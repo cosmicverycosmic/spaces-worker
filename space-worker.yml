@@ -1,0 +1,216 @@
+name: Space Worker (GCS + Register)
+
+on:
+  workflow_dispatch:
+    inputs:
+      space_url:
+        description: "X Spaces URL (or direct media URL) to ingest"
+        required: true
+        type: string
+      title:
+        description: "Title for the Space post / attachment"
+        required: false
+        type: string
+      post_id:
+        description: "Existing WP Space post ID to attach audio to (optional)"
+        required: false
+        default: "0"
+        type: string
+      gcs_prefix:
+        description: "Path prefix inside the bucket (e.g., spaces/myshow). Leave blank for auto."
+        required: false
+        default: ""
+        type: string
+      make_public:
+        description: "Make uploaded objects public (requires bucket to allow it)"
+        required: true
+        default: true
+        type: boolean
+      do_transcript:
+        description: "Generate transcript + VTT via Deepgram (requires DEEPGRAM_API_KEY)"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ secrets.GCS_BUCKET }}
+      WP_URL: ${{ secrets.WP_URL }}
+      WP_USER: ${{ secrets.WP_USER }}
+      WP_PASS: ${{ secrets.WP_APP_PASSWORD }}
+      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+      SPACE_URL: ${{ inputs.space_url }}
+      TITLE: ${{ inputs.title }}
+      POST_ID: ${{ inputs.post_id }}
+      GCS_PREFIX_IN: ${{ inputs.gcs_prefix }}
+      MAKE_PUBLIC: ${{ inputs.make_public }}
+      DO_TRANSCRIPT: ${{ inputs.do_transcript }}
+
+    steps:
+      - name: Checkout (not strictly required)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg, jq, python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq python3 python3-pip
+          python3 -m pip install --upgrade pip yt-dlp
+
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud / gsutil
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Prepare workspace variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          DATE_SLUG="$(date -u +%Y/%m/%d)"
+          SAFE_TITLE="$(echo "${TITLE:-}" | tr -cd '[:alnum:]._-' | tr '[:upper:]' '[:lower:]')"
+          if [ -z "${SAFE_TITLE}" ]; then SAFE_TITLE="space"; fi
+
+          if [ -n "${GCS_PREFIX_IN}" ]; then
+            PREFIX="${GCS_PREFIX_IN%/}/$RUN_ID"
+          else
+            PREFIX="spaces/${DATE_SLUG}/${RUN_ID}"
+          fi
+
+          AUDIO_BASENAME="${SAFE_TITLE}.m4a"
+          AUDIO_PATH="./${AUDIO_BASENAME}"
+
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "audio_file=$AUDIO_PATH" >> $GITHUB_OUTPUT
+          echo "audio_name=$AUDIO_BASENAME" >> $GITHUB_OUTPUT
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Download audio with yt-dlp → .m4a
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ steps.prep.outputs.audio_file }}"
+          yt-dlp \
+            --no-progress \
+            -x --audio-format m4a --audio-quality 0 \
+            -o "$OUT" \
+            "$SPACE_URL"
+
+          if [ ! -s "$OUT" ]; then
+            echo "Download failed or empty output" >&2
+            exit 1
+          fi
+          ffprobe -v error -show_format -of json "$OUT" | jq .
+
+      - name: (Optional) Generate transcript + VTT with Deepgram
+        if: ${{ env.DO_TRANSCRIPT == 'true' && env.DEEPGRAM_API_KEY != '' }}
+        id: dg
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUDIO="${{ steps.prep.outputs.audio_file }}"
+
+          # JSON transcript
+          curl -sS -X POST "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true&punctuate=true" \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mp4" \
+            --data-binary @"$AUDIO" \
+            -o transcript.json
+
+          # Minimal plain text from JSON (best alternative)
+          jq -r '
+            .results.channels[0].alternatives[0].paragraphs.transcript
+            // .results.channels[0].alternatives[0].transcript
+            // empty
+          ' transcript.json > transcript.txt
+
+          # WebVTT captions
+          curl -sS -X POST "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true&punctuate=true&format=vtt" \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mp4" \
+            --data-binary @"$AUDIO" \
+            -o captions.vtt
+
+          echo "has_txt=$(test -s transcript.txt && echo yes || echo no)" >> $GITHUB_OUTPUT
+          echo "has_vtt=$(test -s captions.vtt && echo yes || echo no)" >> $GITHUB_OUTPUT
+
+      - name: Upload audio to GCS
+        id: up_audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.prep.outputs.prefix }}"
+          AUDIO="${{ steps.prep.outputs.audio_file }}"
+          GCS_URI="gs://${BUCKET}/${PREFIX}/${{ steps.prep.outputs.audio_name }}"
+          gsutil -h "Cache-Control:no-cache" -h "Content-Type:audio/mp4" cp "$AUDIO" "$GCS_URI"
+          if [ "${MAKE_PUBLIC}" = "true" ]; then
+            gsutil acl ch -u AllUsers:R "$GCS_URI" || true
+          fi
+          echo "gcs_audio_uri=$GCS_URI" >> $GITHUB_OUTPUT
+          echo "audio_url=https://storage.googleapis.com/${BUCKET}/${PREFIX}/${{ steps.prep.outputs.audio_name }}" >> $GITHUB_OUTPUT
+
+      - name: Upload transcript + VTT to GCS (if any)
+        if: ${{ steps.dg.outcomes != 'skipped' }}
+        id: up_txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.prep.outputs.prefix }}"
+          TXT_URI=""
+          VTT_URI=""
+
+          if [ -s transcript.txt ]; then
+            TXT_URI="gs://${BUCKET}/${PREFIX}/transcript.txt"
+            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/plain; charset=utf-8" cp transcript.txt "$TXT_URI"
+            if [ "${MAKE_PUBLIC}" = "true" ]; then gsutil acl ch -u AllUsers:R "$TXT_URI" || true; fi
+          fi
+
+          if [ -s captions.vtt ]; then
+            VTT_URI="gs://${BUCKET}/${PREFIX}/captions.vtt"
+            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/vtt; charset=utf-8" cp captions.vtt "$VTT_URI"
+            if [ "${MAKE_PUBLIC}" = "true" ]; then gsutil acl ch -u AllUsers:R "$VTT_URI" || true; fi
+          fi
+
+          echo "txt_url=$( [ -n "$TXT_URI" ] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/transcript.txt" )" >> $GITHUB_OUTPUT
+          echo "vtt_url=$( [ -n "$VTT_URI" ] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/captions.vtt" )" >> $GITHUB_OUTPUT
+
+      - name: Register in WordPress (your ss3k route)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUTH=$(printf "%s:%s" "$WP_USER" "$WP_PASS" | base64 -w0 || base64)
+          AUDIO_URL="${{ steps.up_audio.outputs.audio_url }}"
+          VTT_URL="${{ steps.up_txt.outputs.vtt_url }}"
+          TRANSCRIPT="$(test -s transcript.txt && sed 's/\\/\\\\/g' transcript.txt | sed ':a;N;$!ba;s/\n/\\n/g' || echo "")"
+
+          TITLE_JSON="${TITLE:-}"
+          if [ -z "$TITLE_JSON" ]; then TITLE_JSON="Space ${GITHUB_RUN_NUMBER}"; fi
+
+          jq -n \
+            --arg title        "$TITLE_JSON" \
+            --arg gcs_url      "$AUDIO_URL" \
+            --arg mime         "audio/mp4" \
+            --argjson post_id  ${POST_ID:-0} \
+            --arg vtt_url      "${VTT_URL:-}" \
+            --arg transcript   "${TRANSCRIPT:-}" \
+            '{title:$title,gcs_url:$gcs_url,mime:$mime,post_id:$post_id,vtt_url:$vtt_url,transcript:$transcript}' \
+          | curl -sS -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
+              -H "Authorization: Basic $AUTH" \
+              -H "Content-Type: application/json" \
+              -d @- \
+              -o wp_register.json
+
+          echo "WP response:"
+          cat wp_register.json | jq .
+
+      - name: Summary
+        run: |
+          echo "Audio URL:  ${{ steps.up_audio.outputs.audio_url }}"
+          echo "VTT URL:    ${{ steps.up_txt.outputs.vtt_url }}"
+          echo "Transcript: ${{ steps.up_txt.outputs.txt_url }}"
+          echo "Run ID:     ${{ steps.prep.outputs.run_id }}"
