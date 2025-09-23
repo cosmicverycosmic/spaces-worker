@@ -36,11 +36,13 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
+      # Secrets
       BUCKET: ${{ secrets.GCS_BUCKET }}
       WP_URL: ${{ secrets.WP_URL }}
       WP_USER: ${{ secrets.WP_USER }}
       WP_PASS: ${{ secrets.WP_APP_PASSWORD }}
       DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+      # Inputs
       SPACE_URL: ${{ inputs.space_url }}
       TITLE: ${{ inputs.title }}
       POST_ID: ${{ inputs.post_id }}
@@ -49,14 +51,16 @@ jobs:
       DO_TRANSCRIPT: ${{ inputs.do_transcript }}
 
     steps:
-      - name: Checkout (not strictly required)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg, jq, python
+      - name: Install ffmpeg, jq, python, yt-dlp
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq python3 python3-pip
           python3 -m pip install --upgrade pip yt-dlp
+          echo "::notice title=Install::Dependencies ready"
 
       - name: Auth to GCP
         uses: google-github-actions/auth@v2
@@ -71,41 +75,130 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          DATE_SLUG="$(date -u +%Y/%m/%d)"
-          SAFE_TITLE="$(echo "${TITLE:-}" | tr -cd '[:alnum:]._-' | tr '[:upper:]' '[:lower:]')"
-          if [ -z "${SAFE_TITLE}" ]; then SAFE_TITLE="space"; fi
 
-          if [ -n "${GCS_PREFIX_IN}" ]; then
-            PREFIX="${GCS_PREFIX_IN%/}/$RUN_ID"
-          else
-            PREFIX="spaces/${DATE_SLUG}/${RUN_ID}"
+          echo "::group::Prep"
+          RUN_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          DATE_PATH="$(date -u +%Y/%m/%d)"
+
+          # Title -> safe basename
+          SAFE_TITLE="$(echo "${TITLE:-}" | tr -cd '[:alnum:]._ -' | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]\+/-/g')"
+          if [[ -z "${SAFE_TITLE}" ]]; then SAFE_TITLE="space"; fi
+
+          # Extract a short ID from the URL for filenames
+          SPACE_ID="$(echo "${SPACE_URL}" | sed -E 's#.*?/spaces/([^/?]+).*#\1#')"
+          if [[ -z "${SPACE_ID}" || "${SPACE_ID}" == "${SPACE_URL}" ]]; then
+            SPACE_ID="$(echo "${SPACE_URL}" | tr -cd '[:alnum:]' | tail -c 12)"
           fi
 
-          AUDIO_BASENAME="${SAFE_TITLE}.m4a"
-          AUDIO_PATH="./${AUDIO_BASENAME}"
+          # Normalize (optional) prefix
+          PREFIX_IN="${GCS_PREFIX_IN:-}"
+          PREFIX_IN="${PREFIX_IN#/}"   # strip leading /
+          PREFIX_IN="${PREFIX_IN%/}"   # strip trailing /
 
-          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
-          echo "audio_file=$AUDIO_PATH" >> $GITHUB_OUTPUT
-          echo "audio_name=$AUDIO_BASENAME" >> $GITHUB_OUTPUT
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          if [[ -n "${PREFIX_IN}" ]]; then
+            PREFIX="${PREFIX_IN}/${DATE_PATH}/${RUN_ID}"
+          else
+            PREFIX="spaces/${DATE_PATH}/${RUN_ID}"
+          fi
 
-      - name: Download audio with yt-dlp → .m4a
+          WORKDIR="$(mktemp -d)"
+          RAW_BASE="${SAFE_TITLE}-${SPACE_ID}"
+          RAW_FILE="${WORKDIR}/${RAW_BASE}.m4a"  # yt-dlp target (may change ext)
+          MP3_FILE="${WORKDIR}/${RAW_BASE}.mp3"  # our final normalized file
+          LOG_PREFIX="[SS3K]"
+
+          echo "prefix=${PREFIX}" >> "${GITHUB_OUTPUT}"
+          echo "workdir=${WORKDIR}" >> "${GITHUB_OUTPUT}"
+          echo "raw_file=${RAW_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "mp3_file=${MP3_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "raw_base=${RAW_BASE}" >> "${GITHUB_OUTPUT}"
+          echo "space_id=${SPACE_ID}" >> "${GITHUB_OUTPUT}"
+
+          echo "${LOG_PREFIX} Space ID: ${SPACE_ID}"
+          echo "${LOG_PREFIX} Prefix:   gs://${BUCKET}/${PREFIX}"
+          echo "${LOG_PREFIX} Workdir:  ${WORKDIR}"
+          echo "::endgroup::"
+          echo "::notice title=Prep::Prefix gs://${BUCKET}/${PREFIX}"
+
+      - name: Download best audio with yt-dlp
         shell: bash
         run: |
           set -euo pipefail
-          OUT="${{ steps.prep.outputs.audio_file }}"
-          yt-dlp \
-            --no-progress \
-            -x --audio-format m4a --audio-quality 0 \
-            -o "$OUT" \
-            "$SPACE_URL"
+          echo "::group::Download"
+          OUT="${{ steps.prep.outputs.raw_file }}"
+          OUT_BASE="${OUT%.*}"
 
-          if [ ! -s "$OUT" ]; then
-            echo "Download failed or empty output" >&2
+          # Let yt-dlp pick the best audio; prefer m4a but accept best
+          python3 -m yt_dlp \
+            --no-progress --no-playlist \
+            -f 'bestaudio[ext=m4a]/bestaudio/best' \
+            -o "${OUT_BASE}.%(ext)s" \
+            "${SPACE_URL}"
+
+          # Resolve actual file path (yt-dlp may not choose m4a)
+          RAW_FILE="$(ls -1 "${OUT_BASE}."* 2>/dev/null | head -n1 || true)"
+          if [[ -z "${RAW_FILE}" || ! -s "${RAW_FILE}" ]]; then
+            echo "Download failed: no audio file produced." >&2
             exit 1
           fi
-          ffprobe -v error -show_format -of json "$OUT" | jq .
+          echo "raw_file=${RAW_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "::notice title=Download::Saved $(basename "${RAW_FILE}")"
+          echo "::endgroup::"
+
+      - name: Convert → optimized MP3 (noise-reduced + normalized)
+        id: to_mp3
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Transcode"
+          IN="${{ steps.download.outputs.raw_file || steps.prep.outputs.raw_file }}"  # fallback if outputs unavailable
+          # The previous step places the resolved path in GITHUB_OUTPUT, but to be safe:
+          if [[ ! -f "${IN}" ]]; then IN="$(ls -1 "${{ steps.prep.outputs.workdir }}/${{ steps.prep.outputs.raw_base }}."* | head -n1)"; fi
+
+          MP3="${{ steps.prep.outputs.mp3_file }}"
+          # Filters: highpass (rumble cut), lowpass (remove HF hiss), spectral denoise,
+          # resample to 48k, then EBU R128 loudness normalization to -16 LUFS / -1.5 dBTP.
+          ffmpeg -hide_banner -y -nostdin -v error -i "${IN}" \
+            -af "highpass=f=80,lowpass=f=16000,afftdn=nr=12:lmd=7:om=o,aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11" \
+            -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k \
+            "${MP3}"
+
+          if [[ ! -s "${MP3}" ]]; then
+            echo "Transcode failed." >&2
+            exit 1
+          fi
+
+          # Show basic info (not the whole file)
+          ffprobe -v error -show_format -show_streams -of json "${MP3}" | jq '{format: {duration, bit_rate, tags}, streams: [.streams[] | {codec_name, sample_rate, channels}] }'
+          echo "mp3_file=${MP3}" >> "${GITHUB_OUTPUT}"
+          echo "::notice title=Transcode::Created $(basename "${MP3}")"
+          echo "::endgroup::"
+
+      - name: Upload MP3 to GCS
+        id: up_audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Upload audio"
+          PREFIX="${{ steps.prep.outputs.prefix }}"
+          MP3="${{ steps.to_mp3.outputs.mp3_file || steps.prep.outputs.mp3_file }}"
+          BASENAME="$(basename "${MP3}")"
+          GCS_URI="gs://${BUCKET}/${PREFIX}/${BASENAME}"
+
+          # Upload with strong caching (immutable)
+          gsutil -h "Cache-Control:public, max-age=31536000, immutable" \
+                 -h "Content-Type:audio/mpeg" \
+                 cp "${MP3}" "${GCS_URI}"
+
+          if [[ "${MAKE_PUBLIC}" == "true" ]]; then
+            gsutil acl ch -u AllUsers:R "${GCS_URI}" || true
+          fi
+
+          echo "gcs_audio_uri=${GCS_URI}" >> "${GITHUB_OUTPUT}"
+          echo "audio_url=https://storage.googleapis.com/${BUCKET}/${PREFIX}/${BASENAME}" >> "${GITHUB_OUTPUT}"
+          echo "::notice title=Upload::${GCS_URI}"
+          echo "::endgroup::"
 
       - name: (Optional) Generate transcript + VTT with Deepgram
         if: ${{ env.DO_TRANSCRIPT == 'true' && env.DEEPGRAM_API_KEY != '' }}
@@ -113,16 +206,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          AUDIO="${{ steps.prep.outputs.audio_file }}"
+          echo "::group::Deepgram"
+          AUDIO="${{ steps.to_mp3.outputs.mp3_file || steps.prep.outputs.mp3_file }}"
 
-          # JSON transcript
+          # Transcript (JSON -> plain text)
           curl -sS -X POST "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true&punctuate=true" \
             -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
-            -H "Content-Type: audio/mp4" \
-            --data-binary @"$AUDIO" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${AUDIO}" \
             -o transcript.json
 
-          # Minimal plain text from JSON (best alternative)
           jq -r '
             .results.channels[0].alternatives[0].paragraphs.transcript
             // .results.channels[0].alternatives[0].transcript
@@ -132,85 +225,107 @@ jobs:
           # WebVTT captions
           curl -sS -X POST "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true&punctuate=true&format=vtt" \
             -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
-            -H "Content-Type: audio/mp4" \
-            --data-binary @"$AUDIO" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${AUDIO}" \
             -o captions.vtt
 
-          echo "has_txt=$(test -s transcript.txt && echo yes || echo no)" >> $GITHUB_OUTPUT
-          echo "has_vtt=$(test -s captions.vtt && echo yes || echo no)" >> $GITHUB_OUTPUT
+          [[ -s transcript.txt ]] && echo "::notice title=Deepgram::Transcript ✓"
+          [[ -s captions.vtt   ]] && echo "::notice title=Deepgram::VTT ✓"
+          echo "has_txt=$(test -s transcript.txt && echo yes || echo no)" >> "${GITHUB_OUTPUT}"
+          echo "has_vtt=$(test -s captions.vtt && echo yes || echo no)" >> "${GITHUB_OUTPUT}"
+          echo "::endgroup::"
 
-      - name: Upload audio to GCS
-        id: up_audio
-        shell: bash
-        run: |
-          set -euo pipefail
-          PREFIX="${{ steps.prep.outputs.prefix }}"
-          AUDIO="${{ steps.prep.outputs.audio_file }}"
-          GCS_URI="gs://${BUCKET}/${PREFIX}/${{ steps.prep.outputs.audio_name }}"
-          gsutil -h "Cache-Control:no-cache" -h "Content-Type:audio/mp4" cp "$AUDIO" "$GCS_URI"
-          if [ "${MAKE_PUBLIC}" = "true" ]; then
-            gsutil acl ch -u AllUsers:R "$GCS_URI" || true
-          fi
-          echo "gcs_audio_uri=$GCS_URI" >> $GITHUB_OUTPUT
-          echo "audio_url=https://storage.googleapis.com/${BUCKET}/${PREFIX}/${{ steps.prep.outputs.audio_name }}" >> $GITHUB_OUTPUT
-
-      - name: Upload transcript + VTT to GCS (if any)
-        if: ${{ steps.dg.outcomes != 'skipped' }}
+      - name: Upload transcript + VTT to GCS (if produced)
+        if: ${{ steps.dg.outcome == 'success' }}
         id: up_txt
         shell: bash
         run: |
           set -euo pipefail
+          echo "::group::Upload text"
           PREFIX="${{ steps.prep.outputs.prefix }}"
+
           TXT_URI=""
           VTT_URI=""
 
-          if [ -s transcript.txt ]; then
+          if [[ -s transcript.txt ]]; then
             TXT_URI="gs://${BUCKET}/${PREFIX}/transcript.txt"
-            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/plain; charset=utf-8" cp transcript.txt "$TXT_URI"
-            if [ "${MAKE_PUBLIC}" = "true" ]; then gsutil acl ch -u AllUsers:R "$TXT_URI" || true; fi
+            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/plain; charset=utf-8" cp transcript.txt "${TXT_URI}"
+            [[ "${MAKE_PUBLIC}" == "true" ]] && gsutil acl ch -u AllUsers:R "${TXT_URI}" || true
           fi
 
-          if [ -s captions.vtt ]; then
+          if [[ -s captions.vtt ]]; then
             VTT_URI="gs://${BUCKET}/${PREFIX}/captions.vtt"
-            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/vtt; charset=utf-8" cp captions.vtt "$VTT_URI"
-            if [ "${MAKE_PUBLIC}" = "true" ]; then gsutil acl ch -u AllUsers:R "$VTT_URI" || true; fi
+            gsutil -h "Cache-Control:no-cache" -h "Content-Type:text/vtt; charset=utf-8" cp captions.vtt "${VTT_URI}"
+            [[ "${MAKE_PUBLIC}" == "true" ]] && gsutil acl ch -u AllUsers:R "${VTT_URI}" || true
           fi
 
-          echo "txt_url=$( [ -n "$TXT_URI" ] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/transcript.txt" )" >> $GITHUB_OUTPUT
-          echo "vtt_url=$( [ -n "$VTT_URI" ] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/captions.vtt" )" >> $GITHUB_OUTPUT
+          [[ -n "${TXT_URI}" ]] && echo "::notice title=Upload::${TXT_URI}"
+          [[ -n "${VTT_URI}" ]] && echo "::notice title=Upload::${VTT_URI}"
 
-      - name: Register in WordPress (your ss3k route)
+          echo "txt_url=$( [[ -n "${TXT_URI}" ]] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/transcript.txt" )" >> "${GITHUB_OUTPUT}"
+          echo "vtt_url=$( [[ -n "${VTT_URI}" ]] && echo "https://storage.googleapis.com/${BUCKET}/${PREFIX}/captions.vtt" )" >> "${GITHUB_OUTPUT}"
+          echo "::endgroup::"
+
+      - name: Register in WordPress (ss3k register endpoint)
+        id: wpreg
         shell: bash
         run: |
           set -euo pipefail
-          AUTH=$(printf "%s:%s" "$WP_USER" "$WP_PASS" | base64 -w0 || base64)
+          echo "::group::WordPress register"
+          AUTH="$(printf "%s:%s" "$WP_USER" "$WP_PASS" | base64 -w0 || base64)"
           AUDIO_URL="${{ steps.up_audio.outputs.audio_url }}"
           VTT_URL="${{ steps.up_txt.outputs.vtt_url }}"
-          TRANSCRIPT="$(test -s transcript.txt && sed 's/\\/\\\\/g' transcript.txt | sed ':a;N;$!ba;s/\n/\\n/g' || echo "")"
+          # Escape transcript for JSON if present
+          if [[ -s transcript.txt ]]; then
+            TRANSCRIPT_JSON="$(python3 - << 'PY'
+import json,sys
+print(json.dumps(open("transcript.txt","r",encoding="utf-8",errors="ignore").read()))
+PY
+)"
+          else
+            TRANSCRIPT_JSON='""'
+          fi
 
           TITLE_JSON="${TITLE:-}"
-          if [ -z "$TITLE_JSON" ]; then TITLE_JSON="Space ${GITHUB_RUN_NUMBER}"; fi
+          if [[ -z "${TITLE_JSON}" ]]; then
+            TITLE_JSON="Space ${GITHUB_RUN_NUMBER} (${ { steps.prep.outputs.space_id } })"
+          fi
 
           jq -n \
             --arg title        "$TITLE_JSON" \
             --arg gcs_url      "$AUDIO_URL" \
-            --arg mime         "audio/mp4" \
+            --arg mime         "audio/mpeg" \
             --argjson post_id  ${POST_ID:-0} \
             --arg vtt_url      "${VTT_URL:-}" \
-            --arg transcript   "${TRANSCRIPT:-}" \
+            --arg transcript   "$(echo ${TRANSCRIPT_JSON})" \
             '{title:$title,gcs_url:$gcs_url,mime:$mime,post_id:$post_id,vtt_url:$vtt_url,transcript:$transcript}' \
           | curl -sS -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
-              -H "Authorization: Basic $AUTH" \
+              -H "Authorization: Basic ${AUTH}" \
               -H "Content-Type: application/json" \
               -d @- \
               -o wp_register.json
 
-          echo "WP response:"
-          cat wp_register.json | jq .
+          echo "WP response (truncated):"
+          head -c 2000 wp_register.json | jq . || (cat wp_register.json | head -c 2000)
 
-      - name: Summary
+          echo "::notice title=WordPress::Registration call completed"
+          echo "::endgroup::"
+
+      - name: Job Summary (URLs you can show in the plugin)
+        shell: bash
         run: |
-          echo "Audio URL:  ${{ steps.up_audio.outputs.audio_url }}"
-          echo "VTT URL:    ${{ steps.up_txt.outputs.vtt_url }}"
-          echo "Transcript: ${{ steps.up_txt.outputs.txt_url }}"
-          echo "Run ID:     ${{ steps.prep.outputs.run_id }}"
+          {
+            echo "## Space Worker Result"
+            echo ""
+            echo "- **Audio (MP3):** ${{ steps.up_audio.outputs.audio_url }}"
+            if [[ -n "${{ steps.up_txt.outputs.vtt_url }}" ]]; then
+              echo "- **Captions (VTT):** ${{ steps.up_txt.outputs.vtt_url }}"
+            fi
+            if [[ -n "${{ steps.up_txt.outputs.txt_url }}" ]]; then
+              echo "- **Transcript (TXT):** ${{ steps.up_txt.outputs.txt_url }}"
+            fi
+            echo "- **GCS Object:** ${{ steps.up_audio.outputs.gcs_audio_uri }}"
+            echo "- **Prefix:** \`gs://${{ env.BUCKET }}/${{ steps.prep.outputs.prefix }}\`"
+            echo ""
+            echo "> These links can be polled by the WP plugin; notices are also emitted in the logs prefixed with **[SS3K]**."
+          } >> "${GITHUB_STEP_SUMMARY}"
