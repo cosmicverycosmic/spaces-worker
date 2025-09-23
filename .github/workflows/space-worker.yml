@@ -47,13 +47,14 @@ concurrency:
   group: ${{ format('space-worker-{0}-{1}', github.ref, inputs.post_id != '' && inputs.post_id || github.run_id) }}
   cancel-in-progress: false
 
+# Secrets first; fall back to repo-level Variables if a secret is not defined.
 env:
-  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-  GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-  WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-  WP_USER: ${{ secrets.WP_USER }}
-  WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY || vars.GCP_SA_KEY }}
+  GCS_BUCKET: ${{ secrets.GCS_BUCKET || vars.GCS_BUCKET }}
+  WP_BASE_URL: ${{ secrets.WP_BASE_URL || vars.WP_BASE_URL }}
+  WP_USER: ${{ secrets.WP_USER || vars.WP_USER }}
+  WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD || vars.WP_APP_PASSWORD }}
+  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
 jobs:
   run:
@@ -91,8 +92,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY secret is missing"; exit 1; }
-          test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET secret is missing"; exit 1; }
+          # make sure the key exists and looks non-empty (masked output is expected)
+          test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY secret/var is missing"; exit 1; }
+          # this was empty in your failed run — now we fail early with a clear message
+          test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET secret/var is missing"; exit 1; }
           # trim leading/trailing slashes from prefix
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
@@ -107,6 +110,18 @@ jobs:
           BASE="space-${TS}-${GITHUB_RUN_ID}"
           echo "base=${BASE}" >> "$GITHUB_OUTPUT"
 
+      - name: Ping (downloading)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        run: |
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Downloading Space audio…" \
+                         --arg run "${{ github.run_id }}" \
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
+
       - name: Download Space audio with yt-dlp (best audio)
         shell: bash
         working-directory: work
@@ -118,6 +133,18 @@ jobs:
           IN="$(ls -S | head -n1)"
           test -f "$IN" || { echo "No file downloaded"; exit 1; }
           echo "INPUT_FILE=$IN" >> "$GITHUB_ENV"
+
+      - name: Ping (normalizing)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        run: |
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Normalizing & encoding to MP3…" \
+                         --arg run "${{ github.run_id }}" \
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
 
       - name: Loudness normalization → MP3
         shell: bash
@@ -147,8 +174,26 @@ jobs:
           set -euxo pipefail
           echo "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json"
-          # Optional; not required for gsutil and can cause warnings. Leave disabled.
+          # Not required for gsutil and can cause warnings; leave disabled.
           # gcloud config set core/project "$(jq -r '.project_id' "${HOME}/gcp-key.json")" || true
+
+      - name: Verify bucket access
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null
+
+      - name: Ping (uploading MP3)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        run: |
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Uploading MP3 to GCS…" \
+                         --arg run "${{ github.run_id }}" \
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
 
       - name: Upload MP3 to GCS
         id: upload_mp3
@@ -167,10 +212,21 @@ jobs:
           fi
           gsutil cp "$OUT_MP3" "$DEST"
           if [ "${{ inputs.make_public }}" = "true" ]; then
-            # Try ACL first (if ACLs enabled); if it fails, fall back to IAM (UBLA buckets)
             gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}"
           fi
           echo "gcs_url=${PUB_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Ping (transcribing)
+        if: ${{ inputs.do_transcript == 'true' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        run: |
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Deepgram: generating transcript & VTT…" \
+                         --arg run "${{ github.run_id }}" \
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
 
       - name: Transcript + VTT via Deepgram (optional)
         id: tx
@@ -193,6 +249,18 @@ jobs:
             --data-binary @"${AUDIO_PATH}" > "${VTT_PATH}"
           TXT="$(jq -r '.results.channels[0].alternatives[0].transcript // ""' out/dg.json)"
           echo "$TXT" > "out/${{ steps.prep.outputs.base }}.txt"
+
+      - name: Ping (uploading VTT)
+        if: ${{ steps.tx.outcome == 'success' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        run: |
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Uploading VTT to GCS…" \
+                         --arg run "${{ github.run_id }}" \
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
 
       - name: Upload VTT to GCS (optional)
         id: upload_vtt
@@ -217,7 +285,7 @@ jobs:
           fi
           echo "vtt_url=${PUB_VTT}" >> "$GITHUB_OUTPUT"
 
-      - name: Ping WP worker-status (processing)
+      - name: Ping (registering in WordPress)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         run: |
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
@@ -225,7 +293,7 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
             -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
                          --arg status "processing" \
-                         --arg msg "Audio uploaded to GCS; finishing up." \
+                         --arg msg "Registering assets in WordPress…" \
                          --arg run "${{ github.run_id }}" \
                          '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run}')"
 
