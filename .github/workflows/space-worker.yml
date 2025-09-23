@@ -43,7 +43,6 @@ on:
 permissions:
   contents: read
 
-# Avoid YAML surprises by keeping the whole expression inside one ${{ }} and quoting the string
 concurrency:
   group: ${{ format('space-worker-{0}-{1}', github.ref, inputs.post_id != '' && inputs.post_id || github.run_id) }}
   cancel-in-progress: false
@@ -87,6 +86,17 @@ jobs:
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
 
+      - name: Validate secrets / normalize prefix
+        id: cfg
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY secret is missing"; exit 1; }
+          test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET secret is missing"; exit 1; }
+          # trim leading/trailing slashes from prefix
+          PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
+          echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
+
       - name: Prepare workspace
         id: prep
         shell: bash
@@ -96,8 +106,6 @@ jobs:
           TS="$(date +%Y%m%d-%H%M%S)"
           BASE="space-${TS}-${GITHUB_RUN_ID}"
           echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "ts=${TS}" >> "$GITHUB_OUTPUT"
-          echo "prefix=${{ inputs.gcs_prefix }}" >> "$GITHUB_OUTPUT"
 
       - name: Download Space audio with yt-dlp (best audio)
         shell: bash
@@ -133,28 +141,35 @@ jobs:
             -ar 48000 -ac 2 -codec:a libmp3lame -b:a 128k "$OUT_MP3"
           echo "OUT_MP3=$OUT_MP3" >> "$GITHUB_ENV"
 
-      - name: Authenticate to GCP
+      - name: Authenticate to GCP (service account)
         shell: bash
         run: |
           set -euxo pipefail
           echo "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json"
-          gcloud config set core/project "$(jq -r '.project_id' "${HOME}/gcp-key.json")"
+          # Optional; not required for gsutil and can cause warnings. Leave disabled.
+          # gcloud config set core/project "$(jq -r '.project_id' "${HOME}/gcp-key.json")" || true
 
       - name: Upload MP3 to GCS
         id: upload_mp3
         shell: bash
         env:
           BASE: ${{ steps.prep.outputs.base }}
-          PREFIX: ${{ steps.prep.outputs.prefix }}
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
         run: |
           set -euxo pipefail
-          DEST="gs://${GCS_BUCKET}/${PREFIX%/}/${BASE}.mp3"
+          if [ -n "$PREFIX" ]; then
+            DEST="gs://${GCS_BUCKET}/${PREFIX}/${BASE}.mp3"
+            PUB_URL="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/${BASE}.mp3"
+          else
+            DEST="gs://${GCS_BUCKET}/${BASE}.mp3"
+            PUB_URL="https://storage.googleapis.com/${GCS_BUCKET}/${BASE}.mp3"
+          fi
           gsutil cp "$OUT_MP3" "$DEST"
           if [ "${{ inputs.make_public }}" = "true" ]; then
-            gsutil acl ch -u AllUsers:R "$DEST"
+            # Try ACL first (if ACLs enabled); if it fails, fall back to IAM (UBLA buckets)
+            gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}"
           fi
-          PUB_URL="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX%/}/${BASE}.mp3"
           echo "gcs_url=${PUB_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Transcript + VTT via Deepgram (optional)
@@ -185,17 +200,21 @@ jobs:
         shell: bash
         env:
           BASE: ${{ steps.prep.outputs.base }}
-          PREFIX: ${{ steps.prep.outputs.prefix }}
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
         run: |
           set -euxo pipefail
-          VTT="out/${BASE}.vtt"
-          test -f "$VTT" || { echo "No VTT file found"; exit 1; }
-          DEST="gs://${GCS_BUCKET}/${PREFIX%/}/${BASE}.vtt"
-          gsutil cp "$VTT" "$DEST"
-          if [ "${{ inputs.make_public }}" = "true" ]; then
-            gsutil acl ch -u AllUsers:R "$DEST"
+          if [ -n "$PREFIX" ]; then
+            DEST="gs://${GCS_BUCKET}/${PREFIX}/${BASE}.vtt"
+            PUB_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/${BASE}.vtt"
+          else
+            DEST="gs://${GCS_BUCKET}/${BASE}.vtt"
+            PUB_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${BASE}.vtt"
           fi
-          PUB_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX%/}/${BASE}.vtt"
+          test -f "out/${BASE}.vtt" || { echo "No VTT file found"; exit 1; }
+          gsutil cp "out/${BASE}.vtt" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}"
+          fi
           echo "vtt_url=${PUB_VTT}" >> "$GITHUB_OUTPUT"
 
       - name: Ping WP worker-status (processing)
