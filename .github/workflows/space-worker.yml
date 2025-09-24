@@ -65,6 +65,7 @@ jobs:
       - name: Start / ping WP worker-status (queued)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
@@ -72,8 +73,9 @@ jobs:
                          --arg status "queued" \
                          --arg msg "Workflow received and queued." \
                          --arg run "${{ github.run_id }}" \
+                         --arg runurl "$RUN_URL" \
                          --argjson progress 1 \
-                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run, progress: $progress}')"
+                         '{post_id: ($pid|tonumber), status: $status, message: $msg, run_id: $run, run_url: $runurl, progress: $progress}')"
 
       - name: Install dependencies (ffmpeg, jq, yt-dlp, gcloud)
         shell: bash
