@@ -1,4 +1,11 @@
 name: Space Worker
+on:
+  workflow_dispatch:
+    inputs:
+      space_url:
+        description: "X (Twitter) Space URL (https://x.com/i/spaces/...)"
+        required: true
+        type: string
 
 on:
   workflow_dispatch:
