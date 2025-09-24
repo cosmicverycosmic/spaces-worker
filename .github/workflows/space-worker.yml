@@ -4,482 +4,583 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: "X Space URL (or direct audio URL)"
+        description: "X (Twitter) Space URL (https://x.com/i/spaces/...)"
         required: true
         type: string
       title:
-        description: "Title to use in WP"
+        description: "Post title to use in WordPress (fallback if no post_id)"
         required: false
-        default: ""
         type: string
+        default: ""
       post_id:
-        description: "Existing WP post ID (spaces CPT)"
+        description: "Existing WP post_id to register assets to (optional)"
         required: false
-        default: ""
         type: string
+        default: ""
       gcs_prefix:
-        description: "Optional prefix in the bucket (e.g. spaces/2024/)"
+        description: "GCS prefix/folder (e.g. spaces/2025/02)"
         required: false
-        default: ""
         type: string
+        default: ""
       make_public:
-        description: "Make GCS object public"
+        description: "Set GCS objects to public?"
         required: false
-        default: "true"
         type: choice
         options: ["true", "false"]
+        default: "true"
       do_transcript:
-        description: "Send MP3 to Deepgram and create transcript/VTT"
+        description: "Generate diarized transcript + VTT via Deepgram?"
         required: false
-        default: "true"
         type: choice
         options: ["true", "false"]
+        default: "true"
       wp_marker:
-        description: "opaque marker from WP for correlation"
+        description: "Opaque marker from WP (optional)"
         required: false
-        default: ""
         type: string
+        default: ""
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ format('space-worker-{0}-{1}', github.ref, inputs.post_id != '' && inputs.post_id || github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  # Prefer repository/org Secrets; fall back to repo/org Variables.
+  GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
+  GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
+  WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
+  WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
+  WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
+  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
+  # Proxy mapping for final URL saved to WP:
+  PROXY_BASE:       ${{ secrets.PROXY_BASE || vars.PROXY_BASE || 'https://media.chbmp.org' }}
+  PROXY_PREFIX:     ${{ secrets.PROXY_PREFIX || vars.PROXY_PREFIX || '' }}
+  WORKDIR: ${{ github.workspace }}/work
+  ARTDIR:  ${{ github.workspace }}/out
+
 jobs:
   run:
+    name: Process Space
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      SPACE_URL: ${{ inputs.space_url }}
-      TITLE_IN: ${{ inputs.title }}
-      POST_ID: ${{ inputs.post_id }}
-      GCS_PREFIX_IN: ${{ inputs.gcs_prefix }}
-      MAKE_PUBLIC: ${{ inputs.make_public }}
-      DO_TRANSCRIPT: ${{ inputs.do_transcript }}
-      WP_MARKER: ${{ inputs.wp_marker }}
-      # Secrets
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-      GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-      WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
-      WP_USER: ${{ secrets.WP_USER }}
-      WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      # Vars (with sane defaults)
-      PROXY_BASE: ${{ vars.PROXY_BASE }}
-      PROXY_PREFIX: ${{ vars.PROXY_PREFIX }}
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
-
-      - name: Set defaults & folders
-        id: prep
+      - name: Start / ping WP (queued)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          : "${PROXY_BASE:=https://media.chbmp.org}"
-          : "${PROXY_PREFIX:=}"
-          : "${GCS_PREFIX_IN:=}"
-          : "${TITLE_IN:=}"
-          : "${POST_ID:=}"
-          mkdir -p "$GITHUB_WORKSPACE/work" "$GITHUB_WORKSPACE/out"
-          echo "workdir=$GITHUB_WORKSPACE/work"   >> $GITHUB_OUTPUT
-          echo "outdir=$GITHUB_WORKSPACE/out"     >> $GITHUB_OUTPUT
-          BASE="space-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_ID}"
-          echo "base=$BASE"                        >> $GITHUB_OUTPUT
-          echo "proxy_base=$PROXY_BASE"           >> $GITHUB_OUTPUT
-          echo "proxy_prefix=$PROXY_PREFIX"       >> $GITHUB_OUTPUT
-          echo "gcs_prefix=$GCS_PREFIX_IN"        >> $GITHUB_OUTPUT
-          echo "title_in=$TITLE_IN"               >> $GITHUB_OUTPUT
-          echo "post_id=$POST_ID"                 >> $GITHUB_OUTPUT
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "queued" \
+                       --arg msg "Workflow received and queued." \
+                       --arg run "${{ github.run_id }}" --argjson progress 1 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Install deps (ffmpeg, jq, python, yt-dlp)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg jq python3 python3-pip
-          python3 -m pip install --upgrade pip
-          pip3 install yt-dlp
-
-      - name: Auth & setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          export_default_credentials: true
-
-      - name: Start — tell WP it’s processing
-        if: env.WP_BASE_URL != ''
-        env:
-          WP_BASE_URL: ${{ env.WP_BASE_URL }}
-          WP_USER: ${{ env.WP_USER }}
-          WP_APP_PASSWORD: ${{ env.WP_APP_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${POST_ID:-}" ]]; then
-            curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-              -H 'Content-Type: application/json' \
-              -X POST "${WP_BASE_URL}/wp-json/ss3k/v1/worker-status" \
-              -d "{\"post_id\": ${POST_ID}, \"status\": \"processing\", \"run_id\":\"${GITHUB_RUN_ID}\", \"progress\": 1, \"message\": \"Worker started (queueing)\"}" >/dev/null
-          fi
-
-      - name: Download Space audio (yt-dlp or direct)
-        id: grab
-        env:
-          WORKDIR: ${{ steps.prep.outputs.workdir }}
-          SPACE_URL: ${{ env.SPACE_URL }}
-        run: |
-          set -euo pipefail
-          cd "$WORKDIR"
-          OUTFILE=""
-          # If it's a direct file (ends with audio ext), just curl it
-          if echo "$SPACE_URL" | grep -Eiq '\.(m4a|mp3|aac|mp4)(\?|$)'; then
-            fname="$(basename "${SPACE_URL%%\?*}")"
-            OUTFILE="$WORKDIR/${fname}"
-            curl -L --fail -A "Mozilla/5.0" -o "$OUTFILE" "$SPACE_URL"
-          else
-            # Try yt-dlp (recorded Spaces are supported)
-            yt-dlp -f ba -x --audio-format m4a \
-              -o "%(title)s.%(ext)s" "$SPACE_URL" || yt-dlp -o "%(title)s.%(ext)s" "$SPACE_URL"
-            # pick the largest m4a/mp4/aac we just got
-            OUTFILE="$(ls -1t *.{m4a,mp4,aac,mp3} 2>/dev/null | head -n1 || true)"
-            if [[ -z "$OUTFILE" ]]; then
-              echo "No audio file downloaded."
-              exit 2
-            fi
-            OUTFILE="$WORKDIR/$OUTFILE"
-          fi
-          echo "input_file=$OUTFILE" >> $GITHUB_OUTPUT
-          echo "Got file: $OUTFILE"
-
-      - name: Trim dead air + loudness-normalize → MP3
-        id: audio
-        env:
-          IN: ${{ steps.grab.outputs.input_file }}
-          OUTDIR: ${{ steps.prep.outputs.outdir }}
-          BASE: ${{ steps.prep.outputs.base }}
+      - name: Install deps (ffmpeg, jq, yt-dlp, gcloud)
+        shell: bash
         run: |
           set -euxo pipefail
-          OUT_MP3="$OUTDIR/${BASE}.mp3"
-          # Remove leading & trailing silence, then loudnorm to podcast-friendly target
-          ffmpeg -hide_banner -y -i "$IN" -vn -ac 2 -ar 44100 \
-            -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,loudnorm=I=-16:LRA=11:TP=-1.5" \
-            -c:a libmp3lame -b:a 128k "$OUT_MP3"
-          echo "out_mp3=$OUT_MP3" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --no-cache-dir yt-dlp
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+          curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          sudo apt-get update && sudo apt-get install -y google-cloud-sdk
 
-      - name: Upload MP3 to GCS
-        id: uploadmp3
-        env:
-          OUT_MP3: ${{ steps.audio.outputs.out_mp3 }}
-          GCS_BUCKET: ${{ env.GCS_BUCKET }}
-          GCS_PREFIX: ${{ steps.prep.outputs.gcs_prefix }}
-          BASE: ${{ steps.prep.outputs.base }}
-          MAKE_PUBLIC: ${{ env.MAKE_PUBLIC }}
+      - name: Validate secrets / normalize prefix
+        id: cfg
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
+          test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
+          mkdir -p "$WORKDIR" "$ARTDIR"
+          PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
+          echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
+
+      - name: Ping (preflight starting)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
         run: |
           set -euo pipefail
-          DEST="gs://${GCS_BUCKET}/${GCS_PREFIX}${BASE}.mp3"
-          gsutil cp "$OUT_MP3" "$DEST"
-          echo "gcs_url=gs://${GCS_BUCKET}/${GCS_PREFIX}${BASE}.mp3" >> $GITHUB_OUTPUT
-          echo "public_url=https://storage.googleapis.com/${GCS_BUCKET}/${GCS_PREFIX}${BASE}.mp3" >> $GITHUB_OUTPUT
-          # Public access (bucket-level IAM preferred; ACL may be blocked under UBLA)
-          if [[ "${MAKE_PUBLIC}" == "true" ]]; then
-            gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
-          fi
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "Preflight: verifying WP auth, GCS access, and bucket permissions…" \
+                       --arg run "${{ github.run_id }}" --argjson progress 5 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Optional — tell WP after audio upload
-        if: env.WP_BASE_URL != '' && env.POST_ID != ''
+      - name: GCP auth (service account)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf '%s\n' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
+          gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
+
+      - name: "Preflight: bucket ok + tiny upload"
+        id: preflight
+        shell: bash
         env:
-          WP_BASE_URL: ${{ env.WP_BASE_URL }}
-          WP_USER: ${{ env.WP_USER }}
-          WP_APP_PASSWORD: ${{ env.WP_APP_PASSWORD }}
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
+        run: |
+          set -euxo pipefail
+          gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null
+          echo "ok $(date -Iseconds) run=${GITHUB_RUN_ID}" > "${ARTDIR}/_preflight-${GITHUB_RUN_ID}.txt"
+          if [ -n "$PREFIX" ]; then
+            TEST="gs://${GCS_BUCKET}/${PREFIX}/_preflight/_preflight-${GITHUB_RUN_ID}.txt"
+          else
+            TEST="gs://${GCS_BUCKET}/_preflight/_preflight-${GITHUB_RUN_ID}.txt"
+          fi
+          gsutil cp "${ARTDIR}/_preflight-${GITHUB_RUN_ID}.txt" "${TEST}"
+          gsutil acl ch -u AllUsers:R "${TEST}" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+          gsutil rm -f "${TEST}" || true
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+
+      - name: Ping (preflight ok)
+        if: ${{ steps.preflight.outputs.ok == '1' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "Preflight passed: WP & GCS verified. Proceeding…" \
+                       --arg run "${{ github.run_id }}" --argjson progress 9 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Ping (downloading)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
         run: |
           set -euo pipefail
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H 'Content-Type: application/json' \
-            -X POST "${WP_BASE_URL}/wp-json/ss3k/v1/worker-status" \
-            -d "{\"post_id\": ${POST_ID}, \"status\": \"processing\", \"run_id\":\"${GITHUB_RUN_ID}\", \"progress\": 40, \"message\": \"Audio uploaded to GCS\"}" >/dev/null
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Downloading Space audio…" \
+                         --arg run "${{ github.run_id }}" --argjson progress 10 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Deepgram transcript + grouped VTT (if enabled)
-        id: transcribe
-        if: env.DO_TRANSCRIPT == 'true' && env.DEEPGRAM_API_KEY != ''
+      - name: Download Space audio (yt-dlp bestaudio)
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
         env:
-          OUTDIR: ${{ steps.prep.outputs.outdir }}
-          OUT_MP3: ${{ steps.audio.outputs.out_mp3 }}
-          DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
+          URL: ${{ inputs.space_url }}
+        run: |
+          set -euxo pipefail
+          yt-dlp -o "%(title)s.%(ext)s" -f "bestaudio/best" "$URL"
+          IN="$(ls -S | head -n1 || true)"
+          test -f "$IN" || { echo "No file downloaded"; exit 1; }
+          echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
+
+      - name: Ping (downloaded)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
         run: |
           set -euo pipefail
-          DG_JSON="$OUTDIR/dg.json"
-          TXT="$OUTDIR/${{ steps.prep.outputs.base }}.txt"
-          VTT="$OUTDIR/${{ steps.prep.outputs.base }}.vtt"
+          SIZE=$(stat -c%s "$INPUT_FILE" 2>/dev/null || echo 0)
+          MSG="Downloaded: $(basename "$INPUT_FILE") (${SIZE} bytes)"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
+                       --arg run "${{ github.run_id }}" --argjson progress 25 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-          # Send to Deepgram (diarize + utterances)
-          curl -sS -X POST 'https://api.deepgram.com/v1/listen?smart_format=true&model=nova-2&diarize=true&utterances=true' \
-               -H "Authorization: Token ${DG_KEY}" \
-               -H 'Content-Type: audio/mpeg' \
-               --data-binary @"${OUT_MP3}" > "$DG_JSON"
+      - name: Ping (normalizing)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Trimming dead air & loudness-normalizing to MP3…" \
+                         --arg run "${{ github.run_id }}" --argjson progress 30 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-          # Build grouped transcript + VTT with merged runs per speaker
-          python3 - "$DG_JSON" "$TXT" "$VTT" << 'PY'
+      - name: Loudness normalization + dead-air trim → MP3
+        shell: bash
+        env:
+          TS: ${{ github.run_id }}
+        run: |
+          set -euxo pipefail
+          PASS1_JSON="${WORKDIR}/loudnorm_pass1_${TS}.json"
+          ffmpeg -hide_banner -y -i "$INPUT_FILE" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/pass1.log" || true
+          awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+          ILOG="$(cat "$PASS1_JSON" 2>/dev/null || echo '{}')"
+          ME_I=$(jq -r '.input_i // "-16"'    <<<"$ILOG")
+          ME_TP=$(jq -r '.input_tp // "-1.5"' <<<"$ILOG")
+          ME_LRA=$(jq -r '.input_lra // "11"'  <<<"$ILOG")
+          ME_THR=$(jq -r '.input_thresh // "-26"'<<<"$ILOG")
+
+          BASE="space-$(date +%Y%m%d-%H%M%S)-${TS}"
+          echo "BASE=${BASE}" >> "$GITHUB_ENV"
+
+          OUT_MP3="${ARTDIR}/${BASE}.mp3"
+          # Trim silence (start & end) then apply loudnorm with measured values
+          ffmpeg -hide_banner -y -i "$INPUT_FILE" \
+            -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=${ME_I}:measured_TP=${ME_TP}:measured_LRA=${ME_LRA}:measured_thresh=${ME_THR}:print_format=summary" \
+            -ar 48000 -ac 2 -codec:a libmp3lame -b:a 128k "$OUT_MP3"
+          echo "OUT_MP3=$OUT_MP3" >> "$GITHUB_ENV"
+
+      - name: Ping (encoded)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIZE=$(stat -c%s "$OUT_MP3" 2>/dev/null || echo 0)
+          MSG="MP3 ready: $(basename "$OUT_MP3") (${SIZE} bytes)"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
+                       --arg run "${{ github.run_id }}" --argjson progress 50 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Ping (uploading MP3)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Uploading MP3 to GCS…" \
+                         --arg run "${{ github.run_id }}" --argjson progress 55 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Upload MP3 to GCS
+        id: upload_mp3
+        shell: bash
+        env:
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
+        run: |
+          set -euxo pipefail
+          if [ -n "$PREFIX" ]; then
+            DEST="gs://${GCS_BUCKET}/${PREFIX}/${BASE}.mp3"
+            PUB_URL="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/${BASE}.mp3"
+          else
+            DEST="gs://${GCS_BUCKET}/${BASE}.mp3"
+            PUB_URL="https://storage.googleapis.com/${GCS_BUCKET}/${BASE}.mp3"
+          fi
+          gsutil cp "$OUT_MP3" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+          fi
+          echo "gcs_url=${PUB_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Ping (uploaded MP3)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MSG="GCS MP3: ${{ steps.upload_mp3.outputs.gcs_url }}"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
+                       --arg run "${{ github.run_id }}" --argjson progress 60 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Ping (transcribing)
+        if: ${{ inputs.do_transcript == 'true' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Deepgram: diarized transcript & VTT…" \
+                         --arg run "${{ github.run_id }}" --argjson progress 70 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Transcript + grouped paragraphs & VTT
+        id: tx
+        if: ${{ inputs.do_transcript == 'true' }}
+        shell: bash
+        env:
+          DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
+        run: |
+          set -euxo pipefail
+          test -n "$DG_KEY" || { echo "DEEPGRAM_API_KEY not set"; exit 1; }
+          DG_JSON="${ARTDIR}/dg.json"
+          TX_PATH="${ARTDIR}/${BASE}.txt"
+          VTT_PATH="${ARTDIR}/${BASE}.vtt"
+
+          curl -sS -X POST "https://api.deepgram.com/v1/listen?smart_format=true&model=nova-2&diarize=true&utterances=true" \
+            -H "Authorization: Token ${DG_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${OUT_MP3}" > "${DG_JSON}"
+
+          python3 - "$DG_JSON" "$TX_PATH" "$VTT_PATH" << 'PY'
 import json, sys
+dg, tx, vtt = sys.argv[1:]
+data=json.load(open(dg,encoding='utf-8'))
+def vtt_time(t):
+    h=int(t//3600); t-=h*3600
+    m=int(t//60); s=t-m*60
+    ms=int(round((s-int(s))*1000)); return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"
 
-dg_path, txt_path, vtt_path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(dg_path, 'r', encoding='utf-8') as f:
-    data = json.load(f)
+utts=data.get("results",{}).get("utterances") or []
+if not utts:
+    alts=data.get("results",{}).get("channels",[{"alternatives":[{}]}])[0]["alternatives"][0]
+    utts=[{"speaker":0,"start":0.0,"end":alts.get("duration",0.0),"transcript":alts.get("transcript","").strip()}]
 
-def secs_to_vtt(t):
-    h = int(t//3600); t -= h*3600
-    m = int(t//60);   s = t - m*60
-    ms = int(round((s - int(s)) * 1000))
-    return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"
-
-utts = []
-if data.get("results",{}).get("utterances"):
-    utts = data["results"]["utterances"]
-elif data.get("results",{}).get("channels"):
-    alts = data["results"]["channels"][0]["alternatives"][0]
-    # fallback single blob
-    utts = [{"speaker":0,"start":0.0,"end":alts.get("duration",0.0),"transcript":alts.get("transcript","").strip()}]
-
-# group consecutive by speaker
-paras = []
-merged_cues = []
-cur_s = None; cur_t=[]; start=None; end=None
+paras=[]; cues=[]
+cur_s=None; cur_txt=[]; start=None; end=None
 for u in utts:
-    sp = int(u.get("speaker", 0))
-    t  = (u.get("transcript") or "").strip()
-    s  = float(u.get("start") or 0.0)
-    e  = float(u.get("end") or s)
+    sp=int(u.get("speaker",0))
+    t=(u.get("transcript") or "").strip()
+    s=float(u.get("start") or 0.0); e=float(u.get("end") or s)
     if not t: continue
-    if cur_s is None:
-        cur_s = sp; cur_t=[t]; start=s; end=e
-    elif sp == cur_s:
-        cur_t.append(t); end = e
+    if cur_s is None: cur_s=sp; cur_txt=[t]; start=s; end=e
+    elif sp==cur_s:   cur_txt.append(t); end=e
     else:
-        paras.append( (cur_s, " ".join(cur_t).strip()) )
-        merged_cues.append( (start, end, cur_s, " ".join(cur_t).strip()) )
-        cur_s = sp; cur_t=[t]; start=s; end=e
-# flush
-if cur_t:
-    paras.append( (cur_s, " ".join(cur_t).strip()) )
-    merged_cues.append( (start, end, cur_s, " ".join(cur_t).strip()) )
+        text=" ".join(cur_txt).strip()
+        paras.append((cur_s,text))
+        cues.append((start,end,cur_s,text))
+        cur_s=sp; cur_txt=[t]; start=s; end=e
+if cur_txt:
+    text=" ".join(cur_txt).strip()
+    paras.append((cur_s,text))
+    cues.append((start,end,cur_s,text))
 
-# write TXT
-with open(txt_path, 'w', encoding='utf-8') as f:
+with open(tx,'w',encoding='utf-8') as f:
     for sp, text in paras:
         f.write(f"Speaker {sp+1}: {text}\n\n")
 
-# write WebVTT (merged cues)
-with open(vtt_path, 'w', encoding='utf-8') as f:
+with open(vtt,'w',encoding='utf-8') as f:
     f.write("WEBVTT\n\n")
-    for s, e, sp, text in merged_cues:
-        f.write(f"{secs_to_vtt(s)} --> {secs_to_vtt(e)}\n")
-        f.write(f"Speaker {sp+1}: {text}\n\n")
+    for s,e,sp,text in cues:
+        f.write(f"{vtt_time(s)} --> {vtt_time(e)}\nSpeaker {sp+1}: {text}\n\n")
 PY
 
-          echo "tx_path=$TXT" >> $GITHUB_OUTPUT
-          echo "vtt_path=$VTT" >> $GITHUB_OUTPUT
+          echo "TX_PATH=${TX_PATH}"   >> "$GITHUB_ENV"
+          echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
 
-      - name: Upload VTT to GCS (if present)
-        id: uploadvtt
-        if: steps.transcribe.outputs.vtt_path != ''
-        env:
-          VTT: ${{ steps.transcribe.outputs.vtt_path }}
-          GCS_BUCKET: ${{ env.GCS_BUCKET }}
-          GCS_PREFIX: ${{ steps.prep.outputs.gcs_prefix }}
-          BASE: ${{ steps.prep.outputs.base }}
-          MAKE_PUBLIC: ${{ env.MAKE_PUBLIC }}
+      - name: Ping (transcribed)
+        if: ${{ steps.tx.outcome == 'success' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
         run: |
           set -euo pipefail
-          DEST="gs://${GCS_BUCKET}/${GCS_PREFIX}${BASE}.vtt"
-          gsutil -h "Content-Type:text/vtt" cp "$VTT" "$DEST"
-          if [[ "${MAKE_PUBLIC}" == "true" ]]; then
-            gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "Transcript & grouped VTT created." \
+                       --arg run "${{ github.run_id }}" --argjson progress 80 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Ping (uploading VTT)
+        if: ${{ steps.tx.outcome == 'success' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "Uploading VTT to GCS…" \
+                       --arg run "${{ github.run_id }}" --argjson progress 85 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Upload VTT to GCS
+        id: upload_vtt
+        if: ${{ steps.tx.outcome == 'success' }}
+        shell: bash
+        env:
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
+        run: |
+          set -euxo pipefail
+          test -f "${VTT_PATH}" || { echo "No VTT produced"; exit 1; }
+          if [ -n "$PREFIX" ]; then
+            DEST="gs://${GCS_BUCKET}/${PREFIX}/${BASE}.vtt"
+            PUB_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/${BASE}.vtt"
+          else
+            DEST="gs://${GCS_BUCKET}/${BASE}.vtt"
+            PUB_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${BASE}.vtt"
           fi
-          echo "vtt_public=https://storage.googleapis.com/${GCS_BUCKET}/${GCS_PREFIX}${BASE}.vtt" >> $GITHUB_OUTPUT
+          gsutil cp "${VTT_PATH}" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+          fi
+          echo "vtt_url=${PUB_VTT}" >> "$GITHUB_OUTPUT"
 
-      - name: Scrape /peek for attendees (best-effort)
+      - name: Scrape /peek attendees → HTML
         id: peek
+        shell: bash
         env:
-          SPACE_URL: ${{ env.SPACE_URL }}
-          OUTDIR: ${{ steps.prep.outputs.outdir }}
+          URL: ${{ inputs.space_url }}
         run: |
           set -euo pipefail
-          PEEK_HTML="$OUTDIR/peek.html"
-          # try the "peek" page; not guaranteed to work without auth, but often enough for recorded spaces
-          curl -sSL -A "Mozilla/5.0" "${SPACE_URL%/}/peek" -o "$PEEK_HTML" || true
-          # parse best-effort with python; look for handles & roles in embedded json
-          python3 - "$PEEK_HTML" "$OUTDIR/attendees.html" << 'PY'
-import re, sys, json, html
-inp, outp = sys.argv[1], sys.argv[2]
+          ATTH="${ARTDIR}/attendees.html"
+          curl -sSL -A "Mozilla/5.0" "${URL%/}/peek" -o "${ARTDIR}/peek.html" || true
+          python3 - "${ARTDIR}/peek.html" "$ATTH" << 'PY'
+import re, sys, html
+src, outp = sys.argv[1], sys.argv[2]
 try:
-    raw = open(inp, 'r', encoding='utf-8', errors='ignore').read()
+    raw=open(src,'r',encoding='utf-8',errors='ignore').read()
 except:
-    raw = ""
-# attempt to find embedded json
-json_candidates = re.findall(r'\{.*\}', raw, flags=re.S)
-host, cohosts, speakers = [], [], []
-def add(lst, handle, name=None):
-    handle = handle.strip('@')
-    name = (name or '').strip()
-    url = f"https://x.com/{handle}"
-    label = f'{name} (@{handle})' if name else f'@{handle}'
-    lst.append((url, label))
+    raw=""
+host=[]; cohosts=[]; speakers=[]
+def add(lst, handle, name=""):
+    h=handle.strip('@'); url=f"https://x.com/{h}"
+    label=f"{name.strip()} (@{h})" if name.strip() else f"@{h}"
+    lst.append((url,label))
 def uniq(lst):
-    seen=set(); out=[]
+    seen=set(); res=[]
     for u,l in lst:
-        k=(u,l)
-        if k in seen: continue
-        seen.add(k); out.append((u,l))
-    return out
+        if (u,l) in seen: continue
+        seen.add((u,l)); res.append((u,l))
+    return res
 
-# pass 1: look for obvious handles around role tokens
-if raw:
-    # very rough buckets if the html uses these words near anchors
-    for m in re.findall(r'(?i)(Host|Co-?hosts?|Speakers?).{0,400}?href="https://x\.com/([A-Za-z0-9_]+)"[^>]*>([^<]{0,120})', raw):
-        role, handle, name = m
-        role = role.lower()
-        if 'host' in role and 'co' not in role:
-            add(host, handle, name)
-        elif 'co' in role:
-            add(cohosts, handle, name)
-        else:
-            add(speakers, handle, name)
+# simple role-aware scrape
+for role, handle, name in re.findall(r'(?i)(Host|Co-?hosts?|Speakers?).{0,400}?href="https://x\.com/([A-Za-z0-9_]+)"[^>]*>([^<]{0,120})', raw):
+    role=role.lower()
+    if 'co' in role: add(cohosts, handle, name)
+    elif 'host' in role: add(host, handle, name)
+    else: add(speakers, handle, name)
 
-# pass 2: generic unique anchors (fallback into "Speakers")
+# fallback: any anchors → speakers
 if not (host or cohosts or speakers):
-    for handle,name in re.findall(r'href="https://x\.com/([A-Za-z0-9_]+)".{0,60}?>([^<]{0,120})', raw):
+    for handle, name in re.findall(r'href="https://x\.com/([A-Za-z0-9_]+)".{0,80}?>([^<]{0,120})', raw):
         add(speakers, handle, name)
 
-host    = uniq(host)
-cohosts = uniq(cohosts)
-speakers= uniq(speakers)
+host=uniq(host); cohosts=uniq(cohosts); speakers=uniq(speakers)
 
-html_out=[]
 def block(title, items):
-    if not items: return
-    html_out.append(f'  <li><strong>{title}</strong>')
-    html_out.append('    <ul>')
+    if not items: return ""
+    lines=[f'  <li><strong>{title}</strong>', '    <ul>']
     for u,l in items:
-        html_out.append(f'      <li><a href="{u}" target="_blank">{html.escape(l)}</a></li>')
-    html_out.append('    </ul>')
-    html_out.append('  </li>')
+        lines.append(f'      <li><a href="{u}" target="_blank">{html.escape(l)}</a></li>')
+    lines += ['    </ul>', '  </li>']
+    return "\n".join(lines)
 
-if host or cohosts or speakers:
-    html_out_head=['<ul>']
-    block("Host", host)
-    block("Co-hosts", cohosts)
-    block("Speakers", speakers)
-    html_out_tail=['</ul>']
-    open(outp,'w',encoding='utf-8').write("\n".join(html_out_head+html_out+html_out_tail))
-else:
-    open(outp,'w',encoding='utf-8').write("")
+parts=['<ul>']
+parts.append(block("Host", host))
+parts.append(block("Co-hosts", cohosts))
+parts.append(block("Speakers", speakers))
+parts.append('</ul>')
+out="\n".join(p for p in parts if p)
+open(outp,'w',encoding='utf-8').write(out if out.strip()!="<ul>\n</ul>" else "")
 PY
-          ATTH="$OUTDIR/attendees.html"
-          if [[ -s "$ATTH" ]]; then
-            echo "attendees_html_path=$ATTH" >> $GITHUB_OUTPUT
+          if [ -s "$ATTH" ]; then
+            echo "attendees_html=${ATTH}" >> "$GITHUB_OUTPUT"
           else
-            echo "attendees_html_path=" >> $GITHUB_OUTPUT
+            echo "attendees_html=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Register with WordPress
+      - name: Ping (registering in WordPress)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "Registering assets in WordPress…" \
+                       --arg run "${{ github.run_id }}" --argjson progress 95 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: Register in WordPress (proxy URL + attendees)
         id: register
+        shell: bash
         env:
-          WP_BASE_URL: ${{ env.WP_BASE_URL }}
-          WP_USER: ${{ env.WP_USER }}
-          WP_APP_PASSWORD: ${{ env.WP_APP_PASSWORD }}
-          BASE: ${{ steps.prep.outputs.base }}
-          TITLE_IN: ${{ steps.prep.outputs.title_in }}
-          POST_ID: ${{ steps.prep.outputs.post_id }}
-          GCS_PUBLIC: ${{ steps.uploadmp3.outputs.public_url }}
-          VTT_PUBLIC: ${{ steps.uploadvtt.outputs.vtt_public }}
-          PROXY_BASE: ${{ steps.prep.outputs.proxy_base }}
-          PROXY_PREFIX: ${{ steps.prep.outputs.proxy_prefix }}
-          TX_PATH: ${{ steps.transcribe.outputs.tx_path }}
-          ATTH: ${{ steps.peek.outputs.attendees_html_path }}
+          WP_URL:  ${{ env.WP_BASE_URL }}
+          WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
+          GCS_URL: ${{ steps.upload_mp3.outputs.gcs_url }}
+          VTT_URL: ${{ steps.upload_vtt.outputs.vtt_url }}
+          TITLE_IN:   ${{ inputs.title }}
+          POST_ID_IN: ${{ inputs.post_id }}
+          PROXY_BASE:   ${{ env.PROXY_BASE }}
+          PROXY_PREFIX: ${{ env.PROXY_PREFIX }}
+          ATTH_PATH: ${{ steps.peek.outputs.attendees_html }}
         run: |
-          set -euo pipefail
-          # compute proxy URL for MP3
-          BN="$(basename "${GCS_PUBLIC}")"  # space-*.mp3
+          set -euxo pipefail
+          JFILE="${ARTDIR}/register.json"
+          TXFILE="${TX_PATH:-${ARTDIR}/${BASE}.txt}"
+          [ -f "$TXFILE" ] || : > "$TXFILE"
+
+          # map storage → proxy
+          BN="$(basename "${GCS_URL}")"
           PROXY_URL="${PROXY_BASE%/}/${PROXY_PREFIX#/}${BN}"
-          # build JSON
-          JFILE="$GITHUB_WORKSPACE/out/register.json"
-          # read transcript if exists
-          TX=""
-          if [[ -n "${TX_PATH:-}" && -s "${TX_PATH:-}" ]]; then
-            TX="$(cat "$TX_PATH")"
-          fi
-          # read attendees if exists
-          ATT=""
-          if [[ -n "${ATTH:-}" && -s "${ATTH:-}" ]]; then
-            ATT="$(cat "$ATTH")"
+
+          if [ -n "${ATTH_PATH}" ] && [ -s "${ATTH_PATH}" ]; then
+            ATTH_JSON=$(jq -Rs . < "${ATTH_PATH}")
+          else
+            ATTH_JSON="null"
           fi
 
-          # prefer provided title or fall back to Space URL
-          TITLE="${TITLE_IN:-Space: ${SPACE_URL}}"
-
-          # compose payload
           jq -n \
-            --arg title   "$TITLE" \
-            --arg gcs     "$PROXY_URL" \
+            --arg title   "${TITLE_IN}" \
+            --arg gcs     "${PROXY_URL}" \
             --arg mime    "audio/mpeg" \
-            --arg vtt     "${VTT_PUBLIC:-}" \
-            --arg tx      "$TX" \
-            --arg att     "$ATT" \
-            --arg pid     "${POST_ID:-}" '
-              {
-                title: $title,
-                gcs_url: $gcs,
-                mime: $mime
-              }
-              + ( ( $vtt | select(length>0) ) as $v? | ( if $v? then { vtt_url: $v? } else {} end) )
-              + ( ( $tx  | select(length>0) ) as $t? | ( if $t? then { transcript: $t? } else {} end) )
-              + ( ( $att | select(length>0) ) as $a? | ( if $a? then { attendees_html: $a? } else {} end) )
-              + ( ( $pid | tonumber? ) as $maybe | if $maybe then { post_id: $maybe } else {} end )
-            ' > "$JFILE"
+            --arg vtt     "${VTT_URL}" \
+            --arg pid     "${POST_ID_IN}" \
+            --rawfile tx  "${TXFILE}" \
+            --argjson att ${ATTH_JSON} '
+            {
+              title: ($title // ""),
+              gcs_url: $gcs,
+              mime: $mime
+            }
+            + ( ($vtt // "") | select(length>0) | {vtt_url:.} )
+            + ( ($tx  // "") | select(length>0) | {transcript:.} )
+            + ( if $att != null then {attendees_html:$att} else {} end )
+            + ( ($pid|tonumber? // null) as $maybe
+                | if $maybe then {post_id:$maybe} else {} end )
+          ' > "$JFILE"
 
-          echo "Register payload:"
-          jq . "$JFILE"
+          RESP="${ARTDIR}/register.out.json"
+          curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
+            -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
+            --data-binary @"${JFILE}" > "${RESP}"
 
-          RESP="$GITHUB_WORKSPACE/out/register.out.json"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H 'Content-Type: application/json' \
-            -X POST "${WP_BASE_URL}/wp-json/ss3k/v1/register" \
-            --data-binary @"$JFILE" > "$RESP"
+          PERMA=$(jq -r '.permalink // ""' "${RESP}")
+          EDIT_URL="${WP_URL%/}/wp-admin/post.php?post=${POST_ID_IN}&action=edit"
 
-          echo "WP response:"
-          jq . "$RESP"
+          curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
+            -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${POST_ID_IN}" --arg status "complete" \
+                       --arg msg "Worker finished. View: ${PERMA} · Edit: ${EDIT_URL}" \
+                       --arg run "${{ github.run_id }}" --argjson progress 100 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-          # summarize
-          PERMA="$(jq -r '.permalink // ""' "$RESP")"
-          echo "permalink=$PERMA" >> $GITHUB_OUTPUT
+          jq . "${RESP}" || true
 
-      - name: Finish — tell WP it’s complete
-        if: env.WP_BASE_URL != '' && env.POST_ID != ''
-        env:
-          WP_BASE_URL: ${{ env.WP_BASE_URL }}
-          WP_USER: ${{ env.WP_USER }}
-          WP_APP_PASSWORD: ${{ env.WP_APP_PASSWORD }}
-          PERMA: ${{ steps.register.outputs.permalink }}
+      - name: Ping WP on failure
+        if: ${{ failure() && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
         run: |
           set -euo pipefail
-          MSG="Worker finished. View: ${PERMA}"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H 'Content-Type: application/json' \
-            -X POST "${WP_BASE_URL}/wp-json/ss3k/v1/worker-status" \
-            -d "{\"post_id\": ${POST_ID}, \"status\": \"complete\", \"message\": \"${MSG}\", \"run_id\": \"${GITHUB_RUN_ID}\", \"progress\": 100}" >/dev/null
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "error" \
+                       --arg msg "Worker failed. See GitHub run ${{ github.run_id }}." \
+                       --arg run "${{ github.run_id }}" --argjson progress 100 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Job summary
-        if: always()
-        env:
-          SPACE_URL: ${{ env.SPACE_URL }}
-          GCS_PUBLIC: ${{ steps.uploadmp3.outputs.public_url }}
-          VTT_PUBLIC: ${{ steps.uploadvtt.outputs.vtt_public }}
-          PERMA: ${{ steps.register.outputs.permalink }}
+        if: ${{ always() }}
+        shell: bash
         run: |
           {
             echo "### Space Worker Summary"
-            echo "- **Space URL:** ${SPACE_URL}"
-            echo "- **GCS MP3:** ${GCS_PUBLIC}"
-            if [[ -n "${VTT_PUBLIC:-}" ]]; then
-              echo "- **GCS VTT:** ${VTT_PUBLIC}"
+            echo "- **Space URL:** ${{ inputs.space_url }}"
+            echo "- **Post ID:** ${{ inputs.post_id }}"
+            echo "- **GCS MP3:** ${{ steps.upload_mp3.outputs.gcs_url }}"
+            if [ "${{ steps.upload_vtt.outputs.vtt_url }}" != "" ]; then
+              echo "- **GCS VTT:** ${{ steps.upload_vtt.outputs.vtt_url }}"
             fi
-            echo "- **WP Post:** ${PERMA}"
+            echo "- **Public:** ${{ inputs.make_public }}"
+            echo "- **Transcript:** ${{ inputs.do_transcript }}"
           } >> "$GITHUB_STEP_SUMMARY"
