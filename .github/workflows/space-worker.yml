@@ -48,14 +48,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Prefer repository/org Secrets; fall back to repo/org Variables.
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-  # Proxy mapping for the saved URL in WP (defaults to media.chbmp.org):
+  # Proxy used when saving to WP
   PROXY_BASE:       ${{ secrets.PROXY_BASE || vars.PROXY_BASE || 'https://media.chbmp.org' }}
   PROXY_PREFIX:     ${{ secrets.PROXY_PREFIX || vars.PROXY_PREFIX || '' }}
   WORKDIR: ${{ github.workspace }}/work
@@ -101,7 +100,6 @@ jobs:
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
           mkdir -p "$WORKDIR" "$ARTDIR"
-          # trim leading/trailing slashes from prefix
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
 
@@ -124,7 +122,7 @@ jobs:
           printf '%s\n' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      - name: "Preflight: bucket ok + tiny upload"
+      - name: Preflight: bucket ok + tiny upload
         id: preflight
         shell: bash
         env:
@@ -139,7 +137,6 @@ jobs:
             TEST="gs://${GCS_BUCKET}/_preflight/_preflight-${GITHUB_RUN_ID}.txt"
           fi
           gsutil cp "${ARTDIR}/_preflight-${GITHUB_RUN_ID}.txt" "${TEST}"
-          # Try to make it public; tolerate UBLA buckets.
           gsutil acl ch -u AllUsers:R "${TEST}" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
           gsutil rm -f "${TEST}" || true
           echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -228,7 +225,6 @@ jobs:
           echo "BASE=${BASE}" >> "$GITHUB_ENV"
 
           OUT_MP3="${ARTDIR}/${BASE}.mp3"
-          # Trim silence (start & end) then apply loudnorm with measured values
           ffmpeg -hide_banner -y -i "$INPUT_FILE" \
             -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_duration=0.5:start_threshold=-45dB,areverse,loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=${ME_I}:measured_TP=${ME_TP}:measured_LRA=${ME_LRA}:measured_thresh=${ME_THR}:print_format=summary" \
             -ar 48000 -ac 2 -codec:a libmp3lame -b:a 128k "$OUT_MP3"
@@ -320,55 +316,38 @@ jobs:
           TX_PATH="${ARTDIR}/${BASE}.txt"
           VTT_PATH="${ARTDIR}/${BASE}.vtt"
 
-          # Deepgram diarized JSON
           curl -sS -X POST "https://api.deepgram.com/v1/listen?smart_format=true&model=nova-2&diarize=true&utterances=true" \
             -H "Authorization: Token ${DG_KEY}" \
             -H "Content-Type: audio/mpeg" \
             --data-binary @"${OUT_MP3}" > "${DG_JSON}"
 
-          # Write Python helper to a file (avoid inline heredoc after python3)
+          # Build a tiny python file without heredocs (YAML-safe)
           TXPY="${WORKDIR}/make_tx_vtt.py"
-          cat > "${TXPY}" <<'PY'
-import json, sys
-dg, tx, vtt = sys.argv[1:]
-data=json.load(open(dg,encoding='utf-8'))
-def vtt_time(t):
-    h=int(t//3600); t-=h*3600
-    m=int(t//60); s=t-m*60
-    ms=int(round((s-int(s))*1000))
-    return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"
-utts=data.get("results",{}).get("utterances") or []
-if not utts:
-    alts=data.get("results",{}).get("channels",[{"alternatives":[{}]}])[0]["alternatives"][0]
-    utts=[{"speaker":0,"start":0.0,"end":alts.get("duration",0.0),"transcript":alts.get("transcript","").strip()}]
-paras=[]; cues=[]
-cur_s=None; cur_txt=[]; start=None; end=None
-for u in utts:
-    sp=int(u.get("speaker",0))
-    t=(u.get("transcript") or "").strip()
-    s=float(u.get("start") or 0.0); e=float(u.get("end") or s)
-    if not t: continue
-    if cur_s is None: cur_s=sp; cur_txt=[t]; start=s; end=e
-    elif sp==cur_s:   cur_txt.append(t); end=e
-    else:
-        text=" ".join(cur_txt).strip()
-        paras.append((cur_s,text))
-        cues.append((start,end,cur_s,text))
-        cur_s=sp; cur_txt=[t]; start=s; end=e
-if cur_txt:
-    text=" ".join(cur_txt).strip()
-    paras.append((cur_s,text))
-    cues.append((start,end,cur_s,text))
-with open(tx,'w',encoding='utf-8') as f:
-    for sp, text in paras:
-        f.write(f"Speaker {sp+1}: {text}\n\n")
-with open(vtt,'w',encoding='utf-8') as f:
-    f.write("WEBVTT\n\n")
-    for s,e,sp,text in cues:
-        f.write(f"{vtt_time(s)} --> {vtt_time(e)}\nSpeaker {sp+1}: {text}\n\n")
-PY
-          python3 "${TXPY}" "${DG_JSON}" "${TX_PATH}" "${VTT_PATH}"
+          printf '%s\n' '#!/usr/bin/env python3' \
+          'import json, sys' \
+          'dg, tx, vtt = sys.argv[1:]' \
+          'data=json.load(open(dg,encoding="utf-8"))' \
+          'def vt(t):' \
+          '    h=int(t//3600); t-=h*3600; m=int(t//60); s=t-m*60; ms=int(round((s-int(s))*1000)); return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"' \
+          'utts=data.get("results",{}).get("utterances") or []' \
+          'if not utts:' \
+          '    alts=data.get("results",{}).get("channels",[{"alternatives":[{}]}])[0]["alternatives"][0]' \
+          '    utts=[{"speaker":0,"start":0.0,"end":alts.get("duration",0.0),"transcript":alts.get("transcript","").strip()}]' \
+          'paras=[]; cues=[]' \
+          'cur=None; buf=[]; s=e=None' \
+          'for u in utts:' \
+          '    sp=int(u.get("speaker",0)); t=(u.get("transcript") or "").strip(); st=float(u.get("start") or 0.0); en=float(u.get("end") or st)' \
+          '    if not t: continue' \
+          '    if cur is None: cur=sp; buf=[t]; s=st; e=en' \
+          '    elif sp==cur: buf.append(t); e=en' \
+          '    else: txt=" ".join(buf).strip(); paras.append((cur,txt)); cues.append((s,e,cur,txt)); cur=sp; buf=[t]; s=st; e=en' \
+          'if buf: txt=" ".join(buf).strip(); paras.append((cur,txt)); cues.append((s,e,cur,txt))' \
+          'open(tx,"w",encoding="utf-8").write("".join([f"Speaker {sp+1}: {txt}\\n\\n" for sp,txt in paras]))' \
+          'f=open(vtt,"w",encoding="utf-8"); f.write("WEBVTT\\n\\n")' \
+          '[f.write(f"{vt(s)} --> {vt(e)}\\nSpeaker {sp+1}: {txt}\\n\\n") for s,e,sp,txt in cues]; f.close()' \
+          > "$TXPY"
 
+          python3 "$TXPY" "$DG_JSON" "$TX_PATH" "$VTT_PATH"
           echo "TX_PATH=${TX_PATH}"   >> "$GITHUB_ENV"
           echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
 
@@ -428,48 +407,42 @@ PY
           ATTH="${ARTDIR}/attendees.html"
           curl -sSL -A "Mozilla/5.0" "${URL%/}/peek" -o "${ARTDIR}/peek.html" || true
           PYTMP="${WORKDIR}/peek_to_html.py"
-          cat > "${PYTMP}" <<'PY'
-import re, sys, html
-src, outp = sys.argv[1], sys.argv[2]
-try:
-    raw=open(src,'r',encoding='utf-8',errors='ignore').read()
-except:
-    raw=""
-host=[]; cohosts=[]; speakers=[]
-def add(lst, handle, name=""):
-    h=handle.strip('@'); url=f"https://x.com/{h}"
-    label=f"{name.strip()} (@{h})" if name.strip() else f"@{h}"
-    lst.append((url,label))
-def uniq(lst):
-    seen=set(); res=[]
-    for u,l in lst:
-        if (u,l) in seen: continue
-        seen.add((u,l)); res.append((u,l))
-    return res
-for role, handle, name in re.findall(r'(?i)(Host|Co-?hosts?|Speakers?).{0,400}?href="https://x\.com/([A-Za-z0-9_]+)"[^>]*>([^<]{0,120})', raw):
-    role=role.lower()
-    if 'co' in role: add(cohosts, handle, name)
-    elif 'host' in role: add(host, handle, name)
-    else: add(speakers, handle, name)
-if not (host or cohosts or speakers):
-    for handle, name in re.findall(r'href="https://x\.com/([A-Za-z0-9_]+)".{0,80}?>([^<]{0,120})', raw):
-        add(speakers, handle, name)
-host=uniq(host); cohosts=uniq(cohosts); speakers=uniq(speakers)
-def block(title, items):
-    if not items: return ""
-    lines=[f'  <li><strong>{title}</strong>', '    <ul>']
-    for u,l in items:
-        lines.append(f'      <li><a href="{u}" target="_blank">{html.escape(l)}</a></li>')
-    lines += ['    </ul>', '  </li>']
-    return "\n".join(lines)
-parts=['<ul>']
-for title, items in (("Host",host),("Co-hosts",cohosts),("Speakers",speakers)):
-    b=block(title, items)
-    if b: parts.append(b)
-parts.append('</ul>')
-out="\n".join(parts)
-open(outp,'w',encoding='utf-8').write(out if out.strip()!="<ul>\n</ul>" else "")
-PY
+          printf '%s\n' 'import re, sys, html' \
+          'src, outp = sys.argv[1], sys.argv[2]' \
+          'raw=open(src,"r",encoding="utf-8",errors="ignore").read() if src else ""' \
+          'host=[]; cohosts=[]; speakers=[]' \
+          'def add(lst, handle, name=""):' \
+          '    h=handle.strip("@"); url=f"https://x.com/{h}"' \
+          '    label=f"{name.strip()} (@{h})" if name.strip() else f"@{h}"' \
+          '    lst.append((url,label))' \
+          'def uniq(lst):' \
+          '    seen=set(); res=[]' \
+          '    for u,l in lst:' \
+          '        if (u,l) in seen: continue' \
+          '        seen.add((u,l)); res.append((u,l))' \
+          '    return res' \
+          'for role, handle, name in re.findall(r"(?i)(Host|Co-?hosts?|Speakers?).{0,400}?href=\\"https://x\\.com/([A-Za-z0-9_]+)\\"[^>]*>([^<]{0,120})", raw):' \
+          '    role=role.lower()' \
+          '    if "co" in role: add(cohosts, handle, name)' \
+          '    elif "host" in role: add(host, handle, name)' \
+          '    else: add(speakers, handle, name)' \
+          'if not (host or cohosts or speakers):' \
+          '    for handle, name in re.findall(r"href=\\"https://x\\.com/([A-Za-z0-9_]+)\\".{0,80}?>([^<]{0,120})", raw):' \
+          '        add(speakers, handle, name)' \
+          'host=uniq(host); cohosts=uniq(cohosts); speakers=uniq(speakers)' \
+          'def block(title, items):' \
+          '    if not items: return ""' \
+          '    lines=[f"  <li><strong>{title}</strong>", "    <ul>"]' \
+          '    for u,l in items: lines.append(f"      <li><a href=\\"{u}\\" target=\\"_blank\\">{html.escape(l)}</a></li>")' \
+          '    lines += ["    </ul>", "  </li>"]; return "\n".join(lines)' \
+          'parts=["<ul>"]' \
+          'for title, items in (("Host",host),("Co-hosts",cohosts),("Speakers",speakers)):' \
+          '    b=block(title, items)' \
+          '    if b: parts.append(b)' \
+          'parts.append("</ul>")' \
+          'out="".join([p+"\n" for p in parts])' \
+          'open(outp,"w",encoding="utf-8").write(out if out.strip()!="<ul></ul>" else "")' \
+          > "${PYTMP}"
           python3 "${PYTMP}" "${ARTDIR}/peek.html" "${ATTH}" || true
           if [ -s "$ATTH" ]; then
             echo "attendees_html=${ATTH}" >> "$GITHUB_OUTPUT"
@@ -508,7 +481,6 @@ PY
           TXFILE="${TX_PATH:-${ARTDIR}/${BASE}.txt}"
           [ -f "$TXFILE" ] || : > "$TXFILE"
 
-          # map storage → proxy
           BN="$(basename "${GCS_URL}")"
           if [ -n "${PROXY_PREFIX}" ]; then
             PROXY_URL="${PROXY_BASE%/}/${PROXY_PREFIX#/}/${BN}"
@@ -567,7 +539,7 @@ PY
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
             -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "error" \
-                       --arg msg "Worker failed. See GitHub run ${{ github.run_id }}." \
+                       --arg msg "Worker failed. See GitHub run ${GITHUB_RUN_ID}." \
                        --arg run "${{ github.run_id }}" --argjson progress 100 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
