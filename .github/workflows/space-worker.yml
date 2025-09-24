@@ -55,7 +55,7 @@ env:
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-  # Proxy mapping for final URL saved to WP:
+  # Proxy mapping for the saved URL in WP (defaults to media.chbmp.org):
   PROXY_BASE:       ${{ secrets.PROXY_BASE || vars.PROXY_BASE || 'https://media.chbmp.org' }}
   PROXY_PREFIX:     ${{ secrets.PROXY_PREFIX || vars.PROXY_PREFIX || '' }}
   WORKDIR: ${{ github.workspace }}/work
@@ -101,6 +101,7 @@ jobs:
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
           mkdir -p "$WORKDIR" "$ARTDIR"
+          # trim leading/trailing slashes from prefix
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
 
@@ -138,6 +139,7 @@ jobs:
             TEST="gs://${GCS_BUCKET}/_preflight/_preflight-${GITHUB_RUN_ID}.txt"
           fi
           gsutil cp "${ARTDIR}/_preflight-${GITHUB_RUN_ID}.txt" "${TEST}"
+          # Try to make it public; tolerate UBLA buckets.
           gsutil acl ch -u AllUsers:R "${TEST}" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
           gsutil rm -f "${TEST}" || true
           echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -318,25 +320,27 @@ jobs:
           TX_PATH="${ARTDIR}/${BASE}.txt"
           VTT_PATH="${ARTDIR}/${BASE}.vtt"
 
+          # Deepgram diarized JSON
           curl -sS -X POST "https://api.deepgram.com/v1/listen?smart_format=true&model=nova-2&diarize=true&utterances=true" \
             -H "Authorization: Token ${DG_KEY}" \
             -H "Content-Type: audio/mpeg" \
             --data-binary @"${OUT_MP3}" > "${DG_JSON}"
 
-          python3 - "$DG_JSON" "$TX_PATH" "$VTT_PATH" << 'PY'
+          # Write Python helper to a file (avoid inline heredoc after python3)
+          TXPY="${WORKDIR}/make_tx_vtt.py"
+          cat > "${TXPY}" <<'PY'
 import json, sys
 dg, tx, vtt = sys.argv[1:]
 data=json.load(open(dg,encoding='utf-8'))
 def vtt_time(t):
     h=int(t//3600); t-=h*3600
     m=int(t//60); s=t-m*60
-    ms=int(round((s-int(s))*1000)); return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"
-
+    ms=int(round((s-int(s))*1000))
+    return f"{h:02d}:{m:02d}:{int(s):02d}.{ms:03d}"
 utts=data.get("results",{}).get("utterances") or []
 if not utts:
     alts=data.get("results",{}).get("channels",[{"alternatives":[{}]}])[0]["alternatives"][0]
     utts=[{"speaker":0,"start":0.0,"end":alts.get("duration",0.0),"transcript":alts.get("transcript","").strip()}]
-
 paras=[]; cues=[]
 cur_s=None; cur_txt=[]; start=None; end=None
 for u in utts:
@@ -355,16 +359,15 @@ if cur_txt:
     text=" ".join(cur_txt).strip()
     paras.append((cur_s,text))
     cues.append((start,end,cur_s,text))
-
 with open(tx,'w',encoding='utf-8') as f:
     for sp, text in paras:
         f.write(f"Speaker {sp+1}: {text}\n\n")
-
 with open(vtt,'w',encoding='utf-8') as f:
     f.write("WEBVTT\n\n")
     for s,e,sp,text in cues:
         f.write(f"{vtt_time(s)} --> {vtt_time(e)}\nSpeaker {sp+1}: {text}\n\n")
 PY
+          python3 "${TXPY}" "${DG_JSON}" "${TX_PATH}" "${VTT_PATH}"
 
           echo "TX_PATH=${TX_PATH}"   >> "$GITHUB_ENV"
           echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
@@ -424,7 +427,8 @@ PY
           set -euo pipefail
           ATTH="${ARTDIR}/attendees.html"
           curl -sSL -A "Mozilla/5.0" "${URL%/}/peek" -o "${ARTDIR}/peek.html" || true
-          python3 - "${ARTDIR}/peek.html" "$ATTH" << 'PY'
+          PYTMP="${WORKDIR}/peek_to_html.py"
+          cat > "${PYTMP}" <<'PY'
 import re, sys, html
 src, outp = sys.argv[1], sys.argv[2]
 try:
@@ -442,21 +446,15 @@ def uniq(lst):
         if (u,l) in seen: continue
         seen.add((u,l)); res.append((u,l))
     return res
-
-# simple role-aware scrape
 for role, handle, name in re.findall(r'(?i)(Host|Co-?hosts?|Speakers?).{0,400}?href="https://x\.com/([A-Za-z0-9_]+)"[^>]*>([^<]{0,120})', raw):
     role=role.lower()
     if 'co' in role: add(cohosts, handle, name)
     elif 'host' in role: add(host, handle, name)
     else: add(speakers, handle, name)
-
-# fallback: any anchors → speakers
 if not (host or cohosts or speakers):
     for handle, name in re.findall(r'href="https://x\.com/([A-Za-z0-9_]+)".{0,80}?>([^<]{0,120})', raw):
         add(speakers, handle, name)
-
 host=uniq(host); cohosts=uniq(cohosts); speakers=uniq(speakers)
-
 def block(title, items):
     if not items: return ""
     lines=[f'  <li><strong>{title}</strong>', '    <ul>']
@@ -464,15 +462,15 @@ def block(title, items):
         lines.append(f'      <li><a href="{u}" target="_blank">{html.escape(l)}</a></li>')
     lines += ['    </ul>', '  </li>']
     return "\n".join(lines)
-
 parts=['<ul>']
-parts.append(block("Host", host))
-parts.append(block("Co-hosts", cohosts))
-parts.append(block("Speakers", speakers))
+for title, items in (("Host",host),("Co-hosts",cohosts),("Speakers",speakers)):
+    b=block(title, items)
+    if b: parts.append(b)
 parts.append('</ul>')
-out="\n".join(p for p in parts if p)
+out="\n".join(parts)
 open(outp,'w',encoding='utf-8').write(out if out.strip()!="<ul>\n</ul>" else "")
 PY
+          python3 "${PYTMP}" "${ARTDIR}/peek.html" "${ATTH}" || true
           if [ -s "$ATTH" ]; then
             echo "attendees_html=${ATTH}" >> "$GITHUB_OUTPUT"
           else
@@ -512,7 +510,11 @@ PY
 
           # map storage → proxy
           BN="$(basename "${GCS_URL}")"
-          PROXY_URL="${PROXY_BASE%/}/${PROXY_PREFIX#/}${BN}"
+          if [ -n "${PROXY_PREFIX}" ]; then
+            PROXY_URL="${PROXY_BASE%/}/${PROXY_PREFIX#/}/${BN}"
+          else
+            PROXY_URL="${PROXY_BASE%/}/${BN}"
+          fi
 
           if [ -n "${ATTH_PATH}" ] && [ -s "${ATTH_PATH}" ]; then
             ATTH_JSON=$(jq -Rs . < "${ATTH_PATH}")
