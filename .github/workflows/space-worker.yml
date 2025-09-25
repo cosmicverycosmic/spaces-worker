@@ -301,7 +301,7 @@ jobs:
           echo "proxy_url=${PROXY_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Ping (uploaded MP3)
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -313,7 +313,7 @@ jobs:
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Ping (transcribing)
-        if: ${{ inputs.do_transcript == 'true' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        if: ${{ inputs.do_transcript == 'true' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -328,7 +328,7 @@ jobs:
 
       - name: Transcript + diarized VTT (Deepgram)
         id: tx
-        if: ${{ inputs.do_transcript == 'true' }}
+        if: ${{ inputs.do_transcript == 'true' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         env:
           DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
@@ -462,7 +462,7 @@ jobs:
           ATTN_HTML="${ARTDIR}/attendees.html"
           : > "${ATTN_HTML}"
           if [ -n "${WP_URL}" ] && [ -n "${WP_AUTH}" ]; then
-            # Call WP /peek helper (added below in plugin)
+            # Call WP /peek helper
             curl -sS -u "${WP_AUTH}" \
               --get --data-urlencode "space_url=${URL}" \
               "${WP_URL%/}/wp-json/ss3k/v1/peek" > "${ATTN_JSON}" || true
@@ -504,7 +504,7 @@ jobs:
           echo "ATTN_HTML=${ATTN_HTML}" >> "$GITHUB_ENV"
 
       - name: Ping (registering in WordPress)
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -515,15 +515,15 @@ jobs:
                        --arg run "${{ github.run_id }}" --argjson progress 95 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Register in WordPress (with attendees)
+      - name: Register in WordPress (final-only; with attendees)
         id: register
+        if: ${{ steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         env:
           WP_URL:  ${{ env.WP_BASE_URL }}
           WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
-          # Use PROXY URLs for WP persistence
-          MEDIA_URL: ${{ steps.upload_mp3.outputs.proxy_url }}
-          VTT_URL:   ${{ steps.upload_vtt.outputs.proxy_vtt }}
+          MEDIA_URL: ${{ steps.upload_mp3.outputs.proxy_url }}   # use PROXY URL
+          VTT_URL:   ${{ steps.upload_vtt.outputs.proxy_vtt }}   # may be empty
           TITLE_IN:   ${{ inputs.title }}
           POST_ID_IN: ${{ inputs.post_id }}
         run: |
@@ -537,6 +537,7 @@ jobs:
             AT_HTML="$(cat "${ATFILE}")"
           fi
 
+          # Build JSON safely (no jq optional-variable syntax)
           jq -n \
             --arg title "${TITLE_IN}" \
             --arg media "${MEDIA_URL}" \
@@ -544,18 +545,14 @@ jobs:
             --arg vtt   "${VTT_URL}" \
             --arg pid   "${POST_ID_IN}" \
             --rawfile tx  "${TXFILE}" \
-            --arg attendees "${AT_HTML}" '
-            {
-              title: ($title // ""),
-              gcs_url: $media,     # proxy URL persisted to WP
-              mime: $mime,
-              vtt_url: ( ($vtt // "") | select(length>0) ),
-              transcript: ( ($tx // "") | select(length>0) )
-            }
-            + ( ($attendees | select(length>0)) as $att? | if $att? then {attendees: $att} else {} end )
-            + ( ($pid|tonumber? // null) as $maybe
-                | if $maybe then {post_id:$maybe} else {} end )
-          ' > "$JFILE"
+            --arg attendees_html "${AT_HTML}" '
+              { title: ($title // ""), gcs_url: $media, mime: $mime }
+              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+              + (if ($tx|length)>0 then {transcript:$tx} else {} end)
+              + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
+              + ( ($pid|tonumber? // null) as $maybe
+                  | if $maybe then {post_id:$maybe} else {} end )
+            ' > "$JFILE"
 
           RESP="${ARTDIR}/register.out.json"
           curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
@@ -565,12 +562,14 @@ jobs:
           PERMA=$(jq -r '.permalink // ""' "${RESP}")
           EDIT_URL="${WP_URL%/}/wp-admin/post.php?post=${POST_ID_IN}&action=edit"
 
-          curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
-            -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${POST_ID_IN}" --arg status "complete" \
-                       --arg msg "Worker finished. View: ${PERMA} · Edit: ${EDIT_URL}" \
-                       --arg run "${{ github.run_id }}" --argjson progress 100 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+          if [ -n "${POST_ID_IN}" ]; then
+            curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
+              -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
+              -d "$(jq -n --arg pid "${POST_ID_IN}" --arg status "complete" \
+                         --arg msg "Worker finished. View: ${PERMA} · Edit: ${EDIT_URL}" \
+                         --arg run "${{ github.run_id }}" --argjson progress 100 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+          fi
 
           jq . "${RESP}" || true
 
