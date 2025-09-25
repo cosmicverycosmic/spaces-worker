@@ -39,24 +39,11 @@ on:
         required: false
         type: string
         default: ""
-
-      # --- New/extra inputs to avoid 422s and support targeted runs ---
       space_id:
         description: "Space ID (e.g. 1kvJpyzZOOkxE); auto-parsed from URL if blank"
         required: false
         type: string
         default: ""
-      preferred_basename:
-        description: "Override output base filename (without extension)"
-        required: false
-        type: string
-        default: ""
-      skip_preflight:
-        description: "Ignored (kept for compatibility)"
-        required: false
-        type: choice
-        options: ["true", "false"]
-        default: "true"
       mode:
         description: "Optional targeted mode (full default)"
         required: false
@@ -135,7 +122,7 @@ jobs:
           echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
           echo "PREFIX=${PFX}" >> "$GITHUB_ENV"
 
-          # Bucket path drops leading "spaces/" (proxy keeps it)
+          # If PREFIX is "spaces/YYYY/MM", drop the leading "spaces/" for the bucket
           BP="${PFX#spaces/}"
           echo "bucket_prefix=${BP}" >> "$GITHUB_OUTPUT"
           echo "BUCKET_PREFIX=${BP}" >> "$GITHUB_ENV"
@@ -146,27 +133,17 @@ jobs:
         env:
           IN_SPACE_ID: ${{ inputs.space_id }}
           IN_URL: ${{ inputs.space_url }}
-          IN_BASE: ${{ inputs.preferred_basename }}
         run: |
           set -euxo pipefail
-          # Space ID from input or parse from URL
           SID="${IN_SPACE_ID}"
           if [ -z "$SID" ]; then
             SID="$(echo "$IN_URL" | sed -nE 's#.*/i/spaces/([^/?#]+).*#\1#p')"
           fi
           if [ -z "$SID" ]; then SID="run${GITHUB_RUN_ID}"; fi
 
-          # Date string mm-dd-YYYY
+          # BASE = space-MM-DD-YYYY-<SpaceID>
           D="$(date +%m-%d-%Y)"
-
-          # Preferred basename or default "space-MM-DD-YYYY-<SID>"
-          if [ -n "$IN_BASE" ]; then
-            BASE="$IN_BASE"
-          else
-            BASE="space-${D}-${SID}"
-          fi
-
-          # Sanitize basename
+          BASE="space-${D}-${SID}"
           BASE="$(echo "$BASE" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')"
 
           echo "space_id=${SID}" >> "$GITHUB_OUTPUT"
@@ -314,7 +291,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Bucket path excludes leading "spaces/"
           DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
           RAW_URL="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
           PROXY_URL="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
@@ -609,7 +585,6 @@ jobs:
               -X POST "${WP_URL%/}/wp-json/ss3k/v1/patch-assets" \
               --data-binary @"${ARTDIR}/patch_attendees.json"
           fi
-          # Mark complete (do not regress if other assets already complete)
           curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
             -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
             -d "$(jq -n --arg pid "${POST_ID_IN}" --arg status "complete" \
