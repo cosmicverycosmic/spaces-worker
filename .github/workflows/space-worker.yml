@@ -442,24 +442,23 @@ jobs:
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
 
-      # ===========================
-      # ATTENDEES (crawler + fallback)
-      # ===========================
 
-      # === Peek attendees (Host / Co-hosts / Speakers) - ROBUST + DEBUG ===
+      # === Peek attendees (Host / Co-hosts / Speakers) - ROBUST + DEBUG + Correct Vars ===
       - name: Scrape attendees using twspace-crawler (robust, debug, retries, WP fallback)
         id: twspace_attendees
         shell: bash
         env:
-          ATTN_JSON: ${{ env.ARTDIR }}/attendees.json
-          ATTN_HTML: ${{ env.ARTDIR }}/attendees.html
-          WP_URL: ${{ env.WP_BASE_URL }}
-          WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
-          SID: ${{ steps.ids.outputs.space_id }}
+          ARTDIR: ${{ github.workspace }}/out
+          ATTN_JSON: ${{ github.workspace }}/out/attendees.json
+          ATTN_HTML: ${{ github.workspace }}/out/attendees.html
+          WP_URL: ${{ secrets.WP_BASE_URL || vars.WP_BASE_URL }}
+          WP_AUTH: ${{ secrets.WP_USER }}:${{ secrets.WP_APP_PASSWORD }}
+          SID: ${{ inputs.space_id }}
           URL: ${{ inputs.space_url }}
-          TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION }}
-          TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
-          TWITTER_CSRF_TOKEN: ${{ secrets.TWITTER_CSRF_TOKEN }}
+          # --- Twitter/X credentials from WP config or browser session
+          TWITTER_AUTHORIZATION: ${{ secrets.ss3k_x_bearer }}
+          TWITTER_AUTH_TOKEN: ${{ secrets.ss3k_x_access_token }}
+          TWITTER_CSRF_TOKEN: ${{ secrets.ss3k_x_access_secret }}
         run: |
           set -euxo pipefail
 
@@ -594,6 +593,7 @@ jobs:
           fi
 
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
+
 
       # ===========================
       # Derive Space date and set WP post date
