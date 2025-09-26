@@ -444,8 +444,6 @@ jobs:
           fi
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
-
-
       # === Peek attendees (Host / Co-hosts / Speakers) - ROBUST + DEBUG + Correct Vars ===
       - name: Scrape attendees using twspace-crawler (robust, debug, retries, WP fallback)
         id: twspace_attendees
@@ -456,7 +454,8 @@ jobs:
           ATTN_HTML: ${{ github.workspace }}/out/attendees.html
           WP_URL:  ${{ env.WP_BASE_URL }}
           WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
-          SID: ${{ inputs.space_id }}
+          # Prefer derived SPACE_ID if input is blank
+          SID: ${{ inputs.space_id != '' && inputs.space_id || env.SPACE_ID }}
           URL: ${{ inputs.space_url }}
           # --- Twitter/X credentials (either Bearer OR cookie pair)
           TWITTER_AUTHORIZATION: ${{ env.TWITTER_AUTHORIZATION }}
@@ -471,10 +470,15 @@ jobs:
           [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
           [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ] && echo "::add-mask::${WP_USER}:${WP_APP_PASSWORD}"
 
+          # Resolve SID if still empty (parse from URL)
+          if [ -z "${SID:-}" ] && [ -n "${URL:-}" ]; then
+            SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
+          fi
+
           # Debugging log for env and inputs (masked)
           echo "=== [twspace-crawler DEBUG] ==="
           echo "ARTDIR: $ARTDIR"
-          echo "SID: ${SID:-<none>}"
+          echo "SID (resolved): ${SID:-<none>}"
           echo "URL: $URL"
           echo "TWITTER_AUTHORIZATION set?: $([ -n "${TWITTER_AUTHORIZATION:-}" ] && echo yes || echo no)"
           echo "TWITTER_AUTH_TOKEN set?:    $([ -n "${TWITTER_AUTH_TOKEN:-}" ] && echo yes || echo no)"
@@ -494,7 +498,7 @@ jobs:
           MAX_CRAWLER_RETRIES=3
 
           # Try twspace-crawler with retries
-          if [ "$HAVE_KEYS" = "1" ]; then
+          if [ "$HAVE_KEYS" = "1" ] && [ -n "${SID:-}" ]; then
             docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest
             while [ $CRAWLER_ATTEMPTS -lt $MAX_CRAWLER_RETRIES ]; do
               set +e
@@ -509,40 +513,48 @@ jobs:
               CRAWLER_RC=$?
               set -e
               echo "twspace-crawler exit code: $CRAWLER_RC"
-              # Debug: show JSON (first 20 lines)
+              # Debug: show JSON (first 20 lines) and counts
               if [ -f "$ATTN_JSON" ]; then
                 echo "--- [twspace-crawler output - first 20 lines] ---"
                 head -20 "$ATTN_JSON" || true
-                echo "--- [end output] ---"
+                echo "--- [counts] ---"
+                jq -r '"host=\((.host // [])|length) cohosts=\((.cohosts // [])|length) speakers=\((.speakers // [])|length)"' "$ATTN_JSON" || true
+                echo "----------------"
               else
                 echo "No attendees.json found."
               fi
-              # If success and valid, break
-              if [ $CRAWLER_RC -eq 0 ] && jq -e '.host? or .cohosts? or .speakers?' "$ATTN_JSON" >/dev/null 2>&1; then
+              # If success and we have at least one attendee, break
+              if [ $CRAWLER_RC -eq 0 ] && jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
                 break
               fi
               CRAWLER_ATTEMPTS=$((CRAWLER_ATTEMPTS + 1))
               sleep $((2 ** CRAWLER_ATTEMPTS))
             done
             # If valid output, convert to HTML
-            if [ -f "$ATTN_JSON" ] && jq -e '.host? or .cohosts? or .speakers?' "$ATTN_JSON" >/dev/null 2>&1; then
+            if [ -f "$ATTN_JSON" ] && jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
-                echo "  <li><strong>Host</strong><ul>"
-                jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
-                echo "  <li><strong>Co-hosts</strong><ul>"
-                jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
-                echo "  <li><strong>Speakers</strong><ul>"
-                jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
+                if jq -e '(.host // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Host</strong><ul>"
+                  jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
+                if jq -e '(.cohosts // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Co-hosts</strong><ul>"
+                  jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
+                if jq -e '(.speakers // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Speakers</strong><ul>"
+                  jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
                 echo "</ul>"
               } > "$ATTN_HTML"
               echo "--- [attendees.html generated from crawler] ---"
@@ -550,41 +562,52 @@ jobs:
               echo "--- [end attendees.html] ---"
             fi
           else
-            echo "No Twitter credentials present, skipping twspace-crawler."
+            echo "No usable Twitter credentials or SID missing, skipping twspace-crawler."
           fi
 
           # Fallback to WP /peek if needed
           if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_URL:-}" ] && [ -n "${WP_AUTH:-}" ]; then
             echo "Falling back to WordPress /peek endpoint..."
             curl -sS -u "$WP_AUTH" \
-              --get --data-urlencode "space_url=$URL" \
+              --get \
+              --data-urlencode "space_url=$URL" \
+              --data-urlencode "space_id=${SID:-}" \
               "${WP_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
             echo "--- [WP /peek output - first 20 lines] ---"
             head -20 "$ATTN_JSON" || true
+            echo "--- [counts] ---"
+            jq -r '"host=\((.host // [])|length) cohosts=\((.cohosts // [])|length) speakers=\((.speakers // [])|length) html_len=\((.html // "")|tostring|length)"' "$ATTN_JSON" || true
+            echo "----------------"
             echo "--- [end WP /peek output] ---"
             if jq -e '.html? | length>0' "$ATTN_JSON" >/dev/null 2>&1; then
               jq -r '.html' "$ATTN_JSON" > "$ATTN_HTML"
               echo "--- [attendees.html generated from WP /peek .html] ---"
               head -20 "$ATTN_HTML" || true
               echo "--- [end attendees.html] ---"
-            elif jq -e '.host? or .cohosts? or .speakers?' "$ATTN_JSON" >/dev/null 2>&1; then
+            elif jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
-                echo "  <li><strong>Host</strong><ul>"
-                jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
-                echo "  <li><strong>Co-hosts</strong><ul>"
-                jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
-                echo "  <li><strong>Speakers</strong><ul>"
-                jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                  [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                done
-                echo "  </ul></li>"
+                if jq -e '(.host // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Host</strong><ul>"
+                  jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
+                if jq -e '(.cohosts // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Co-hosts</strong><ul>"
+                  jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
+                if jq -e '(.speakers // []) | length > 0' "$ATTN_JSON" >/dev/null; then
+                  echo "  <li><strong>Speakers</strong><ul>"
+                  jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                  done
+                  echo "  </ul></li>"
+                fi
                 echo "</ul>"
               } > "$ATTN_HTML"
               echo "--- [attendees.html generated from WP /peek keys] ---"
