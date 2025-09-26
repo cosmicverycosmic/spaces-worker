@@ -72,9 +72,12 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
   # Optional: for twspace-crawler (use either official Bearer OR unofficial cookie pair)
-  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || vars.TWITTER_AUTHORIZATION }}
+  # Optional: for twspace-crawler (use either official Bearer OR the auth_token+ct0 cookie pair)
+  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.TWITTER_BEARER || vars.TWITTER_AUTHORIZATION || vars.TWITTER_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || vars.TWITTER_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || vars.TWITTER_CSRF_TOKEN }}
+  
+
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
 
@@ -451,33 +454,38 @@ jobs:
           ARTDIR: ${{ github.workspace }}/out
           ATTN_JSON: ${{ github.workspace }}/out/attendees.json
           ATTN_HTML: ${{ github.workspace }}/out/attendees.html
-          WP_URL: ${{ secrets.WP_BASE_URL || vars.WP_BASE_URL }}
-          WP_AUTH: ${{ secrets.WP_USER }}:${{ secrets.WP_APP_PASSWORD }}
+          WP_URL:  ${{ env.WP_BASE_URL }}
+          WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
           SID: ${{ inputs.space_id }}
           URL: ${{ inputs.space_url }}
-          # --- Twitter/X credentials from WP config or browser session
-          TWITTER_AUTHORIZATION: ${{ secrets.ss3k_x_bearer }}
-          TWITTER_AUTH_TOKEN: ${{ secrets.ss3k_x_access_token }}
-          TWITTER_CSRF_TOKEN: ${{ secrets.ss3k_x_access_secret }}
+          # --- Twitter/X credentials (either Bearer OR cookie pair)
+          TWITTER_AUTHORIZATION: ${{ env.TWITTER_AUTHORIZATION }}
+          TWITTER_AUTH_TOKEN:    ${{ env.TWITTER_AUTH_TOKEN }}
+          TWITTER_CSRF_TOKEN:    ${{ env.TWITTER_CSRF_TOKEN }}
         run: |
           set -euxo pipefail
 
-          # Debugging log for env and inputs
+          # Mask sensitive values in logs
+          [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
+          [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
+          [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
+          [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ] && echo "::add-mask::${WP_USER}:${WP_APP_PASSWORD}"
+
+          # Debugging log for env and inputs (masked)
           echo "=== [twspace-crawler DEBUG] ==="
           echo "ARTDIR: $ARTDIR"
-          echo "SID: $SID"
+          echo "SID: ${SID:-<none>}"
           echo "URL: $URL"
-          echo "TWITTER_AUTHORIZATION: ${TWITTER_AUTHORIZATION:0:8}****"
-          echo "TWITTER_AUTH_TOKEN: ${TWITTER_AUTH_TOKEN:0:8}****"
-          echo "TWITTER_CSRF_TOKEN: ${TWITTER_CSRF_TOKEN:0:8}****"
-          echo "WP_URL: $WP_URL"
-          echo "WP_AUTH: $(echo $WP_AUTH | cut -c1-4)***"
+          echo "TWITTER_AUTHORIZATION set?: $([ -n "${TWITTER_AUTHORIZATION:-}" ] && echo yes || echo no)"
+          echo "TWITTER_AUTH_TOKEN set?:    $([ -n "${TWITTER_AUTH_TOKEN:-}" ] && echo yes || echo no)"
+          echo "TWITTER_CSRF_TOKEN set?:    $([ -n "${TWITTER_CSRF_TOKEN:-}" ] && echo yes || echo no)"
+          echo "WP_URL: ${WP_URL:-<none>}"
           echo "=============================="
 
           : > "$ATTN_HTML"
 
           HAVE_KEYS=0
-          if [ -n "$TWITTER_AUTHORIZATION" ] || { [ -n "$TWITTER_AUTH_TOKEN" ] && [ -n "$TWITTER_CSRF_TOKEN" ]; }; then
+          if [ -n "${TWITTER_AUTHORIZATION:-}" ] || { [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; }; then
             HAVE_KEYS=1
           fi
 
@@ -546,11 +554,11 @@ jobs:
           fi
 
           # Fallback to WP /peek if needed
-          if [ ! -s "$ATTN_HTML" ] && [ -n "$WP_URL" ] && [ -n "$WP_AUTH" ]; then
+          if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_URL:-}" ] && [ -n "${WP_AUTH:-}" ]; then
             echo "Falling back to WordPress /peek endpoint..."
             curl -sS -u "$WP_AUTH" \
               --get --data-urlencode "space_url=$URL" \
-              "$WP_URL/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
+              "${WP_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
             echo "--- [WP /peek output - first 20 lines] ---"
             head -20 "$ATTN_JSON" || true
             echo "--- [end WP /peek output] ---"
