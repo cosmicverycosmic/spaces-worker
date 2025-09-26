@@ -444,6 +444,7 @@ jobs:
           fi
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
+          
       # === Peek attendees (Host / Co-hosts / Speakers) - ROBUST + DEBUG + Correct Vars ===
       - name: Scrape attendees using twspace-crawler (robust, debug, retries, WP fallback)
         id: twspace_attendees
@@ -463,6 +464,9 @@ jobs:
           TWITTER_CSRF_TOKEN:    ${{ env.TWITTER_CSRF_TOKEN }}
         run: |
           set -euxo pipefail
+
+          mkdir -p "$ARTDIR"
+          : > "$ATTN_HTML"
 
           # Mask sensitive values in logs
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
@@ -485,8 +489,6 @@ jobs:
           echo "TWITTER_CSRF_TOKEN set?:    $([ -n "${TWITTER_CSRF_TOKEN:-}" ] && echo yes || echo no)"
           echo "WP_URL: ${WP_URL:-<none>}"
           echo "=============================="
-
-          : > "$ATTN_HTML"
 
           HAVE_KEYS=0
           if [ -n "${TWITTER_AUTHORIZATION:-}" ] || { [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; }; then
@@ -624,7 +626,6 @@ jobs:
           fi
 
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
-
 
       # ===========================
       # Derive Space date and set WP post date
