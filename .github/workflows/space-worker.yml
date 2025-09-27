@@ -163,53 +163,89 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          # Do NOT invent a bearer token. If it doesn't start with "Bearer ", drop it.
+          # Keep AUTH only if it starts with "Bearer "
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH=""
           fi
 
           # Mask provided secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
-          [ -n "$AT" ]   && echo "::add-mask::${AT}"
-          [ -n "$CT" ]   && echo "::add-mask::${CT}"
+          [ -n "$AT" ] && echo "::add-mask::${AT}"
+          [ -n "$CT" ] && echo "::add-mask::${CT}"
 
-          OK=0; REASON="no_creds"
-          COOKIE_MODE=0; BEARER_MODE=0
-          [ -n "$AT" ] && [ -n "$CT" ] && COOKIE_MODE=1 || true
-          [ -n "$AUTH" ] && BEARER_MODE=1 || true
+          OK=0
+          REASON="no_creds"
 
-          if [ "$COOKIE_MODE" -eq 1 ] || [ "$BEARER_MODE" -eq 1 ]; then
-            HARGS=()
-            [ -n "$AUTH" ] && HARGS+=(-H "Authorization: $AUTH")
-            [ -n "$CT" ]   && HARGS+=(-H "x-csrf-token: $CT")
-            CVAL=""
-            [ -n "$AT" ] && CVAL="auth_token=$AT"
-            [ -n "$CT" ] && CVAL="${CVAL:+$CVAL; }ct0=$CT"
-            [ -n "$CVAL" ] && HARGS+=(-H "Cookie: $CVAL")
-            HARGS+=(
-              -H "x-twitter-active-user: yes"
-              -H "x-twitter-client-language: en"
-              -H "x-twitter-auth-type: OAuth2Session"
-              -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
-              -H "User-Agent: Mozilla/5.0"
-            )
+          mkdir -p "${ARTDIR}"
 
-            if [ "$COOKIE_MODE" -eq 1 ]; then
-              # Try v2 first, then 1.1 as fallback
-              PRE1="https://x.com/i/api/2/account/settings.json"
-              PRE2="https://x.com/i/api/1.1/account/settings.json"
-              HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "$PRE1" "${HARGS[@]}" || echo 000)
-              if [ "$HTTP" = "404" ] || [ "$HTTP" = "401" ]; then
-                HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "$PRE2" "${HARGS[@]}" || echo 000)
-              fi
-              if [ "$HTTP" = "200" ]; then OK=1; else REASON="http_${HTTP}"; fi
-            elif [ "$BEARER_MODE" -eq 1 ]; then
-              # For bearer-only, validate by guest activation
-              HTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
-                      -X POST "https://api.twitter.com/1.1/guest/activate.json" \
-                      -H "Authorization: $AUTH" -H "Content-Type: application/json" -d '{}' || echo 000)
-              if [ "$HTTP" = "200" ]; then OK=1; else REASON="guest_${HTTP}"; fi
+          # Common headers
+          BASEH=(
+            -H "User-Agent: Mozilla/5.0"
+            -H "Accept: application/json, text/plain, */*"
+            -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
+          )
+
+          # 1) Try cookie-auth directly on the participants endpoint
+          if [ -n "$AT" ] && [ -n "$CT" ] && [ -n "$AUTH" ]; then
+            CVAL="auth_token=${AT}; ct0=${CT}"
+            HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
+              "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
+              "${BASEH[@]}" \
+              -H "Authorization: ${AUTH}" \
+              -H "x-csrf-token: ${CT}" \
+              -H "Cookie: ${CVAL}" \
+              -H "x-twitter-active-user: yes" \
+              -H "x-twitter-client-language: en" \
+              -H "x-twitter-auth-type: OAuth2Session" || echo 000)
+            if [ "$HTTP" = "200" ]; then
+              OK=1; REASON="cookie_ok"
+            else
+              REASON="cookie_${HTTP}"
             fi
+          fi
+
+          # 2) If cookie route failed, try bearer + guest token
+          if [ "$OK" -ne 1 ] && [ -n "$AUTH" ]; then
+            GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
+              -X POST "https://api.twitter.com/1.1/guest/activate.json" \
+              -H "Authorization: ${AUTH}" \
+              -H "Content-Type: application/json" \
+              -d '{}' || echo 000)
+            if [ "$GHTTP" = "200" ]; then
+              GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
+              if [ -n "$GUEST" ]; then
+                HTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
+                  "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
+                  "${BASEH[@]}" \
+                  -H "Authorization: ${AUTH}" \
+                  -H "x-guest-token: ${GUEST}" \
+                  -H "x-twitter-active-user: yes" \
+                  -H "x-twitter-client-language: en" || echo 000)
+                if [ "$HTTP" = "200" ]; then
+                  OK=1; REASON="guest_ok"
+                else
+                  REASON="guest_${HTTP}"
+                fi
+              else
+                REASON="guest_missing"
+              fi
+            else
+              REASON="guest_${GHTTP}"
+            fi
+          fi
+
+          # 3) Last resort: public peek (do NOT mark OK to keep crawler gated)
+          if [ "$OK" -ne 1 ]; then
+            for PEEK in \
+              "https://x.com/i/spaces/${SPACE_ID}/peek" \
+              "https://twitter.com/i/spaces/${SPACE_ID}/peek"
+            do
+              PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" \
+                "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
+              if [ "$PHTTP" = "200" ]; then
+                REASON="public_ok"; break
+              fi
+            done
           fi
 
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
