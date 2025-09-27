@@ -29,7 +29,7 @@ on:
         options: ["true", "false"]
         default: "true"
       do_transcript:
-        description: "Generate diarized transcript + VTT via Deepgram?"
+        description: "Generate diarized transcript + VTT via Deepgram? (used when crawler captions unavailable)"
         required: false
         type: choice
         options: ["true", "false"]
@@ -65,6 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # === Required project secrets/vars ===
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
@@ -72,10 +73,12 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # Accept both TWITTER_* and your X_* names
-  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.TWITTER_BEARER || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.TWITTER_BEARER || vars.X_BEARER }}
-  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN  || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
-  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
+  # === X / Twitter auth (support either legacy names or the X_* you added) ===
+  # Full "Authorization" value. MUST include the "Bearer " prefix (we will add it if missing).
+  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
+  # Cookies from the same logged-in session:
+  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN || vars.X_AUTH_TOKEN }}
+  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN || vars.X_CSRF }}
 
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
@@ -100,7 +103,7 @@ jobs:
                        --arg run "${{ github.run_id }}" --argjson progress 1 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Install deps (ffmpeg, jq, yt-dlp, gcloud) + Docker login for GHCR
+      - name: Install deps (ffmpeg, jq, yt-dlp, gcloud) + Docker login
         shell: bash
         run: |
           set -euxo pipefail
@@ -120,7 +123,7 @@ jobs:
           set -euxo pipefail
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
-          mkdir -p "$WORKDIR" "$ARTDIR"
+          mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
 
           # Prefix: default to spaces/YYYY/MM
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
@@ -160,105 +163,142 @@ jobs:
           printf '%s\n' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      # ==========================================================
-      # Try twspace-crawler for AUDIO + CAPTIONS (+ started_at)
-      # ==========================================================
-      - name: twspace-crawler (audio + captions + meta)
+      # ===========================
+      # X AUTH PREFLIGHT  (avoid long 401 loops)
+      # ===========================
+      - name: X preflight (auth sanity check)
+        id: x_preflight
+        shell: bash
+        run: |
+          set -euxo pipefail
+          AUTH="${TWITTER_AUTHORIZATION:-}"
+          AT="${TWITTER_AUTH_TOKEN:-}"
+          CT="${TWITTER_CSRF_TOKEN:-}"
+
+          # Normalize: ensure Authorization starts with "Bearer "
+          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
+            AUTH="Bearer ${AUTH}"
+          fi
+
+          # Mask sensitive pieces
+          [ -n "$AUTH" ] && echo "::add-mask::${AUTH}"
+          [ -n "$AT" ]   && echo "::add-mask::${AT}"
+          [ -n "$CT" ]   && echo "::add-mask::${CT}"
+
+          OK=0
+          REASON=""
+
+          if [ -n "$AUTH" ] || { [ -n "$AT" ] && [ -n "$CT" ]; }; then
+            HARGS=()
+            [ -n "$AUTH" ] && HARGS+=(-H "Authorization: $AUTH")
+            [ -n "$CT" ] && HARGS+=(-H "x-csrf-token: $CT")
+            CVAL=""
+            [ -n "$AT" ] && CVAL="auth_token=$AT"
+            [ -n "$CT" ] && CVAL="${CVAL}; ct0=$CT"
+            [ -n "$CVAL" ] && HARGS+=(-H "Cookie: $CVAL")
+            HARGS+=(-H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "Referer: https://x.com/home" -H "User-Agent: Mozilla/5.0")
+
+            HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "https://x.com/i/api/1.1/account/settings.json" "${HARGS[@]}" || echo 000)
+            echo "preflight_http=${HTTP}"
+            if [ "$HTTP" = "200" ]; then
+              OK=1
+            else
+              REASON="http_${HTTP}"
+            fi
+          else
+            REASON="no_creds"
+          fi
+
+          echo "ok=${OK}"        >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          # Export normalized Authorization back to env for later steps
+          [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
+
+      # ===========================
+      # TRY TWSPACE-CRAWLER FIRST (fail-fast; otherwise fallback to yt-dlp path)
+      # ===========================
+      - name: Ping (crawler attempting)
+        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
+                       --arg msg "twspace-crawler: fetching audio/captions/meta…" \
+                       --arg run "${{ github.run_id }}" --argjson progress 8 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
+      - name: twspace-crawler (audio + captions + started_at; fail-fast)
         id: crawl
-        if: ${{ inputs.mode == '' }}   # only needed during full run
+        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' }}
         shell: bash
         env:
-          URL:  ${{ inputs.space_url }}
-          SID:  ${{ steps.ids.outputs.space_id }}
+          SID: ${{ steps.ids.outputs.space_id }}
         run: |
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
 
-          # mask
-          [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
-          [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
-          [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
+          # Run crawler but cap it so we don't spin forever on API denials, geo, etc.
+          docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
+          set +e
+          timeout 60s docker run --rm \
+            -e TWITTER_AUTHORIZATION \
+            -e TWITTER_AUTH_TOKEN \
+            -e TWITTER_CSRF_TOKEN \
+            -v "${ARTDIR}:/app/download" \
+            -v "${ARTDIR}/logs:/app/logs" \
+            ghcr.io/hitomarukonpaku/twspace-crawler:latest \
+            --id "${SID}" --force
+          RC=$?
+          set -e
+          echo "crawler_exit=$RC"
 
-          HAVE_KEYS=0
-          if [ -n "${TWITTER_AUTHORIZATION:-}" ] || { [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; }; then
-            HAVE_KEYS=1
-          fi
-
-          AUDIO_FILE=""
-          CC_FILE=""
-          START_MS=""
-
-          if [ "$HAVE_KEYS" = "1" ] && [ -n "${SID:-}" ]; then
-            docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest
-
-            # Try to fully download (audio & caption) into $ARTDIR
-            set +e
-            docker run --rm \
-              -e TWITTER_AUTHORIZATION \
-              -e TWITTER_AUTH_TOKEN \
-              -e TWITTER_CSRF_TOKEN \
-              -v "${ARTDIR}:/app/download" \
-              -v "${ARTDIR}/logs:/app/logs" \
-              ghcr.io/hitomarukonpaku/twspace-crawler:latest \
-              --id "${SID}" --force
-            RC=$?
-            set -e
-            echo "crawler exit=$RC"
-
-            # Find audio produced by crawler
-            AUDIO_FILE="$(ls -1t "${ARTDIR}"/*.{m4a,mp3,mp4,aac,webm,ogg,wav,ts} 2>/dev/null | head -n1 || true)"
-            [ -n "$AUDIO_FILE" ] && echo "Found crawler audio: $(basename "$AUDIO_FILE")" || echo "No crawler audio found."
-
-            # Find captions JSONL
-            CC_FILE="$(ls -1t "${ARTDIR}"/*cc.jsonl "${ARTDIR}"/*caption*.jsonl 2>/dev/null | head -n1 || true)"
-            [ -n "$CC_FILE" ] && echo "Found crawler captions: $(basename "$CC_FILE")" || echo "No crawler captions found."
-
-            # Attempt to extract plain transcript from captions using crawler's helper
-            if [ -n "$CC_FILE" ]; then
-              set +e
-              docker run --rm \
-                -v "${ARTDIR}:/app/download" \
-                ghcr.io/hitomarukonpaku/twspace-crawler:latest \
-                cc e "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/_crawler_cc.txt"
-              CC_RC=$?
-              set -e
-              echo "cc extract exit=$CC_RC"
-              if [ -s "${ARTDIR}/_crawler_cc.txt" ]; then
-                # Save as transcript (best-effort). We still generate VTT via Deepgram if needed.
-                cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt" || true
-                echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV"
-                echo "captions_txt=${ARTDIR}/${BASE}.txt" >> "$GITHUB_OUTPUT"
-              fi
-            fi
-
-            # Try to discover started_at (ms) from any JSON dropped by crawler
-            # Grep for a large ms-like number next to started_at/created_at
-            START_MS="$(grep -Ehor '\"(started_at|created_at|start|startedAt)\"[^\n]*([0-9]{10,13})' "${ARTDIR}" 2>/dev/null | sed -E 's/.*([0-9]{10,13}).*/\1/' | head -n1 || true)"
-            if [ -n "$START_MS" ]; then
-              if [ ${#START_MS} -gt 10 ]; then SEC=$((START_MS/1000)); else SEC=$START_MS; fi
-              ISO="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%S')"
-              echo "Crawler start ISO: ${ISO}"
-              echo "started_iso=${ISO}" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "No usable Twitter credentials; skipping crawler."
-          fi
-
-          # Export audio (if found) so downstream uses it and skips yt-dlp
+          # Try to find an audio file from crawler output
+          AUDIO_FILE="$(ls -1t "${ARTDIR}"/*.{m4a,mp3,mp4,aac,webm,ogg,wav,ts} 2>/dev/null | head -n1 || true)"
           if [ -n "$AUDIO_FILE" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
           else
             echo "audio_file=" >> "$GITHUB_OUTPUT"
           fi
-          # Only set a VTT path here if you have your own VTT converter (we don't); Deepgram will handle VTT fallback.
-          echo "captions_vtt=" >> "$GITHUB_OUTPUT"
+
+          # Try to detect captions jsonl
+          CC_FILE="$(ls -1t "${ARTDIR}"/*cc.jsonl "${ARTDIR}"/*caption*.jsonl 2>/dev/null | head -n1 || true)"
+          if [ -n "$CC_FILE" ]; then
+            set +e
+            docker run --rm -v "${ARTDIR}:/app/download" \
+              ghcr.io/hitomarukonpaku/twspace-crawler:latest \
+              cc e "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/_crawler_cc.txt"
+            docker run --rm -v "${ARTDIR}:/app/download" \
+              ghcr.io/hitomarukonpaku/twspace-crawler:latest \
+              cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt"
+            set -e
+
+            if [ -s "${ARTDIR}/_crawler_cc.txt" ]; then
+              cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt"
+              echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          # Derive started_at from any sidecar/meta (ms or sec)
+          START_MS="$(grep -Ehor '\"(started_at|created_at|start|startedAt)\"[^\n]*([0-9]{10,13})' "${ARTDIR}" 2>/dev/null | sed -E 's/.*([0-9]{10,13}).*/\1/' | head -n1 || true)"
+          if [ -n "$START_MS" ]; then
+            if [ ${#START_MS} -gt 10 ]; then SEC=$((START_MS/1000)); else SEC=$START_MS; fi
+            ISO="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%S')"
+            echo "started_iso=${ISO}" >> "$GITHUB_OUTPUT"
+          else
+            echo "started_iso=" >> "$GITHUB_OUTPUT"
+          fi
 
       # ===========================
-      # DOWNLOAD/ENCODE (full run)
+      # FALLBACK: yt-dlp download if crawler couldn't give us audio
       # ===========================
-      - name: Ping (downloading)
-        if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+      - name: Ping (downloading via yt-dlp)
+        if: ${{ inputs.mode == '' && (steps.x_preflight.outputs.ok != '1' || steps.crawl.outputs.audio_file == '') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -267,12 +307,12 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
             -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
                          --arg status "processing" \
-                         --arg msg "Downloading Space audio…" \
+                         --arg msg "Downloading Space audio (fallback)…" \
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Download Space audio (yt-dlp bestaudio) — fallback
-        if: ${{ inputs.mode == '' && steps.crawl.outputs.audio_file == '' }}
+      - name: Download Space audio (yt-dlp bestaudio)
+        if: ${{ inputs.mode == '' && (steps.crawl.outputs.audio_file == '') }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -284,19 +324,9 @@ jobs:
           test -f "$IN" || { echo "No file downloaded"; exit 1; }
           echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
 
-      - name: Ping (downloaded)
-        if: ${{ (inputs.mode == '' || inputs.mode == 'transcript_only') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          SIZE=$(stat -c%s "$INPUT_FILE" 2>/dev/null || echo 0)
-          MSG="Downloaded: $(basename "$INPUT_FILE") (${SIZE} bytes)"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
-                       --arg run "${{ github.run_id }}" --argjson progress 25 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
+      # ===========================
+      # ENCODE → MP3 (from either crawler audio or yt-dlp)
+      # ===========================
       - name: Ping (trimming head/tail silence)
         if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -349,25 +379,11 @@ jobs:
           ME_TP=$(jq -r '.input_tp // "-1.5"' <<<"$ILOG")
           ME_LRA=$(jq -r '.input_lra // "11"'  <<<"$ILOG")
           ME_THR=$(jq -r '.input_thresh // "-26"'<<<"$ILOG")
-
           OUT_MP3="${ARTDIR}/${BASE}.mp3"
           ffmpeg -hide_banner -y -i "$AUDIO_IN" \
             -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=${ME_I}:measured_TP=${ME_TP}:measured_LRA=${ME_LRA}:measured_thresh=${ME_THR}:print_format=summary" \
             -ar 48000 -ac 2 -codec:a libmp3lame -b:a 128k "$OUT_MP3"
           echo "OUT_MP3=$OUT_MP3" >> "$GITHUB_ENV"
-
-      - name: Ping (encoded)
-        if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          SIZE=$(stat -c%s "$OUT_MP3" 2>/dev/null || echo 0)
-          MSG="MP3 ready: $(basename "$OUT_MP3") (${SIZE} bytes)"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
-                       --arg run "${{ github.run_id }}" --argjson progress 50 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Ping (uploading MP3)
         if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
@@ -399,20 +415,10 @@ jobs:
           echo "raw_url=${RAW_URL}"   >> "$GITHUB_OUTPUT"
           echo "proxy_url=${PROXY_URL}" >> "$GITHUB_OUTPUT"
 
-      - name: Ping (uploaded MP3)
-        if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.upload_mp3.outputs.proxy_url != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          MSG="MP3: ${{ steps.upload_mp3.outputs.proxy_url }} (raw: ${{ steps.upload_mp3.outputs.raw_url }})"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" --arg msg "$MSG" \
-                       --arg run "${{ github.run_id }}" --argjson progress 60 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
       # =========================================
-      # TRANSCRIPT/VTT (full or transcript_only)
+      # TRANSCRIPT/VTT
+      # 1) Prefer crawler captions if present
+      # 2) Else, Deepgram (when enabled)
       # =========================================
       - name: Fetch existing MP3 for transcript_only
         if: ${{ inputs.mode == 'transcript_only' && inputs.existing_mp3_url != '' }}
@@ -424,23 +430,18 @@ jobs:
           curl -L -o "$OUT_MP3" "${{ inputs.existing_mp3_url }}"
           echo "OUT_MP3=$OUT_MP3" >> "$GITHUB_ENV"
 
-      - name: Ping (transcribing)
-        if: ${{ inputs.mode != 'attendees_only' && inputs.do_transcript == 'true' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.crawl.outputs.captions_vtt == '' }}
+      - name: Adopt crawler transcript/VTT if available
+        id: adopt_cc
+        if: ${{ inputs.mode != 'attendees_only' && env.TX_PATH != '' || env.VTT_PATH != '' }}
         shell: bash
         run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
-                         --arg status "processing" \
-                         --arg msg "Deepgram: diarized transcript & VTT…" \
-                         --arg run "${{ github.run_id }}" --argjson progress 70 \
-                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+          set -euxo pipefail
+          [ -f "${TX_PATH:-/nope}" ]  && echo "TX_OK=1"  >> "$GITHUB_OUTPUT" || echo "TX_OK=0"  >> "$GITHUB_OUTPUT"
+          [ -f "${VTT_PATH:-/nope}" ] && echo "VTT_OK=1" >> "$GITHUB_OUTPUT" || echo "VTT_OK=0" >> "$GITHUB_OUTPUT"
 
-      - name: Transcript + diarized VTT (Deepgram) — fallback when no crawler VTT
+      - name: Deepgram: diarized transcript + VTT (fallback)
         id: tx
-        if: ${{ inputs.mode != 'attendees_only' && inputs.do_transcript == 'true' && steps.crawl.outputs.captions_vtt == '' }}
+        if: ${{ inputs.mode != 'attendees_only' && inputs.do_transcript == 'true' && (steps.adopt_cc.outputs.VTT_OK != '1' || steps.adopt_cc.outputs.TX_OK != '1') }}
         shell: bash
         env:
           DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
@@ -450,12 +451,10 @@ jobs:
           DG_JSON="${ARTDIR}/dg.json"
           TX_PATH="${ARTDIR}/${BASE}.txt"
           VTT_PATH="${ARTDIR}/${BASE}.vtt"
-
           curl -sS -X POST "https://api.deepgram.com/v1/listen?smart_format=true&model=nova-2&diarize=true&utterances=true" \
             -H "Authorization: Token ${DG_KEY}" \
             -H "Content-Type: audio/mpeg" \
             --data-binary @"${OUT_MP3}" > "${DG_JSON}"
-
           if jq -e '(.results.utterances? | length) > 0' "${DG_JSON}" >/dev/null; then
             jq -r '.results.utterances[] | "\((.speaker // 0))\t\(.transcript // "")"' "${DG_JSON}" \
             | awk -F '\t' '
@@ -465,11 +464,6 @@ jobs:
                 else { if (last!=-1) printf("Speaker %d: %s\n\n", last+1, buf); last=sp; buf=txt } }
               END { if (last!=-1) printf("Speaker %d: %s\n", last+1, buf) }
             ' > "${TX_PATH}"
-          else
-            jq -r '.results.channels[0].alternatives[0].transcript // ""' "${DG_JSON}" > "${TX_PATH}"
-          fi
-
-          if jq -e '(.results.utterances? | length) > 0' "${DG_JSON}" >/dev/null; then
             {
               echo "WEBVTT"; echo
               jq -c '.results.utterances[] | {s:(.start // 0), e:(.end // 0), sp:(.speaker // 0), t:(.transcript // "")}' "${DG_JSON}" \
@@ -488,46 +482,19 @@ jobs:
                 }'
             } > "${VTT_PATH}"
           else
+            jq -r '.results.channels[0].alternatives[0].transcript // ""' "${DG_JSON}" > "${TX_PATH}"
             printf "WEBVTT\n\n" > "${VTT_PATH}"
           fi
-
           echo "TX_PATH=${TX_PATH}"   >> "$GITHUB_ENV"
           echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
 
-      # If crawler *did* produce a VTT via some separate mechanism, you could set VTT_PATH earlier and this upload step would still Just Work.
-
-      - name: Ping (transcribed)
-        if: ${{ (steps.tx.outcome == 'success') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                       --arg msg "Transcript & (diarized) VTT created." \
-                       --arg run "${{ github.run_id }}" --argjson progress 80 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
-      - name: Ping (uploading VTT)
-        if: ${{ (steps.tx.outcome == 'success' || steps.crawl.outputs.captions_vtt != '') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                       --arg msg "Uploading VTT to GCS…" \
-                       --arg run "${{ github.run_id }}" --argjson progress 85 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
-      - name: Upload VTT to GCS (bucket path fix + proxy URL)
+      - name: Upload VTT to GCS (if we have one)
         id: upload_vtt
-        if: ${{ steps.tx.outcome == 'success' || steps.crawl.outputs.captions_vtt != '' }}
+        if: ${{ env.VTT_PATH != '' && inputs.mode != 'attendees_only' }}
         shell: bash
         run: |
           set -euxo pipefail
-          test -f "${VTT_PATH:-}" || { echo "No VTT produced"; exit 1; }
+          test -f "${VTT_PATH}" || { echo "No VTT produced"; exit 0; }
           DEST_VTT="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
           RAW_VTT="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
           PROXY_VTT="https://media.chbmp.org/${PREFIX}/${BASE}.vtt"
@@ -538,36 +505,30 @@ jobs:
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
 
-      # === Peek attendees via crawler (fallback to WP /peek) ===
-      - name: Scrape attendees using twspace-crawler (robust, debug, retries, WP fallback)
-        id: twspace_attendees
+      # ===========================
+      # ATTENDEES (crawler first; fallback to WP /peek)
+      # ===========================
+      - name: Scrape attendees (crawler first, timeout; fallback to WP /peek)
+        id: attendees
         shell: bash
         env:
-          ATTN_JSON: ${{ github.workspace }}/out/attendees.json
-          ATTN_HTML: ${{ github.workspace }}/out/attendees.html
-          WP_URL:  ${{ env.WP_BASE_URL }}
-          WP_AUTH: ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
-          SID:     ${{ steps.ids.outputs.space_id }}
-          URL:     ${{ inputs.space_url }}
+          SID: ${{ steps.ids.outputs.space_id }}
+          URL: ${{ inputs.space_url }}
+          ATTN_JSON: ${{ env.ARTDIR }}/attendees.json
+          ATTN_HTML: ${{ env.ARTDIR }}/attendees.html
         run: |
           set -euxo pipefail
-          mkdir -p "${ARTDIR}"
           : > "$ATTN_HTML"
-
+          # Mask secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
           [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
-          [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ] && echo "::add-mask::${WP_USER}:${WP_APP_PASSWORD}"
 
-          HAVE_KEYS=0
-          if [ -n "${TWITTER_AUTHORIZATION:-}" ] || { [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; }; then
-            HAVE_KEYS=1
-          fi
-
-          if [ "$HAVE_KEYS" = "1" ] && [ -n "${SID:-}" ]; then
+          # Use crawler only if preflight ok
+          if [ "${{ steps.x_preflight.outputs.ok }}" = "1" ] && [ -n "$SID" ]; then
             docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
             set +e
-            docker run --rm \
+            timeout 30s docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
               -e TWITTER_CSRF_TOKEN \
@@ -576,8 +537,7 @@ jobs:
               --space-id "$SID" --attendees --out /out/attendees.json
             RC=$?
             set -e
-            echo "twspace-crawler(attendees) exit=$RC"
-            if [ -f "$ATTN_JSON" ] && jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
+            if [ $RC -eq 0 ] && [ -s "$ATTN_JSON" ] && jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
                 if jq -e '(.host // []) | length > 0' "$ATTN_JSON" >/dev/null; then
@@ -606,67 +566,49 @@ jobs:
             fi
           fi
 
-          # Fallback to WP /peek if needed
-          if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_URL:-}" ] && [ -n "${WP_AUTH:-}" ]; then
-            echo "Falling back to WordPress /peek endpoint..."
-            curl -sS -u "$WP_AUTH" \
+          # Fallback to WP /peek if still empty
+          if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ]; then
+            curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
               --get \
               --data-urlencode "space_url=$URL" \
               --data-urlencode "space_id=${SID:-}" \
-              "${WP_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
+              "${WP_BASE_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
             if jq -e '.html? | length>0' "$ATTN_JSON" >/dev/null 2>&1; then
               jq -r '.html' "$ATTN_JSON" > "$ATTN_HTML"
             elif jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
-                if jq -e '(.host // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Host</strong><ul>"
-                  jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
-                if jq -e '(.cohosts // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Co-hosts</strong><ul>"
-                  jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
-                if jq -e '(.speakers // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Speakers</strong><ul>"
-                  jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
+                for grp in host cohosts speakers; do
+                  if jq -e "(.${grp} // []) | length > 0" "$ATTN_JSON" >/dev/null; then
+                    TITLE=$([ "$grp" = "host" ] && echo "Host" || ([ "$grp" = "cohosts" ] && echo "Co-hosts" || echo "Speakers"))
+                    echo "  <li><strong>${TITLE}</strong><ul>"
+                    jq -r ".${grp}[]? | @tsv" "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
+                      [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
+                    done
+                    echo "  </ul></li>"
+                  fi
+                done
                 echo "</ul>"
               } > "$ATTN_HTML"
-            else
-              echo "No attendees found in WP /peek output."
             fi
           fi
 
-          if [ ! -s "$ATTN_HTML" ]; then
-            echo "WARNING: No attendee HTML generated from either crawler or WP /peek!"
-          fi
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
 
       # ===========================
-      # Derive Space date (crawler > yt-dlp) and update WP post date
+      # Space date → set WP post date
+      # Prefer crawler started_iso; else yt-dlp metadata
       # ===========================
-      - name: Derive Space date (metadata) and update post date
+      - name: Derive Space date and update post date
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
           URL: ${{ inputs.space_url }}
         run: |
           set -euxo pipefail
-          META="${ARTDIR}/space_meta.json"
           SPACE_ISO="${{ steps.crawl.outputs.started_iso }}"
-
           if [ -z "$SPACE_ISO" ]; then
-            # Fallback via yt-dlp JSON
+            META="${ARTDIR}/space_meta.json"
             yt-dlp -J "$URL" > "$META" 2>/dev/null || true
             TS="$(jq -r '(.release_timestamp // .timestamp // empty)' "$META" 2>/dev/null || true)"
             if [ -n "$TS" ] && [[ "$TS" =~ ^[0-9]+$ ]]; then
@@ -674,17 +616,15 @@ jobs:
             else
               UD="$(jq -r '.upload_date // empty' "$META" 2>/dev/null || true)" # YYYYMMDD
               if [ -n "$UD" ] && [[ "$UD" =~ ^[0-9]{8}$ ]]; then
-                SPACE_ISO="$(date -u -d "${UD}" '+%Y-%m-%dT12:00:00')"
+                SPACE_ISO="$(date -u -d "${UD}" '+%Y-%m-%dT12:00:00')" # noon UTC if date-only
               fi
             fi
           fi
 
           if [ -n "$SPACE_ISO" ]; then
-            # Update WP post date
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/spaces/${{ inputs.post_id }}" \
               -d "$(jq -n --arg d "$SPACE_ISO" '{date: $d}')"
-            # Log
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
               -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
@@ -692,24 +632,12 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 92 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
           else
-            echo "No Space timestamp discovered."
+            echo "No space date available."
           fi
 
       # ===========================
-      # REGISTER (full) or PATCH (targeted modes)
+      # REGISTER IN WORDPRESS (full run) OR PATCH (targeted modes)
       # ===========================
-      - name: Ping (registering in WordPress)
-        if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' && steps.upload_mp3.outputs.proxy_url != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                       --arg msg "Registering assets in WordPress…" \
-                       --arg run "${{ github.run_id }}" --argjson progress 95 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
       - name: Register in WordPress (final-only; includes attendees)
         id: register
         if: ${{ inputs.mode == '' && steps.upload_mp3.outputs.proxy_url != '' }}
@@ -767,7 +695,6 @@ jobs:
 
           jq . "${RESP}" || true
 
-      # === Targeted: transcript_only → patch VTT/transcript (no re-attach audio)
       - name: Patch transcript/VTT only
         if: ${{ inputs.mode == 'transcript_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -783,7 +710,6 @@ jobs:
             fi
             VPROXY="$PROXY_VTT"
           fi
-
           BODY="$(jq -n \
             --arg pid "${{ inputs.post_id }}" \
             --arg vtt "${VPROXY}" \
@@ -795,7 +721,6 @@ jobs:
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
 
-      # === Targeted: attendees_only → patch attendees only
       - name: Patch attendees only
         if: ${{ inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -841,8 +766,8 @@ jobs:
               echo "- **VTT (proxy):** ${{ steps.upload_vtt.outputs.proxy_vtt }}"
               echo "- **VTT (raw):**   ${{ steps.upload_vtt.outputs.raw_vtt }}"
             fi
+            echo "- **Crawler preflight OK:** ${{ steps.x_preflight.outputs.ok == '1' && 'yes' || 'no' }} (reason: ${{ steps.x_preflight.outputs.reason }})"
             echo "- **Public:**     ${{ inputs.make_public }}"
             echo "- **Transcript:** ${{ inputs.do_transcript }}"
             echo "- **Mode:**       ${{ inputs.mode }}"
-            echo "- **Crawler start ISO (if any):** ${{ steps.crawl.outputs.started_iso }}"
           } >> "$GITHUB_STEP_SUMMARY"
