@@ -186,7 +186,7 @@ jobs:
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
       - name: Ping crawler attempting
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
+        if: ${{ inputs.mode == '' && (env.TWITTER_AUTHORIZATION != '' || (env.TWITTER_AUTH_TOKEN != '' && env.TWITTER_CSRF_TOKEN != '')) && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +199,7 @@ jobs:
 
       - name: twspace crawler audio captions started at fail fast
         id: crawl
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' }}
+        if: ${{ inputs.mode == '' && (env.TWITTER_AUTHORIZATION != '' || (env.TWITTER_AUTH_TOKEN != '' && env.TWITTER_CSRF_TOKEN != '')) }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -239,7 +239,7 @@ jobs:
               cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt"
             set -e
             if [ -s "${ARTDIR}/_crawler_cc.txt" ]; then
-              cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt"
+              cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt"`
               echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV"
             fi
             if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
@@ -467,7 +467,8 @@ jobs:
           [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
           [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
 
-          if [ "${{ steps.x_preflight.outputs.ok }}" = "1" ] && [ -n "$SID" ]; then
+          # Run crawler if we have creds (regardless of preflight) and a SID
+          if { [ -n "${TWITTER_AUTHORIZATION:-}" ] || { [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; }; } && [ -n "$SID" ]; then
             docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
             set +e
             timeout 30s docker run --rm \
@@ -508,11 +509,16 @@ jobs:
             fi
           fi
 
+          # Fallback to WP peek — now pass creds so plugin can use auth/guest API
           if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ]; then
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
               --get \
               --data-urlencode "space_url=$URL" \
               --data-urlencode "space_id=${SID:-}" \
+              --data-urlencode "bearer=${TWITTER_AUTHORIZATION#Bearer }" \
+              --data-urlencode "auth=${TWITTER_AUTH_TOKEN:-}" \
+              --data-urlencode "csrf=${TWITTER_CSRF_TOKEN:-}" \
+              --data-urlencode "debug=1" \
               "${WP_BASE_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
             if jq -e '.html? | length>0' "$ATTN_JSON" >/dev/null 2>&1; then
               jq -r '.html' "$ATTN_JSON" > "$ATTN_HTML"
@@ -534,6 +540,25 @@ jobs:
             fi
           fi
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
+
+      - name: Upload attendees html to gcs if any
+        id: upload_attn
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -s "${ATTN_HTML:-/nope}" ]; then
+            echo "No attendees HTML to upload"
+            exit 0
+          fi
+          DEST_ATT="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          RAW_ATT="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          PROXY_ATT="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.html"
+          gsutil cp "${ATTN_HTML}" "$DEST_ATT"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            gsutil acl ch -u AllUsers:R "$DEST_ATT" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+          fi
+          echo "raw_att=${RAW_ATT}"       >> "$GITHUB_OUTPUT"
+          echo "proxy_att=${PROXY_ATT}"   >> "$GITHUB_OUTPUT"
 
       - name: Derive space date time and update post
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
@@ -581,6 +606,7 @@ jobs:
           VTT_URL:   ${{ steps.upload_vtt.outputs.proxy_vtt }}
           TITLE_IN:   ${{ inputs.title }}
           POST_ID_IN: ${{ inputs.post_id }}
+          ATT_URL:    ${{ steps.upload_attn.outputs.proxy_att }}
         run: |
           set -euxo pipefail
           JFILE="${ARTDIR}/register.json"
@@ -598,11 +624,13 @@ jobs:
             --arg vtt   "${VTT_URL}" \
             --arg pid   "${POST_ID_IN}" \
             --rawfile tx  "${TXFILE}" \
-            --arg attendees_html "${AT_HTML}" '
+            --arg attendees_html "${AT_HTML}" \
+            --arg att_url "${ATT_URL}" '
               { title: ($title // ""), gcs_url: $media, mime: $mime }
               + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
               + (if ($tx|length)>0 then {transcript:$tx} else {} end)
               + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
+              + (if ($att_url|length)>0 then {attendees_url:$att_url} else {} end)
               + ( ($pid|tonumber? // null) as $maybe
                   | if $maybe then {post_id:$maybe} else {} end )
             ' > "$JFILE"
@@ -651,6 +679,8 @@ jobs:
       - name: Patch attendees only
         if: ${{ inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
+        env:
+          ATT_URL: ${{ steps.upload_attn.outputs.proxy_att }}
         run: |
           set -euxo pipefail
           ATFILE="${ATTN_HTML:-}"
@@ -658,9 +688,10 @@ jobs:
           if [ -n "${ATFILE}" ] && [ -f "${ATFILE}" ]; then
             AT_HTML="$(cat "${ATFILE}")"
           fi
-          BODY="$(jq -n --arg pid "${{ inputs.post_id }}" --arg attendees_html "${AT_HTML}" \
+          BODY="$(jq -n --arg pid "${{ inputs.post_id }}" --arg attendees_html "${AT_HTML}" --arg att_url "${ATT_URL}" \
             '{ post_id: ($pid|tonumber), status:"complete", progress:100 }
-             + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)')"
+             + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
+             + (if ($att_url|length)>0 then {attendees_url:$att_url} else {} end)')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
 
@@ -692,6 +723,10 @@ jobs:
             if [ "${{ steps.upload_vtt.outputs.proxy_vtt }}" != "" ]; then
               echo "- VTT proxy: ${{ steps.upload_vtt.outputs.proxy_vtt }}"
               echo "- VTT raw:   ${{ steps.upload_vtt.outputs.raw_vtt }}"
+            fi
+            if [ "${{ steps.upload_attn.outputs.proxy_att }}" != "" ]; then
+              echo "- Attendees HTML: ${{ steps.upload_attn.outputs.proxy_att }}"
+              echo "- Attendees raw:  ${{ steps.upload_attn.outputs.raw_att }}"
             fi
             echo "- Crawler preflight OK: ${{ steps.x_preflight.outputs.ok == '1' && 'yes' || 'no' }} reason ${{ steps.x_preflight.outputs.reason }}"
             echo "- Public:     ${{ inputs.make_public }}"
