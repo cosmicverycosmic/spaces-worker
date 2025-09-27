@@ -65,7 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # === Required project secrets/vars ===
+  # Project secrets/vars
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
@@ -73,10 +73,8 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # === X / Twitter auth (support either legacy names or the X_* you added) ===
-  # Full "Authorization" value. MUST include the "Bearer " prefix (we will add it if missing).
+  # X / Twitter auth (optional; crawler prefers these if present)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
-  # Cookies from the same logged-in session:
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN || vars.X_CSRF }}
 
@@ -124,18 +122,14 @@ jobs:
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
-
-          # Prefix: default to spaces/YYYY/MM
+          # gcs_prefix: trim slashes; default spaces/YYYY/MM when empty
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           if [ -z "$PFX" ]; then
             PFX="spaces/$(date +%Y)/$(date +%m)"
           fi
           echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
           echo "PREFIX=${PFX}" >> "$GITHUB_ENV"
-
-          # If PREFIX is "spaces/YYYY/MM", drop leading "spaces/" for the bucket
-          BP="${PFX#spaces/}"
-          echo "BUCKET_PREFIX=${BP}" >> "$GITHUB_ENV"
+          echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
       - name: Derive Space ID and base filename
         id: ids
@@ -163,9 +157,7 @@ jobs:
           printf '%s\n' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      # ===========================
-      # X AUTH PREFLIGHT  (avoid long 401 loops)
-      # ===========================
+      # ---------- Optional X auth preflight (helps crawler) ----------
       - name: X preflight (auth sanity check)
         id: x_preflight
         shell: bash
@@ -174,20 +166,13 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
-
-          # Normalize: ensure Authorization starts with "Bearer "
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH="Bearer ${AUTH}"
           fi
-
-          # Mask sensitive pieces
           [ -n "$AUTH" ] && echo "::add-mask::${AUTH}"
           [ -n "$AT" ]   && echo "::add-mask::${AT}"
           [ -n "$CT" ]   && echo "::add-mask::${CT}"
-
-          OK=0
-          REASON=""
-
+          OK=0; REASON="no_creds"
           if [ -n "$AUTH" ] || { [ -n "$AT" ] && [ -n "$CT" ]; }; then
             HARGS=()
             [ -n "$AUTH" ] && HARGS+=(-H "Authorization: $AUTH")
@@ -197,26 +182,14 @@ jobs:
             [ -n "$CT" ] && CVAL="${CVAL}; ct0=$CT"
             [ -n "$CVAL" ] && HARGS+=(-H "Cookie: $CVAL")
             HARGS+=(-H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "Referer: https://x.com/home" -H "User-Agent: Mozilla/5.0")
-
             HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "https://x.com/i/api/1.1/account/settings.json" "${HARGS[@]}" || echo 000)
-            echo "preflight_http=${HTTP}"
-            if [ "$HTTP" = "200" ]; then
-              OK=1
-            else
-              REASON="http_${HTTP}"
-            fi
-          else
-            REASON="no_creds"
+            if [ "$HTTP" = "200" ]; then OK=1; else REASON="http_${HTTP}"; fi
           fi
-
           echo "ok=${OK}"        >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
-          # Export normalized Authorization back to env for later steps
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # ===========================
-      # TRY TWSPACE-CRAWLER FIRST (then inline yt-dlp fallback if needed)
-      # ===========================
+      # ---------- Crawler first (fast exit) ----------
       - name: Ping (crawler attempting)
         if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
         shell: bash
@@ -229,20 +202,18 @@ jobs:
                        --arg run "${{ github.run_id }}" --argjson progress 8 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: twspace-crawler (audio + captions + started_at; with inline fallback)
+      - name: twspace-crawler (audio + captions + started_at; fail-fast)
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
-          URL: ${{ inputs.space_url }}
         run: |
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
-
           docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
           set +e
-          timeout 90s docker run --rm \
+          timeout 60s docker run --rm \
             -e TWITTER_AUTHORIZATION \
             -e TWITTER_AUTH_TOKEN \
             -e TWITTER_CSRF_TOKEN \
@@ -254,31 +225,18 @@ jobs:
           set -e
           echo "crawler_exit=$RC"
 
-          # --- recursive newest-file scanners (space-safe) ---
-          scan_newest() { # ext list via grep -E
-            find "${ARTDIR}" -type f -regextype posix-egrep -regex ".*\.($1)$" -printf '%T@ %p\n' 2>/dev/null \
-              | sort -nr | head -n1 | cut -d' ' -f2-
-          }
-
-          AUDIO_FILE="$(scan_newest 'm4a|mp3|mp4|aac|webm|ogg|wav|ts' || true)"
-          CC_FILE="$(scan_newest '(?i)(cc\.jsonl|caption.*\.jsonl)$' || true || true)" || true
-
-          # Inline yt-dlp fallback into ARTDIR if crawler didn't yield audio
-          if [ -z "${AUDIO_FILE}" ]; then
-            echo "No crawler audio found — trying yt-dlp fallback…"
-            yt-dlp -P "${ARTDIR}" -o "%(title)s.%(ext)s" -f "bestaudio/best" "${URL}" || true
-            AUDIO_FILE="$(scan_newest 'm4a|mp3|mp4|aac|webm|ogg|wav|ts' || true)"
-          fi
-
-          if [ -n "${AUDIO_FILE}" ]; then
+          # Find audio (recursive; crawler writes into subfolders)
+          AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+          if [ -n "$AUDIO_FILE" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
-            echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
+            echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
           else
             echo "audio_file=" >> "$GITHUB_OUTPUT"
           fi
 
-          # If captions jsonl present, extract txt + vtt
-          if [ -n "${CC_FILE}" ] && [ -f "${CC_FILE}" ]; then
+          # Captions (if present) → .txt and .vtt
+          CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) | head -n1 || true)"
+          if [ -n "$CC_FILE" ]; then
             set +e
             docker run --rm -v "${ARTDIR}:/app/download" \
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
@@ -287,27 +245,34 @@ jobs:
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
               cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt"
             set -e
-            [ -s "${ARTDIR}/_crawler_cc.txt" ] && cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt" && echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+            if [ -s "${ARTDIR}/_crawler_cc.txt" ]; then
+              cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt"
+              echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+            fi
           fi
 
-          # Prefer 13-digit ms for started_at; fallback to 10-digit seconds
-          START_MS="$(grep -Ehor '"'(started_at|created_at|start|startedAt)'"'[^0-9]*([0-9]{13}) "${ARTDIR}" "${ARTDIR}/logs" 2>/dev/null | grep -Eo '[0-9]{13}' | head -n1 || true)"
-          if [ -z "$START_MS" ]; then
-            START_MS="$(grep -Ehor '"'(started_at|created_at|start|startedAt)'"'[^0-9]*([0-9]{10}) "${ARTDIR}" "${ARTDIR}/logs" 2>/dev/null | grep -Eo '[0-9]{10}' | head -n1 || true)"
+          # Robust started_at extraction: prefer 13-digit ms, else 10-digit s
+          START_EPOCH=""
+          MS="$(grep -Ehor '[0-9]{13}' "${ARTDIR}" 2>/dev/null | head -n1 || true)"
+          if [ -n "$MS" ]; then
+            START_EPOCH=$((MS/1000))
+          else
+            S="$(grep -Ehor '"(started_at|created_at|start|startedAt)"[^0-9]*([0-9]{10})' "${ARTDIR}" 2>/dev/null | sed -E 's/.*([0-9]{10}).*/\1/' | head -n1 || true)"
+            if [ -n "$S" ]; then START_EPOCH=$S; fi
           fi
-
-          if [ -n "$START_MS" ]; then
-            if [ ${#START_MS} -ge 13 ]; then SEC=$((START_MS/1000)); else SEC=$START_MS; fi
-            ISO="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%S')"
+          if [ -n "$START_EPOCH" ]; then
+            ISO="$(date -u -d "@$START_EPOCH" '+%Y-%m-%dT%H:%M:%S')"
             echo "started_iso=${ISO}" >> "$GITHUB_OUTPUT"
           else
             echo "started_iso=" >> "$GITHUB_OUTPUT"
           fi
 
-      # Retained separate fallback (won't run if inline fallback already found audio)
+      # ---------- Fallback: EXACT old yt-dlp step if no crawler audio ----------
       - name: Ping (downloading via yt-dlp)
-        if: ${{ inputs.mode == '' && (steps.x_preflight.outputs.ok != '1' || steps.crawl.outputs.audio_file == '') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        if: ${{ inputs.mode == '' && (steps.crawl.outcome != 'success' || steps.crawl.outputs.audio_file == '') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -320,8 +285,8 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Download Space audio (yt-dlp bestaudio)
-        if: ${{ inputs.mode == '' && (steps.crawl.outputs.audio_file == '') }}
+      - name: Download Space audio (yt-dlp bestaudio) — old behavior
+        if: ${{ inputs.mode == '' && (steps.crawl.outcome != 'success' || steps.crawl.outputs.audio_file == '') }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -333,9 +298,7 @@ jobs:
           test -f "$IN" || { echo "No file downloaded"; exit 1; }
           echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
 
-      # ===========================
-      # ENCODE → MP3 (from either crawler audio or yt-dlp)
-      # ===========================
+      # ---------- Process → MP3 ----------
       - name: Ping (trimming head/tail silence)
         if: ${{ inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -424,39 +387,23 @@ jobs:
           echo "raw_url=${RAW_URL}"     >> "$GITHUB_OUTPUT"
           echo "proxy_url=${PROXY_URL}" >> "$GITHUB_OUTPUT"
 
-      # =========================================
-      # TRANSCRIPT/VTT
-      # 1) Prefer crawler captions if present
-      # 2) Else, Deepgram (when enabled)
-      # =========================================
-      - name: Fetch existing MP3 for transcript_only
-        if: ${{ inputs.mode == 'transcript_only' && inputs.existing_mp3_url != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p "${ARTDIR}"
-          OUT_MP3="${ARTDIR}/${BASE}.mp3"
-          curl -L -o "$OUT_MP3" "${{ inputs.existing_mp3_url }}"
-          echo "OUT_MP3=$OUT_MP3" >> "$GITHUB_ENV"
-
+      # ---------- Transcript/VTT ----------
       - name: Adopt crawler transcript/VTT if available
         id: adopt_cc
-        if: ${{ inputs.mode != 'attendees_only' }}
+        if: ${{ inputs.mode != 'attendees_only' && (env.TX_PATH != '' || env.VTT_PATH != '') }}
         shell: bash
         run: |
           set -euxo pipefail
-          [ -f "${TX_PATH:-}" ]  && echo "TX_OK=1"  >> "$GITHUB_OUTPUT" || echo "TX_OK=0"  >> "$GITHUB_OUTPUT"
-          [ -f "${VTT_PATH:-}" ] && echo "VTT_OK=1" >> "$GITHUB_OUTPUT" || echo "VTT_OK=0" >> "$GITHUB_OUTPUT"
+          [ -f "${TX_PATH:-/nope}" ]  && echo "TX_OK=1"  >> "$GITHUB_OUTPUT" || echo "TX_OK=0"  >> "$GITHUB_OUTPUT"
+          [ -f "${VTT_PATH:-/nope}" ] && echo "VTT_OK=1" >> "$GITHUB_OUTPUT" || echo "VTT_OK=0" >> "$GITHUB_OUTPUT"
 
-      - name: "Deepgram: diarized transcript + VTT (fallback)"
+      - name: Deepgram: diarized transcript + VTT (fallback)
         id: tx
         if: ${{ inputs.mode != 'attendees_only' && inputs.do_transcript == 'true' && (steps.adopt_cc.outputs.VTT_OK != '1' || steps.adopt_cc.outputs.TX_OK != '1') }}
         shell: bash
         env:
           DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
         run: |
-          # (unchanged Deepgram script body)
-
           set -euxo pipefail
           test -n "$DG_KEY" || { echo "DEEPGRAM_API_KEY not set"; exit 1; }
           DG_JSON="${ARTDIR}/dg.json"
@@ -493,13 +440,13 @@ jobs:
                 }'
             } > "${VTT_PATH}"
           else
-            jq -r '.results.channels[0].alternatives[0].transcript // ""' "${DG_JSON}" > "${TX_PATH}"
+            jq -r '.results.channels[0].alternatives[0].transcript // ""' "${DG_JSON}" > "${TX_path:-${ARTDIR}/${BASE}.txt}"
             printf "WEBVTT\n\n" > "${VTT_PATH}"
           fi
           echo "TX_PATH=${TX_PATH}"   >> "$GITHUB_ENV"
           echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
 
-      - name: Upload VTT to GCS (if we have one)
+      - name: Upload VTT to GCS (if any)
         id: upload_vtt
         if: ${{ env.VTT_PATH != '' && inputs.mode != 'attendees_only' }}
         shell: bash
@@ -516,10 +463,8 @@ jobs:
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
 
-      # ===========================
-      # ATTENDEES (crawler first; fallback to WP /peek)
-      # ===========================
-      - name: Scrape attendees (crawler first, timeout; fallback to WP /peek)
+      # ---------- Attendees ----------
+      - name: Scrape attendees (crawler first; fallback to WP /peek)
         id: attendees
         shell: bash
         env:
@@ -530,12 +475,9 @@ jobs:
         run: |
           set -euxo pipefail
           : > "$ATTN_HTML"
-          # Mask secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
           [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
-
-          # Use crawler only if preflight ok
           if [ "${{ steps.x_preflight.outputs.ok }}" = "1" ] && [ -n "$SID" ]; then
             docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
             set +e
@@ -564,7 +506,7 @@ jobs:
                     [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
                   done
                   echo "  </ul></li>"
-                fi
+                fi>
                 if jq -e '(.speakers // []) | length > 0' "$ATTN_JSON" >/dev/null; then
                   echo "  <li><strong>Speakers</strong><ul>"
                   jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
@@ -576,8 +518,6 @@ jobs:
               } > "$ATTN_HTML"
             fi
           fi
-
-          # Fallback to WP /peek if still empty
           if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ]; then
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
               --get \
@@ -603,14 +543,10 @@ jobs:
               } > "$ATTN_HTML"
             fi
           fi
-
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
 
-      # ===========================
-      # Space date+time → set WP post date and save meta with time
-      # Prefer crawler started_iso; else yt-dlp metadata
-      # ===========================
-      - name: Derive Space date and update post date + time meta
+      # ---------- Space date/time → WP post ----------
+      - name: Derive Space date/time and update post
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -627,53 +563,33 @@ jobs:
             else
               UD="$(jq -r '.upload_date // empty' "$META" 2>/dev/null || true)" # YYYYMMDD
               if [ -n "$UD" ] && [[ "$UD" =~ ^[0-9]{8}$ ]]; then
-                SPACE_ISO="$(date -u -d "${UD}" '+%Y-%m-%dT12:00:00')" # noon UTC if date-only
+                SPACE_ISO="$(date -u -d "${UD}" '+%Y-%m-%dT12:00:00')" # fallback noon UTC if date-only
               fi
             fi
           fi
-
           if [ -n "$SPACE_ISO" ]; then
-            SPACE_DATE="$(date -u -d "$SPACE_ISO" '+%Y-%m-%d')"
-            SPACE_TIME="$(date -u -d "$SPACE_ISO" '+%H:%M:%S')"
-            SPACE_TS="$(date -u -d "$SPACE_ISO" '+%s')"
-
-            # 1) Set the post's date (includes time)
+            # Save full datetime (includes time) and GMT variant
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/spaces/${{ inputs.post_id }}" \
-              -d "$(jq -n --arg d "$SPACE_ISO" '{date: $d}')"
-
-            # 2) Also save explicit time components as meta (best-effort; won't fail job if meta keys aren't registered)
-            jq -n \
-              --arg iso "$SPACE_ISO" \
-              --arg d "$SPACE_DATE" \
-              --arg t "$SPACE_TIME" \
-              --argjson ts "$SPACE_TS" \
-              '{ meta: { space_iso_utc: $iso, space_date_utc: $d, space_time_utc: $t, space_ts: $ts } }' > "${ARTDIR}/space-meta.json"
-
-            curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-              -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/spaces/${{ inputs.post_id }}" \
-              --data-binary @"${ARTDIR}/space-meta.json" || echo "Meta update skipped (keys may not be registered)."
-
+              -d "$(jq -n --arg d "$SPACE_ISO" '{date: $d, date_gmt: $d}')"
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
               -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                         --arg msg "Post date/time set to ${SPACE_ISO} (UTC) and saved to meta." \
+                         --arg msg "Post date/time set to ${SPACE_ISO} (UTC) from Space metadata." \
                          --arg run "${{ github.run_id }}" --argjson progress 92 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
           else
-            echo "No space date available."
+            echo "No space date/time available."
           fi
 
-      # ===========================
-      # REGISTER IN WORDPRESS (full run) OR PATCH (targeted modes)
-      # ===========================
+      # ---------- Register / Patch in WordPress ----------
       - name: Register in WordPress (final-only; includes attendees)
         id: register
         if: ${{ inputs.mode == '' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
         env:
-          WP_URL:   ${{ env.WP_BASE_URL }}
-          WP_AUTH:  ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
+          WP_URL:    ${{ env.WP_BASE_URL }}
+          WP_AUTH:   ${{ env.WP_USER }}:${{ env.WP_APP_PASSWORD }}
           MEDIA_URL: ${{ steps.upload_mp3.outputs.proxy_url }}
           VTT_URL:   ${{ steps.upload_vtt.outputs.proxy_vtt }}
           TITLE_IN:   ${{ inputs.title }}
@@ -688,7 +604,6 @@ jobs:
           if [ -n "${ATFILE}" ] && [ -f "${ATFILE}" ]; then
             AT_HTML="$(cat "${ATFILE}")"
           fi
-
           jq -n \
             --arg title "${TITLE_IN}" \
             --arg media "${MEDIA_URL}" \
@@ -704,15 +619,12 @@ jobs:
               + ( ($pid|tonumber? // null) as $maybe
                   | if $maybe then {post_id:$maybe} else {} end )
             ' > "$JFILE"
-
           RESP="${ARTDIR}/register.out.json"
           curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
             -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
             --data-binary @"${JFILE}" > "${RESP}"
-
           PERMA=$(jq -r '.permalink // ""' "${RESP}")
           EDIT_URL="${WP_URL%/}/wp-admin/post.php?post=${POST_ID_IN}&action=edit"
-
           if [ -n "${POST_ID_IN}" ]; then
             curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
               -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
@@ -721,7 +633,6 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 100 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
           fi
-
           jq . "${RESP}" || true
 
       - name: Patch transcript/VTT only
@@ -799,5 +710,5 @@ jobs:
             echo "- **Public:**     ${{ inputs.make_public }}"
             echo "- **Transcript:** ${{ inputs.do_transcript }}"
             echo "- **Mode:**       ${{ inputs.mode }}"
-            echo "- **Started ISO (crawler/meta):** ${{ steps.crawl.outputs.started_iso }}"
+            echo "- **Crawler start ISO (if any):** ${{ steps.crawl.outputs.started_iso }}"
           } >> "$GITHUB_STEP_SUMMARY"
