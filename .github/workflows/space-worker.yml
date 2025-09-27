@@ -215,7 +215,7 @@ jobs:
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
       # ===========================
-      # TRY TWSPACE-CRAWLER FIRST (fail-fast; otherwise fallback to yt-dlp path)
+      # TRY TWSPACE-CRAWLER FIRST (then inline yt-dlp fallback if needed)
       # ===========================
       - name: Ping (crawler attempting)
         if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
@@ -229,20 +229,20 @@ jobs:
                        --arg run "${{ github.run_id }}" --argjson progress 8 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: twspace-crawler (audio + captions + started_at; fail-fast)
+      - name: twspace-crawler (audio + captions + started_at; with inline fallback)
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
+          URL: ${{ inputs.space_url }}
         run: |
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
 
-          # Run crawler but cap it so we don't spin forever on API denials, geo, etc.
           docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
           set +e
-          timeout 60s docker run --rm \
+          timeout 90s docker run --rm \
             -e TWITTER_AUTHORIZATION \
             -e TWITTER_AUTH_TOKEN \
             -e TWITTER_CSRF_TOKEN \
@@ -254,18 +254,31 @@ jobs:
           set -e
           echo "crawler_exit=$RC"
 
-          # Try to find an audio file from crawler output
-          AUDIO_FILE="$(ls -1t "${ARTDIR}"/*.{m4a,mp3,mp4,aac,webm,ogg,wav,ts} 2>/dev/null | head -n1 || true)"
-          if [ -n "$AUDIO_FILE" ]; then
+          # --- recursive newest-file scanners (space-safe) ---
+          scan_newest() { # ext list via grep -E
+            find "${ARTDIR}" -type f -regextype posix-egrep -regex ".*\.($1)$" -printf '%T@ %p\n' 2>/dev/null \
+              | sort -nr | head -n1 | cut -d' ' -f2-
+          }
+
+          AUDIO_FILE="$(scan_newest 'm4a|mp3|mp4|aac|webm|ogg|wav|ts' || true)"
+          CC_FILE="$(scan_newest '(?i)(cc\.jsonl|caption.*\.jsonl)$' || true || true)" || true
+
+          # Inline yt-dlp fallback into ARTDIR if crawler didn't yield audio
+          if [ -z "${AUDIO_FILE}" ]; then
+            echo "No crawler audio found — trying yt-dlp fallback…"
+            yt-dlp -P "${ARTDIR}" -o "%(title)s.%(ext)s" -f "bestaudio/best" "${URL}" || true
+            AUDIO_FILE="$(scan_newest 'm4a|mp3|mp4|aac|webm|ogg|wav|ts' || true)"
+          fi
+
+          if [ -n "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
-            echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
+            echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           else
             echo "audio_file=" >> "$GITHUB_OUTPUT"
           fi
 
-          # Try to detect captions jsonl
-          CC_FILE="$(ls -1t "${ARTDIR}"/*cc.jsonl "${ARTDIR}"/*caption*.jsonl 2>/dev/null | head -n1 || true)"
-          if [ -n "$CC_FILE" ]; then
+          # If captions jsonl present, extract txt + vtt
+          if [ -n "${CC_FILE}" ] && [ -f "${CC_FILE}" ]; then
             set +e
             docker run --rm -v "${ARTDIR}:/app/download" \
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
@@ -274,29 +287,25 @@ jobs:
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
               cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt"
             set -e
-
-            if [ -s "${ARTDIR}/_crawler_cc.txt" ]; then
-              cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt"
-              echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV"
-            fi
-            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-            fi
+            [ -s "${ARTDIR}/_crawler_cc.txt" ] && cp "${ARTDIR}/_crawler_cc.txt" "${ARTDIR}/${BASE}.txt" && echo "TX_PATH=${ARTDIR}/${BASE}.txt" >> "$GITHUB_ENV" || true
+            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           fi
 
-          # Derive started_at from any sidecar/meta (ms or sec)
-          START_MS="$(grep -Ehor '\"(started_at|created_at|start|startedAt)\"[^\n]*([0-9]{10,13})' "${ARTDIR}" 2>/dev/null | sed -E 's/.*([0-9]{10,13}).*/\1/' | head -n1 || true)"
+          # Prefer 13-digit ms for started_at; fallback to 10-digit seconds
+          START_MS="$(grep -Ehor '"'(started_at|created_at|start|startedAt)'"'[^0-9]*([0-9]{13}) "${ARTDIR}" "${ARTDIR}/logs" 2>/dev/null | grep -Eo '[0-9]{13}' | head -n1 || true)"
+          if [ -z "$START_MS" ]; then
+            START_MS="$(grep -Ehor '"'(started_at|created_at|start|startedAt)'"'[^0-9]*([0-9]{10}) "${ARTDIR}" "${ARTDIR}/logs" 2>/dev/null | grep -Eo '[0-9]{10}' | head -n1 || true)"
+          fi
+
           if [ -n "$START_MS" ]; then
-            if [ ${#START_MS} -gt 10 ]; then SEC=$((START_MS/1000)); else SEC=$START_MS; fi
+            if [ ${#START_MS} -ge 13 ]; then SEC=$((START_MS/1000)); else SEC=$START_MS; fi
             ISO="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%S')"
             echo "started_iso=${ISO}" >> "$GITHUB_OUTPUT"
           else
             echo "started_iso=" >> "$GITHUB_OUTPUT"
           fi
 
-      # ===========================
-      # FALLBACK: yt-dlp download if crawler couldn't give us audio
-      # ===========================
+      # Retained separate fallback (won't run if inline fallback already found audio)
       - name: Ping (downloading via yt-dlp)
         if: ${{ inputs.mode == '' && (steps.x_preflight.outputs.ok != '1' || steps.crawl.outputs.audio_file == '') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -412,7 +421,7 @@ jobs:
           if [ "${{ inputs.make_public }}" = "true" ]; then
             gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
           fi
-          echo "raw_url=${RAW_URL}"   >> "$GITHUB_OUTPUT"
+          echo "raw_url=${RAW_URL}"     >> "$GITHUB_OUTPUT"
           echo "proxy_url=${PROXY_URL}" >> "$GITHUB_OUTPUT"
 
       # =========================================
@@ -432,7 +441,7 @@ jobs:
 
       - name: Adopt crawler transcript/VTT if available
         id: adopt_cc
-        if: ${{ inputs.mode != 'attendees_only' && env.TX_PATH != '' || env.VTT_PATH != '' }}
+        if: ${{ inputs.mode != 'attendees_only' && (env.TX_PATH != '' || env.VTT_PATH != '') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -596,10 +605,10 @@ jobs:
           echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
 
       # ===========================
-      # Space date → set WP post date
+      # Space date+time → set WP post date and save meta with time
       # Prefer crawler started_iso; else yt-dlp metadata
       # ===========================
-      - name: Derive Space date and update post date
+      - name: Derive Space date and update post date + time meta
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -622,13 +631,31 @@ jobs:
           fi
 
           if [ -n "$SPACE_ISO" ]; then
+            SPACE_DATE="$(date -u -d "$SPACE_ISO" '+%Y-%m-%d')"
+            SPACE_TIME="$(date -u -d "$SPACE_ISO" '+%H:%M:%S')"
+            SPACE_TS="$(date -u -d "$SPACE_ISO" '+%s')"
+
+            # 1) Set the post's date (includes time)
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/spaces/${{ inputs.post_id }}" \
               -d "$(jq -n --arg d "$SPACE_ISO" '{date: $d}')"
+
+            # 2) Also save explicit time components as meta (best-effort; won't fail job if meta keys aren't registered)
+            jq -n \
+              --arg iso "$SPACE_ISO" \
+              --arg d "$SPACE_DATE" \
+              --arg t "$SPACE_TIME" \
+              --argjson ts "$SPACE_TS" \
+              '{ meta: { space_iso_utc: $iso, space_date_utc: $d, space_time_utc: $t, space_ts: $ts } }' > "${ARTDIR}/space-meta.json"
+
+            curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+              -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/spaces/${{ inputs.post_id }}" \
+              --data-binary @"${ARTDIR}/space-meta.json" || echo "Meta update skipped (keys may not be registered)."
+
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
               -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
               -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                         --arg msg "Post date set to ${SPACE_ISO} (UTC) based on Space metadata." \
+                         --arg msg "Post date/time set to ${SPACE_ISO} (UTC) and saved to meta." \
                          --arg run "${{ github.run_id }}" --argjson progress 92 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
           else
@@ -770,4 +797,5 @@ jobs:
             echo "- **Public:**     ${{ inputs.make_public }}"
             echo "- **Transcript:** ${{ inputs.do_transcript }}"
             echo "- **Mode:**       ${{ inputs.mode }}"
+            echo "- **Started ISO (crawler/meta):** ${{ steps.crawl.outputs.started_iso }}"
           } >> "$GITHUB_STEP_SUMMARY"
