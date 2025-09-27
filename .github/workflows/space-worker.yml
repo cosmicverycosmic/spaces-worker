@@ -176,17 +176,29 @@ jobs:
           OK=0
           REASON="no_creds"
 
+          HAS_COOKIE=0
+          HAS_BEARER=0
+          [ -n "$AT" ] && [ -n "$CT" ] && HAS_COOKIE=1 || true
+          [ -n "$AUTH" ] && HAS_BEARER=1 || true
+
+          # If we have any creds at all, allow the crawler (diagnostics below still run)
+          if [ "$HAS_COOKIE" -eq 1 ] || [ "$HAS_BEARER" -eq 1 ]; then
+            OK=1
+            REASON="creds_present"
+          fi
+
           mkdir -p "${ARTDIR}"
 
-          # Common headers
+          # Common headers for diag calls
           BASEH=(
             -H "User-Agent: Mozilla/5.0"
             -H "Accept: application/json, text/plain, */*"
             -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
           )
 
-          # 1) Try cookie-auth directly on the participants endpoint
-          if [ -n "$AT" ] && [ -n "$CT" ] && [ -n "$AUTH" ]; then
+          # --- Diagnostics only (do not gate on these) ---
+          # Try participants with cookie+auth
+          if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
             CVAL="auth_token=${AT}; ct0=${CT}"
             HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
               "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
@@ -197,44 +209,41 @@ jobs:
               -H "x-twitter-active-user: yes" \
               -H "x-twitter-client-language: en" \
               -H "x-twitter-auth-type: OAuth2Session" || echo 000)
-            if [ "$HTTP" = "200" ]; then
-              OK=1; REASON="cookie_ok"
-            else
-              REASON="cookie_${HTTP}"
-            fi
+            echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
           fi
 
-          # 2) If cookie route failed, try bearer + guest token
-          if [ "$OK" -ne 1 ] && [ -n "$AUTH" ]; then
+          # Guest activation (bearer-only)
+          if [ "$HAS_BEARER" -eq 1 ]; then
             GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
               -X POST "https://api.twitter.com/1.1/guest/activate.json" \
               -H "Authorization: ${AUTH}" \
               -H "Content-Type: application/json" \
               -d '{}' || echo 000)
+            echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
+
+            # If we didn’t already allow the crawler, a successful guest activation is enough
+            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
+              OK=1
+              REASON="guest_ok"
+            fi
+
+            # Try participants with guest token (diag)
             if [ "$GHTTP" = "200" ]; then
               GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
               if [ -n "$GUEST" ]; then
-                HTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
+                PHTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
                   "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
                   "${BASEH[@]}" \
                   -H "Authorization: ${AUTH}" \
                   -H "x-guest-token: ${GUEST}" \
                   -H "x-twitter-active-user: yes" \
                   -H "x-twitter-client-language: en" || echo 000)
-                if [ "$HTTP" = "200" ]; then
-                  OK=1; REASON="guest_ok"
-                else
-                  REASON="guest_${HTTP}"
-                fi
-              else
-                REASON="guest_missing"
+                echo "diag_participants_guest_http=${PHTTP}" >> "$GITHUB_OUTPUT"
               fi
-            else
-              REASON="guest_${GHTTP}"
             fi
           fi
 
-          # 3) Last resort: public peek (do NOT mark OK to keep crawler gated)
+          # Public peek (if this works, we definitely can try the crawler)
           if [ "$OK" -ne 1 ]; then
             for PEEK in \
               "https://x.com/i/spaces/${SPACE_ID}/peek" \
@@ -242,15 +251,20 @@ jobs:
             do
               PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" \
                 "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
+              echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
               if [ "$PHTTP" = "200" ]; then
-                REASON="public_ok"; break
+                OK=1
+                REASON="public_ok"
+                break
               fi
             done
           fi
+          # --- end diagnostics ---
 
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
+
 
       - name: Ping crawler attempting
         if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
