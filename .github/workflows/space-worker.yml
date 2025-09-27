@@ -441,20 +441,22 @@ jobs:
 
       - name: Adopt crawler transcript/VTT if available
         id: adopt_cc
-        if: ${{ inputs.mode != 'attendees_only' && (env.TX_PATH != '' || env.VTT_PATH != '') }}
+        if: ${{ inputs.mode != 'attendees_only' }}
         shell: bash
         run: |
           set -euxo pipefail
-          [ -f "${TX_PATH:-/nope}" ]  && echo "TX_OK=1"  >> "$GITHUB_OUTPUT" || echo "TX_OK=0"  >> "$GITHUB_OUTPUT"
-          [ -f "${VTT_PATH:-/nope}" ] && echo "VTT_OK=1" >> "$GITHUB_OUTPUT" || echo "VTT_OK=0" >> "$GITHUB_OUTPUT"
+          [ -f "${TX_PATH:-}" ]  && echo "TX_OK=1"  >> "$GITHUB_OUTPUT" || echo "TX_OK=0"  >> "$GITHUB_OUTPUT"
+          [ -f "${VTT_PATH:-}" ] && echo "VTT_OK=1" >> "$GITHUB_OUTPUT" || echo "VTT_OK=0" >> "$GITHUB_OUTPUT"
 
-      - name: Deepgram: diarized transcript + VTT (fallback)
+      - name: "Deepgram: diarized transcript + VTT (fallback)"
         id: tx
         if: ${{ inputs.mode != 'attendees_only' && inputs.do_transcript == 'true' && (steps.adopt_cc.outputs.VTT_OK != '1' || steps.adopt_cc.outputs.TX_OK != '1') }}
         shell: bash
         env:
           DG_KEY: ${{ env.DEEPGRAM_API_KEY }}
         run: |
+          # (unchanged Deepgram script body)
+
           set -euxo pipefail
           test -n "$DG_KEY" || { echo "DEEPGRAM_API_KEY not set"; exit 1; }
           DG_JSON="${ARTDIR}/dg.json"
