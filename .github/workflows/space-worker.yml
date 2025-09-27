@@ -162,26 +162,57 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
+
+          # Do NOT invent a bearer token. If it doesn't start with "Bearer ", drop it.
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
-            AUTH="Bearer ${AUTH}"
+            AUTH=""
           fi
-          [ -n "$AUTH" ] && echo "::add-mask::${AUTH}"
+
+          # Mask provided secrets
+          [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ]   && echo "::add-mask::${AT}"
           [ -n "$CT" ]   && echo "::add-mask::${CT}"
+
           OK=0; REASON="no_creds"
-          if [ -n "$AUTH" ] || { [ -n "$AT" ] && [ -n "$CT" ]; }; then
+          COOKIE_MODE=0; BEARER_MODE=0
+          [ -n "$AT" ] && [ -n "$CT" ] && COOKIE_MODE=1 || true
+          [ -n "$AUTH" ] && BEARER_MODE=1 || true
+
+          if [ "$COOKIE_MODE" -eq 1 ] || [ "$BEARER_MODE" -eq 1 ]; then
             HARGS=()
             [ -n "$AUTH" ] && HARGS+=(-H "Authorization: $AUTH")
-            [ -n "$CT" ] && HARGS+=(-H "x-csrf-token: $CT")
+            [ -n "$CT" ]   && HARGS+=(-H "x-csrf-token: $CT")
             CVAL=""
             [ -n "$AT" ] && CVAL="auth_token=$AT"
-            [ -n "$CT" ] && CVAL="${CVAL}; ct0=$CT"
+            [ -n "$CT" ] && CVAL="${CVAL:+$CVAL; }ct0=$CT"
             [ -n "$CVAL" ] && HARGS+=(-H "Cookie: $CVAL")
-            HARGS+=(-H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "Referer: https://x.com/home" -H "User-Agent: Mozilla/5.0")
-            HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "https://x.com/i/api/1.1/account/settings.json" "${HARGS[@]}" || echo 000)
-            if [ "$HTTP" = "200" ]; then OK=1; else REASON="http_${HTTP}"; fi
+            HARGS+=(
+              -H "x-twitter-active-user: yes"
+              -H "x-twitter-client-language: en"
+              -H "x-twitter-auth-type: OAuth2Session"
+              -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
+              -H "User-Agent: Mozilla/5.0"
+            )
+
+            if [ "$COOKIE_MODE" -eq 1 ]; then
+              # Try v2 first, then 1.1 as fallback
+              PRE1="https://x.com/i/api/2/account/settings.json"
+              PRE2="https://x.com/i/api/1.1/account/settings.json"
+              HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "$PRE1" "${HARGS[@]}" || echo 000)
+              if [ "$HTTP" = "404" ] || [ "$HTTP" = "401" ]; then
+                HTTP=$(curl -sS -o "${ARTDIR}/x_preflight.json" -w "%{http_code}" "$PRE2" "${HARGS[@]}" || echo 000)
+              fi
+              if [ "$HTTP" = "200" ]; then OK=1; else REASON="http_${HTTP}"; fi
+            elif [ "$BEARER_MODE" -eq 1 ]; then
+              # For bearer-only, validate by guest activation
+              HTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
+                      -X POST "https://api.twitter.com/1.1/guest/activate.json" \
+                      -H "Authorization: $AUTH" -H "Content-Type: application/json" -d '{}' || echo 000)
+              if [ "$HTTP" = "200" ]; then OK=1; else REASON="guest_${HTTP}"; fi
+            fi
           fi
-          echo "ok=${OK}"        >> "$GITHUB_OUTPUT"
+
+          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
@@ -282,6 +313,67 @@ jobs:
             echo "started_iso=${ISO}" >> "$GITHUB_OUTPUT"
           else
             echo "started_iso=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # ---- EXTRA: fetch participants JSON directly and post artifacts to WP ----
+          HARGS=()
+          [ -n "${TWITTER_CSRF_TOKEN:-}" ] && HARGS+=(-H "x-csrf-token: ${TWITTER_CSRF_TOKEN}")
+          if [ -n "${TWITTER_AUTH_TOKEN:-}" ] || [ -n "${TWITTER_CSRF_TOKEN:-}" ]; then
+            CVAL=""
+            [ -n "${TWITTER_AUTH_TOKEN:-}" ] && CVAL="auth_token=${TWITTER_AUTH_TOKEN}"
+            [ -n "${TWITTER_CSRF_TOKEN:-}" ] && CVAL="${CVAL:+$CVAL; }ct0=${TWITTER_CSRF_TOKEN}"
+            HARGS+=(-H "Cookie: $CVAL" -H "x-twitter-auth-type: OAuth2Session")
+          fi
+          [ -n "${TWITTER_AUTHORIZATION:-}" ] && HARGS+=(-H "Authorization: ${TWITTER_AUTHORIZATION}")
+          HARGS+=(-H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "Referer: https://x.com/i/spaces/${SID}" -H "User-Agent: Mozilla/5.0")
+
+          curl -sS -o "$ARTDIR/participants.json" -w "%{http_code}" \
+               "https://x.com/i/api/spaces/${SID}/participants" "${HARGS[@]}" >/dev/null || true
+
+          if [ ! -s "$ARTDIR/participants.json" ] && [ -n "${TWITTER_AUTHORIZATION:-}" ]; then
+            GT="$(jq -r '.guest_token // empty' "$ARTDIR/x_guest.json" 2>/dev/null || true)"
+            if [ -z "$GT" ]; then
+              curl -sS -X POST "https://api.twitter.com/1.1/guest/activate.json" \
+                   -H "Authorization: ${TWITTER_AUTHORIZATION}" \
+                   -H "Content-Type: application/json" -d '{}' > "$ARTDIR/x_guest.json" || true
+              GT="$(jq -r '.guest_token // empty' "$ARTDIR/x_guest.json" 2>/dev/null || true)"
+            fi
+            if [ -n "$GT" ]; then
+              curl -sS -o "$ARTDIR/participants.json" \
+                   -H "authorization: ${TWITTER_AUTHORIZATION}" -H "x-guest-token: $GT" \
+                   -H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" \
+                   -H "Referer: https://x.com/i/spaces/${SID}" -H "User-Agent: Mozilla/5.0" \
+                   "https://x.com/i/api/spaces/${SID}/participants" || true
+            fi
+          fi
+
+          {
+            echo "<pre>"
+            if [ -s "$ARTDIR/participants.json" ]; then
+              echo "participants_json_bytes: $(wc -c < "$ARTDIR/participants.json")"
+            else
+              echo "participants_json_bytes: 0"
+            fi
+            echo "crawler_stdout_bytes: $(wc -c < "$LOG_STD" 2>/dev/null || echo 0)"
+            echo "crawler_stderr_bytes: $(wc -c < "$LOG_ERR" 2>/dev/null || echo 0)"
+            echo "</pre>"
+          } > "$ARTDIR/crawler.html" || true
+
+          if [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ] && [ -n "${{ inputs.post_id }}" ]; then
+            curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+              -H "Content-Type: application/json" \
+              -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+              -d "$(jq -n \
+                    --arg pid "${{ inputs.post_id }}" \
+                    --arg status "processing" \
+                    --arg msg "Crawler artifacts captured" \
+                    --arg run "${{ github.run_id }}" \
+                    --arg mkr "${{ inputs.wp_marker }}" \
+                    --argjson cjson "$(jq -c . "$ARTDIR/participants.json" 2>/dev/null || echo '{}')" \
+                    --arg chtml "$(cat "$ARTDIR/crawler.html" 2>/dev/null || echo '')" \
+                    '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:12,
+                      crawler_json:$cjson, crawler_html:$chtml,
+                      artifacts:{ participants:"participants.json", preflight:"x_preflight.json", guest:"x_guest.json" }}')"
           fi
 
       - name: Ping downloading via yt dlp
