@@ -71,15 +71,15 @@ env:
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-  # Optional: for twspace-crawler (use either official Bearer OR unofficial cookie pair)
-  # Optional: for twspace-crawler (use either official Bearer OR the auth_token+ct0 cookie pair)
-  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.TWITTER_BEARER || vars.TWITTER_AUTHORIZATION || vars.TWITTER_BEARER }}
-  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || vars.TWITTER_AUTH_TOKEN }}
-  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || vars.TWITTER_CSRF_TOKEN }}
-  
+
+  # Accept both TWITTER_* and your X_* names
+  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.TWITTER_BEARER || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.TWITTER_BEARER || vars.X_BEARER }}
+  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN  || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
+  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
+  
 
 jobs:
   run:
