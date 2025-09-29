@@ -284,67 +284,72 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Extract raw attendees-related line (don't try to fully parse JSON)
+          # Extract raw attendees-related line (clean JSON after the pipe)
           RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
           fi
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
-            # Also try to capture the portion after the pipe for convenience (may still not be valid JSON)
             printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line_after_pipe.txt" || true
           fi
-          [ -s "${ARTDIR}/_as_line.txt" ] && echo "as_line=${ARTDIR}/_as_line.txt" >> "$GITHUB_OUTPUT" || true
+          [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
 
       - name: Build attendees JSON and HTML from crawler logs
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
         env:
-          AS_LINE: ${{ steps.crawl.outputs.as_line }}
+          CAND: ${{ steps.crawl.outputs.as_line }}
         run: |
           set -euxo pipefail
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
 
-          # Best-effort: try to coerce to JSON when possible; ignore failures.
-          # Grab the part after the pipe and try a couple of safe trims.
-          CAND="${ARTDIR}/_as_line_after_pipe.txt"
-          if [ -s "$CAND" ]; then
-            TRY="$(sed -E 's/^[^\\[{]*([\\[{].*)$/\\1/' "$CAND" || true)"
-            if printf '%s' "$TRY" | jq -e . >/dev/null 2>&1; then
-              printf '%s' "$TRY" > "${ARTDIR}/_as_line.json"
-            else
-              TRY2="$(sed -nE 's/^.*([\\[{].*[\\}\\]]).*$/\\1/p' "$CAND" || true)"
-              if printf '%s' "$TRY2" | jq -e . >/dev/null 2>&1; then
-                printf '%s' "$TRY2" > "${ARTDIR}/_as_line.json"
-              fi
-            fi
+          # Directly validate and store JSON from the captured line (it's already clean JSON)
+          if jq -e . "${CAND}" >/dev/null 2>&1; then
+            cp "${CAND}" "${ARTDIR}/_as_line.json"
           fi
 
+          # Convert to compact attendees.json (host, cohosts, speakers)
           if [ -s "${ARTDIR}/_as_line.json" ]; then
             jq -r '
-              def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + (h//""))} | select(.handle!=null and .handle!="" and .url!=null);
-              def uniqh: unique_by(.handle);
-              (.audioSpace // .) as $a |
-              {
-                host:    ( [ $a.metadata?.creator_results?.result?.legacy? ] | map(mk(.screen_name; .name)) | uniqh ),
-                cohosts: ( ( $a.participants?.admins   // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh ),
-                speakers:( ( $a.participants?.speakers // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh )
-              }
+              # Helper to normalize a person object from different shapes
+              def mkp:
+                { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
+                  name:   (.display_name       // .user_results?.result?.legacy?.name)
+                }
+                | select(.handle!=null and .handle!="")
+                | . + { url: ("https://x.com/" + .handle) };
+
+              (.audioSpace // .) as $a
+              | ($a.metadata?.creator_results?.result?.legacy?) as $h
+              | ($h.screen_name // empty) as $H
+              | {
+                  host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
+                  cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
+                  speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
+                }
             ' "${ARTDIR}/_as_line.json" > "$OUT_JSON" || true
           fi
 
-          if [ -s "$OUT_JSON" ] && jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null 2>&1; then
+          # Generate simple HTML sections exactly like desired
+          if [ -s "$OUT_JSON" ] && jq -e . "$OUT_JSON" >/dev/null 2>&1; then
             jq -r '
-              def li: "    <li><a href=\"" + (.url//"#") + "\" target=\"_blank\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
-              "<ul>\n" +
-              (if (.host|length)>0 then "  <li><strong>Host</strong>\n  <ul>\n" + (.host|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
-              (if (.cohosts|length)>0 then "  <li><strong>Co-hosts</strong>\n  <ul>\n" + (.cohosts|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
-              (if (.speakers|length)>0 then "  <li><strong>Speakers</strong>\n  <ul>\n" + (.speakers|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
-              "</ul>\n"
+              def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def section(title; items):
+                if (items|length) > 0
+                then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
+                else ""
+                end;
+
+              . as $d
+              | section("Host"; $d.host)
+              + section( (if ($d.cohosts|length)==1 then "Co-host" else "Co-hosts" end); $d.cohosts)
+              + section("Speakers"; $d.speakers)
             ' "$OUT_JSON" > "$OUT_HTML" || true
-            if grep -qi '<li[^>]*><a ' "$OUT_HTML"; then
+
+            if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
               echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
             fi
@@ -352,7 +357,7 @@ jobs:
             echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
           fi
 
-      # NEW: Always assemble and upload a raw attendees dump, regardless of parsing success
+      # Always assemble and upload a raw attendees dump, regardless of parsing success
       - name: Assemble attendees RAW dump
         id: assemble_attendees_raw
         shell: bash
@@ -557,7 +562,7 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Patch WP with artifacts
+      - name: Patch WP with artifacts (attach attendees HTML directly)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -588,23 +593,21 @@ jobs:
                 + (if (j|length)>0 then {attendees_json_url:j} else {} end)
                 + (if (r|length)>0 then {attendees_raw_url:r} else {} end)
               );
-            . as $root
-            | ({
-                post_id: ($pid|tonumber),
-                status: "complete",
-                progress: 100
-              }
-              + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
-              + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
-              + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
-            )
-            | . + ( if ( ($aturl|length)>0 or ($jturl|length)>0 or ($rawurl|length)>0 )
-                    then { artifacts: maybe_artifacts($aturl; $jturl; $rawurl) }
-                    else {} end)
-            | . + ( if      ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
-                    else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
-                    else if ($rawurl|length)>0 then {ss3k_attendees_html_url:$rawurl}
-                    else {} end end end)
+            {
+              post_id: ($pid|tonumber),
+              status: "complete",
+              progress: 100
+            }
+            + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
+            + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
+            + (if ($athtml|length)>0 then {attendees_html:$athtml, attendees:$athtml} else {} end)
+            + ( if ( ($aturl|length)>0 or ($jturl|length)>0 or ($rawurl|length)>0 )
+                then { artifacts: maybe_artifacts($aturl; $jturl; $rawurl) }
+                else {} end)
+            + ( if      ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
+                else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
+                else if ($rawurl|length)>0 then {ss3k_attendees_html_url:$rawurl}
+                else {} end end end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
