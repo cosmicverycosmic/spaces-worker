@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X / Twitter Space URL
+        description: X or Twitter Space URL
         required: true
         type: string
       post_id:
-        description: Existing WordPress post ID to patch 
+        description: Existing WordPress post ID optional
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title 
+        description: Fallback post title optional
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix 
+        description: GCS prefix default spaces YYYY MM
         required: false
         type: string
         default: ""
@@ -35,7 +35,7 @@ on:
         options: ["true","false"]
         default: "true"
       space_id:
-        description: Space ID 
+        description: Space ID will be parsed from URL when blank
         required: false
         type: string
         default: ""
@@ -46,7 +46,7 @@ on:
         options: ["", "transcript_only", "attendees_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only URL to existing MP3 
+        description: For transcript_only provide URL to existing MP3 to skip audio pipeline
         required: false
         type: string
         default: ""
@@ -60,20 +60,15 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Required
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
-  # Optional WP (enable if you want status pings + patch)
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
-  # Optional Deepgram
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-  # X / Twitter creds (any of these help; not all required)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN || vars.X_CSRF }}
-
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
 
@@ -84,7 +79,7 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Start (optional WP queued)
+      - name: Start queued status to WP
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
@@ -99,7 +94,7 @@ jobs:
                        --argjson progress 1 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Install deps & docker login
+      - name: Install deps and docker login
         shell: bash
         run: |
           set -euxo pipefail
@@ -112,7 +107,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Validate config & prefixes
+      - name: Validate config and prefixes
         id: cfg
         shell: bash
         run: |
@@ -122,10 +117,10 @@ jobs:
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
-          echo "PREFIX=$PFX"           >> "$GITHUB_ENV"
+          echo "PREFIX=$PFX"                 >> "$GITHUB_ENV"
           echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
-      - name: Derive Space ID + base
+      - name: Derive Space ID and base
         id: ids
         shell: bash
         env:
@@ -151,7 +146,6 @@ jobs:
           printf '%s' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      # ---------- RELAXED PREFLIGHT ----------
       - name: X preflight auth sanity check
         id: x_preflight
         shell: bash
@@ -161,7 +155,6 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          # Require explicit "Bearer " prefix
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH=""
           fi
@@ -186,29 +179,41 @@ jobs:
           mkdir -p "${ARTDIR}"
           BASEH=(-H "User-Agent: Mozilla/5.0" -H "Accept: application/json, text/plain, */*" -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}")
 
-          # diagnostics (non-gating)
           if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
             CVAL="auth_token=${AT}; ct0=${CT}"
             HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
               "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-              "${BASEH[@]}" -H "Authorization: ${AUTH}" -H "x-csrf-token: ${CT}" -H "Cookie: ${CVAL}" \
-              -H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "x-twitter-auth-type: OAuth2Session" || echo 000)
+              "${BASEH[@]}" \
+              -H "Authorization: ${AUTH}" \
+              -H "x-csrf-token: ${CT}" \
+              -H "Cookie: ${CVAL}" \
+              -H "x-twitter-active-user: yes" \
+              -H "x-twitter-client-language: en" \
+              -H "x-twitter-auth-type: OAuth2Session" || echo 000)
             echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
           fi
 
           if [ "$HAS_BEARER" -eq 1 ]; then
             GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
               -X POST "https://api.twitter.com/1.1/guest/activate.json" \
-              -H "Authorization: ${AUTH}" -H "Content-Type: application/json" -d '{}' || echo 000)
+              -H "Authorization: ${AUTH}" \
+              -H "Content-Type: application/json" \
+              -d '{}' || echo 000)
             echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
-            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then OK=1; REASON="guest_ok"; fi
+            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
+              OK=1
+              REASON="guest_ok"
+            fi
             if [ "$GHTTP" = "200" ]; then
               GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
               if [ -n "$GUEST" ]; then
                 PHTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
                   "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-                  "${BASEH[@]}" -H "Authorization: ${AUTH}" -H "x-guest-token: ${GUEST}" \
-                  -H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" || echo 000)
+                  "${BASEH[@]}" \
+                  -H "Authorization: ${AUTH}" \
+                  -H "x-guest-token: ${GUEST}" \
+                  -H "x-twitter-active-user: yes" \
+                  -H "x-twitter-client-language: en" || echo 000)
                 echo "diag_participants_guest_http=${PHTTP}" >> "$GITHUB_OUTPUT"
               fi
             fi
@@ -221,7 +226,11 @@ jobs:
             do
               PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
               echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
-              if [ "$PHTTP" = "200" ]; then OK=1; REASON="public_ok"; break; fi
+              if [ "$PHTTP" = "200" ]; then
+                OK=1
+                REASON="public_ok"
+                break
+              fi
             done
           fi
 
@@ -229,8 +238,7 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # ---------- ATTENDEES via twspace-crawler (no /peek) ----------
-      - name: Run crawler (always for attendees; also used for audio)
+      - name: Run crawler for attendees and audio
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' }}
         shell: bash
@@ -257,14 +265,12 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          # Best-effort audio pick
           AUDIO_FILE="$(find "${ARTDIR}" -maxdepth 1 -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "$AUDIO_FILE" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
           fi
 
-          # Try to pull a master playlist from logs if no audio file yet
           if [ -z "${AUDIO_FILE:-}" ]; then
             M3U8="$(grep -Eo 'https?://[^ ]+master_playlist\.m3u8' "$LOG_STD" "$LOG_ERR" 2>/dev/null | head -n1 || true)"
             if [ -n "$M3U8" ]; then
@@ -276,7 +282,6 @@ jobs:
             fi
           fi
 
-          # Extract raw JSON line for audioSpace (contains participants)
           AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
           if [ -z "$AS_JSON_LINE" ]; then
             AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
@@ -286,7 +291,7 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line.json" ] && echo "as_json=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
-      - name: Build attendees JSON+HTML from crawler logs
+      - name: Build attendees JSON and HTML from crawler logs
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_json != '' }}
         shell: bash
@@ -297,7 +302,6 @@ jobs:
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
 
-          # Pull the embedded audioSpace object if nested
           jq -c 'def first_audioSpace:
                    (.. | .audioSpace? // empty) | select(.!=null) | . | halt;
                  . as $root
@@ -305,11 +309,9 @@ jobs:
 
           SRC="${ARTDIR}/_as_obj.json"
           if ! jq -e type "${SRC}" >/dev/null 2>&1; then
-            # The line itself may already be the audioSpace object
             SRC="$AS_LINE"
           fi
 
-          # Normalize attendees (host from creator_results; admins->cohosts)
           jq -r '
             def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + h)} | select(.handle!=null and .handle!="" and .url!=null);
             def uniqh: unique_by(.handle);
@@ -330,7 +332,6 @@ jobs:
             }
           ' "$SRC" > "$OUT_JSON" || true
 
-          # Create HTML only if we have at least one item
           if jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null; then
             jq -r '
               def li: "    <li><a href=\"" + .url + "\" target=\"_blank\">" + ((.name // "") + " (@" + .handle + ")") + "</a></li>";
@@ -346,9 +347,29 @@ jobs:
             fi
           fi
 
+      - name: Try attendees from public peek best effort
+        id: peek_attendees
+        if: ${{ steps.attendees.outputs.attendees_html == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TMP_JSON="${ARTDIR}/attendees_peek.json"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            --get \
+            --data-urlencode space_url="${{ inputs.space_url }}" \
+            --data-urlencode space_id="${SPACE_ID}" \
+            "${WP_BASE_URL%/}/wp-json/ss3k/v1/peek" > "$TMP_JSON" || true
+          if jq -e '.html? | length>0' "$TMP_JSON" >/dev/null 2>&1; then
+            jq -r '.html' "$TMP_JSON" > "${ARTDIR}/attendees.html"
+            if grep -qi '<li><a ' "${ARTDIR}/attendees.html"; then
+              echo "ATTN_HTML=${ARTDIR}/attendees.html" >> "$GITHUB_ENV"
+              echo "attendees_html=${ARTDIR}/attendees.html" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
       - name: Upload attendees HTML to GCS
         id: upload_attendees
-        if: ${{ steps.attendees.outputs.attendees_html != '' }}
+        if: ${{ steps.attendees.outputs.attendees_html != '' || steps.peek_attendees.outputs.attendees_html != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -359,10 +380,9 @@ jobs:
           if [ "${{ inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "raw_attendees_url=${RAW}"   >> "$GITHUB_OUTPUT"
+          echo "raw_attendees_url=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "proxy_attendees_url=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      # ---------- AUDIO / TRANSCRIPT (skippable if attendees_only) ----------
       - name: Ping processing audio
         if: ${{ inputs.mode != 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -377,7 +397,7 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Fallback download via yt-dlp (if crawler gave no audio)
+      - name: Fallback download via ytdlp if crawler gave no audio
         if: ${{ inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && inputs.existing_mp3_url == '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
@@ -390,7 +410,7 @@ jobs:
           test -f "$IN" || { echo "No file downloaded"; exit 1; }
           echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
 
-      - name: Use provided MP3 (transcript_only mode)
+      - name: Use provided MP3 for transcript only
         if: ${{ inputs.mode == 'transcript_only' && inputs.existing_mp3_url != '' }}
         shell: bash
         run: |
@@ -398,7 +418,7 @@ jobs:
           curl -L "${{ inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
           echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
-      - name: Trim head/tail silence
+      - name: Trim head and tail silence
         if: ${{ inputs.mode != 'attendees_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
@@ -409,7 +429,7 @@ jobs:
             -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
-      - name: Loudness normalize → MP3
+      - name: Loudness normalize to MP3
         if: ${{ inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
@@ -417,7 +437,6 @@ jobs:
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
-          # Use pass1 values if available
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
             I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON"); LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
@@ -442,7 +461,7 @@ jobs:
           echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Captions via crawler (VTT) if present
+      - name: Captions via crawler VTT if present
         id: crawl_cc
         if: ${{ inputs.mode != 'attendees_only' }}
         shell: bash
@@ -454,16 +473,19 @@ jobs:
           fi
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
-      - name: VTT via Deepgram (fallback)
-        id: dg
-        if: ${{ inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEGGG != '' && inputs.do_transcript == 'true' }}
+      - name: VTT via Deepgram when needed
+        id: deepgram
+        if: ${{ inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
-        env:
-          DEGGG: ${{ env.DEEPGRAM_API_KEY }}
         run: |
           set -euxo pipefail
-          # Placeholder for your Deepgram call (omitted here if you already have a step/script)
-          true
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${MP3_PATH}" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
+            -o "${ARTDIR}/${BASE}.vtt" || true
+          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
       - name: Upload VTT to GCS
         id: upload_vtt
@@ -481,8 +503,7 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      # ---------- PATCH WP ----------
-      - name: Patch WP with artifacts (optional)
+      - name: Patch WP with artifacts
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -508,7 +529,7 @@ jobs:
               progress: 100
             }
             + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
-            + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+            + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
             + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
             + (if ($aturl|length)>0 then {artifacts:{attendees_html_url:$aturl}} else {} end)
           ')"
@@ -522,22 +543,24 @@ jobs:
         run: |
           {
             echo "### Space Worker Summary"
-            echo "- Space URL: ${{ inputs.space_url }}"
-            echo "- Space ID:  ${SID}"
-            echo "- Post ID:   ${{ inputs.post_id }}"
+            echo "- Space URL ${{
+              inputs.space_url
+            }}"
+            echo "- Space ID  ${SID}"
+            echo "- Post ID   ${{ inputs.post_id }}"
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
-              echo "- Audio:     ${{ steps.upload_mp3.outputs.audio_proxy }}"
+              echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
             fi
             if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
-              echo "- VTT:       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
+              echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             fi
             if [ -n "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ]; then
-              echo "- Attendees: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
+              echo "- Attendees ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
             elif [ -n "${ATTN_HTML:-}" ]; then
               echo "- Attendees embedded in WP"
             else
-              echo "- Attendees: (none extracted)"
+              echo "- Attendees none extracted"
             fi
-            echo "- Preflight: ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
-            echo "- Mode:      ${{ inputs.mode }}"
+            echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
+            echo "- Mode      ${{ inputs.mode }}"
           } >> "$GITHUB_STEP_SUMMARY"
