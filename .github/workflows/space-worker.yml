@@ -272,20 +272,34 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          AUDIO_FILE="$(find "${ARTDIR}" -maxdepth 1 -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-          if [ -n "$AUDIO_FILE" ]; then
-            echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
-            echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
+          # Prefer the exact audio path emitted by the crawler logs
+          AUDIO_FILE="$(grep -hEo '"/app/download[^"]+\.(m4a|mp3|mp4|aac|webm|ogg|wav|ts)"' "$LOG_STD" "$LOG_ERR" | tr -d '"' | sed "s|^/app/download|$ARTDIR|" | tail -n1 || true)"
+
+          # Fallback: newest audio-like file anywhere under $ARTDIR
+          if [[ -z "${AUDIO_FILE:-}" || ! -f "$AUDIO_FILE" ]]; then
+            AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
 
-          if [ -z "${AUDIO_FILE:-}" ]; then
-            M3U8="$(grep -Eo 'https?://[^ ]+master_playlist\.m3u8' "$LOG_STD" "$LOG_ERR" 2>/dev/null | head -n1 || true)"
+          if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE:-}" ]; then
+            echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
+            echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Second fallback: fetch m3u8 from logs and re-mux with ffmpeg (no transcode)
+          if [ -z "${AUDIO_FILE:-}" ] || [ ! -f "${AUDIO_FILE:-}" ]; then
+            M3U8="$(grep -hEo 'https?://[^ ]+playlist_[^ ]+\.m3u8[^ ]*' "$LOG_STD" "$LOG_ERR" | head -n1 || true)"
+            if [ -z "$M3U8" ]; then
+              M3U8="$(grep -hEo 'https?://[^ ]+master_playlist\.m3u8[^ ]*' "$LOG_STD" "$LOG_ERR" | head -n1 || true)"
+            fi
             if [ -n "$M3U8" ]; then
               DL_OUT="${ARTDIR}/${BASE}.m4a"
-              if ! ffmpeg -hide_banner -y -i "$M3U8" -vn -c copy -bsf:a aac_adtstoasc "$DL_OUT"; then
-                ffmpeg -hide_banner -y -i "$M3U8" -vn -c:a aac -b:a 192k "$DL_OUT"
+              if ! ffmpeg -hide_banner -y -protocol_whitelist "file,http,https,tcp,tls" -i "$M3U8" -vn -c copy -bsf:a aac_adtstoasc "$DL_OUT"; then
+                ffmpeg -hide_banner -y -protocol_whitelist "file,http,https,tcp,tls" -i "$M3U8" -vn -c:a aac -b:a 192k "$DL_OUT"
               fi
-              [ -s "$DL_OUT" ] && { echo "INPUT_FILE=${DL_OUT}" >> "$GITHUB_ENV"; echo "audio_file=${DL_OUT}" >> "$GITHUB_OUTPUT"; }
+              if [ -s "$DL_OUT" ]; then
+                echo "INPUT_FILE=${DL_OUT}" >> "$GITHUB_ENV"
+                echo "audio_file=${DL_OUT}" >> "$GITHUB_OUTPUT"
+              fi
             fi
           fi
 
@@ -478,9 +492,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          CC_FILE="$(find "${ARTDIR}" -maxdepth 1 -type f -iname '*cc.jsonl' -o -iname '*caption*.jsonl' | head -n1 || true)"
+          CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
-            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt" || true
+            # Translate host path to container path
+            REL_PATH="${CC_FILE#"${ARTDIR}"}"
+            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download${REL_PATH}" > "${ARTDIR}/${BASE}.vtt" || true
           fi
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
