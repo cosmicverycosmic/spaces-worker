@@ -186,7 +186,7 @@ jobs:
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
       - name: Ping crawler attempting
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
+        if: ${{ (env.TWITTER_AUTHORIZATION != '' || (env.TWITTER_AUTH_TOKEN != '' && env.TWITTER_CSRF_TOKEN != '')) && inputs.mode == '' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +199,7 @@ jobs:
 
       - name: twspace crawler audio captions started at fail fast
         id: crawl
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode == '' }}
+        if: ${{ (env.TWITTER_AUTHORIZATION != '' || (env.TWITTER_AUTH_TOKEN != '' && env.TWITTER_CSRF_TOKEN != '')) && inputs.mode == '' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -225,13 +225,11 @@ jobs:
           set -e
           echo "crawler_exit=$RC"
 
-          # Prefer audio file downloaded by crawler (if it had time to finish)
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "$AUDIO_FILE" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
           else
-            # Capture any data produced by crawler logs: extract HLS master playlist and fetch it
             M3U8="$(grep -Eo 'https?://[^ ]+master_playlist\.m3u8' "$LOG_STD" "$LOG_ERR" 2>/dev/null | head -n1 || true)"
             if [ -z "$M3U8" ] && [ -d "${ARTDIR}/logs" ]; then
               M3U8="$(grep -RhoE 'https?://[^ ]+master_playlist\.m3u8' "${ARTDIR}/logs" 2>/dev/null | head -n1 || true)"
@@ -248,7 +246,6 @@ jobs:
             fi
           fi
 
-          # Adopt captions from crawler if present (even if run timed out early)
           CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
             set +e
@@ -268,7 +265,6 @@ jobs:
             fi
           fi
 
-          # Best-effort start time (from any files the crawler dropped)
           START_EPOCH=""
           MS="$(grep -Ehor '[0-9]{13}' "${ARTDIR}" 2>/dev/null | head -n1 || true)"
           if [ -n "$MS" ]; then
@@ -474,7 +470,7 @@ jobs:
           echo "raw_vtt=${RAW_VTT}"     >> "$GITHUB_OUTPUT"
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
 
-      - name: Scrape attendees crawler first fallback to wp peek
+      - name: Scrape attendees (crawler if creds → WP peek fallback)
         id: attendees
         shell: bash
         env:
@@ -484,60 +480,58 @@ jobs:
           ATTN_HTML: ${{ env.ARTDIR }}/attendees.html
         run: |
           set -euxo pipefail
-          : > "$ATTN_HTML"
-          [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
-          [ -n "${TWITTER_AUTH_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_AUTH_TOKEN}"
-          [ -n "${TWITTER_CSRF_TOKEN:-}" ]    && echo "::add-mask::${TWITTER_CSRF_TOKEN}"
+          TMP_HTML="$(mktemp)"
+          rm -f "$ATTN_JSON" "$ATTN_HTML"
 
-          if [ "${{ steps.x_preflight.outputs.ok }}" = "1" ] && [ -n "$SID" ]; then
+          have_creds=0
+          [ -n "${TWITTER_AUTHORIZATION:-}" ] && have_creds=1
+          if [ -n "${TWITTER_AUTH_TOKEN:-}" ] && [ -n "${TWITTER_CSRF_TOKEN:-}" ]; then have_creds=1; fi
+
+          if [ "$have_creds" = "1" ] && [ -n "$SID" ]; then
             docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
             set +e
-            timeout 30s docker run --rm \
+            timeout 45s docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
               -e TWITTER_CSRF_TOKEN \
               -v "${ARTDIR}:/out" \
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
-              --space-id "$SID" --attendees --out /out/attendees.json
+              --id "$SID" --attendees --out /out/attendees.json
             RC=$?
             set -e
             if [ $RC -eq 0 ] && [ -s "$ATTN_JSON" ] && jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
-                if jq -e '(.host // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Host</strong><ul>"
-                  jq -r '.host[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
-                if jq -e '(.cohosts // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Co-hosts</strong><ul>"
-                  jq -r '.cohosts[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
-                if jq -e '(.speakers // []) | length > 0' "$ATTN_JSON" >/dev/null; then
-                  echo "  <li><strong>Speakers</strong><ul>"
-                  jq -r '.speakers[]? | @tsv' "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                    [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                  done
-                  echo "  </ul></li>"
-                fi
+                for grp in host cohosts speakers; do
+                  if jq -e "(.${grp} // []) | length > 0" "$ATTN_JSON" >/dev/null; then
+                    TITLE=$([ "$grp" = "host" ] && echo "Host" || ([ "$grp" = "cohosts" ] && echo "Co-hosts" || echo "Speakers"))
+                    echo "  <li><strong>${TITLE}</strong><ul>"
+                    jq -r ".${grp}[]? |
+                          if type==\"array\" then
+                            [ (.[0]//\"\"), ((.[1]//\"\")|ltrimstr(\"@\")), (.[2]//(\"https://x.com/\"+((.[1]//\"\")|ltrimstr(\"@\")))) ] | @tsv
+                          else
+                            [ (.name // .display_name // \"\"), ((.handle // .screen_name // .username // \"\")|ltrimstr(\"@\")), (.url // (\"https://x.com/\"+((.handle // .screen_name // .username // \"\")|ltrimstr(\"@\")))) ] | @tsv
+                          end" "$ATTN_JSON" \
+                    | while IFS=$'\t' read -r name handle url; do
+                        [ -n "$url" ] || continue
+                        [ -n "$name" ] || name="@$handle"
+                        echo "    <li><a href=\"$url\" target=\"_blank\" rel=\"noopener\">$name (@$handle)</a></li>"
+                      done
+                    echo "  </ul></li>"
+                  fi
+                done
                 echo "</ul>"
-              } > "$ATTN_HTML"
+              } > "$TMP_HTML"
             fi
           fi
 
-          if [ ! -s "$ATTN_HTML" ] && [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ]; then
+          if [ ! -s "$TMP_HTML" ] && [ -n "${WP_BASE_URL:-}" ] && [ -n "${WP_USER:-}" ] && [ -n "${WP_APP_PASSWORD:-}" ]; then
             curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-              --get \
-              --data-urlencode "space_url=$URL" \
-              --data-urlencode "space_id=${SID:-}" \
+              --get --data-urlencode "space_url=$URL" --data-urlencode "space_id=${SID:-}" \
               "${WP_BASE_URL%/}/wp-json/ss3k/v1/peek" > "$ATTN_JSON" || true
+
             if jq -e '.html? | length>0' "$ATTN_JSON" >/dev/null 2>&1; then
-              jq -r '.html' "$ATTN_JSON" > "$ATTN_HTML"
+              jq -r '.html' "$ATTN_JSON" > "$TMP_HTML"
             elif jq -e '((.host // []) + (.cohosts // []) + (.speakers // [])) | length > 0' "$ATTN_JSON" >/dev/null 2>&1; then
               {
                 echo "<ul>"
@@ -545,25 +539,39 @@ jobs:
                   if jq -e "(.${grp} // []) | length > 0" "$ATTN_JSON" >/dev/null; then
                     TITLE=$([ "$grp" = "host" ] && echo "Host" || ([ "$grp" = "cohosts" ] && echo "Co-hosts" || echo "Speakers"))
                     echo "  <li><strong>${TITLE}</strong><ul>"
-                    jq -r ".${grp}[]? | @tsv" "$ATTN_JSON" | while IFS=$'\t' read -r name handle url; do
-                      [ -n "$name" ] && [ -n "$url" ] && echo "    <li><a href=\"$url\" target=\"_blank\">$name (@$handle)</a></li>"
-                    done
+                    jq -r ".${grp}[]? |
+                          if type==\"array\" then
+                            [ (.[0]//\"\"), ((.[1]//\"\")|ltrimstr(\"@\")), (.[2]//(\"https://x.com/\"+((.[1]//\"\")|ltrimstr(\"@\")))) ] | @tsv
+                          else
+                            [ (.name // .display_name // \"\"), ((.handle // .screen_name // .username // \"\")|ltrimstr(\"@\")), (.url // (\"https://x.com/\"+((.handle // .screen_name // .username // \"\")|ltrimstr(\"@\")))) ] | @tsv
+                          end" "$ATTN_JSON" \
+                    | while IFS=$'\t' read -r name handle url; do
+                        [ -n "$url" ] || continue
+                        [ -n "$name" ] || name="@$handle"
+                        echo "    <li><a href=\"$url\" target=\"_blank\" rel=\"noopener\">$name (@$handle)</a></li>"
+                      done
                     echo "  </ul></li>"
                   fi
                 done
                 echo "</ul>"
-              } > "$ATTN_HTML"
+              } > "$TMP_HTML"
             fi
           fi
-          echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
 
-      # NEW: Upload attendees HTML file to GCS (mirrors VTT handling)
+          if grep -qi '<li><a ' "$TMP_HTML" 2>/dev/null; then
+            mv "$TMP_HTML" "$ATTN_HTML"
+            echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
+          else
+            rm -f "$TMP_HTML" "$ATTN_HTML"
+            echo "ATTN_HTML=" >> "$GITHUB_ENV"
+          fi
+
       - name: Upload attendees html to gcs if any
         id: upload_attendees
         shell: bash
         run: |
           set -euxo pipefail
-          test -f "${ATTN_HTML:-}" || { echo "No attendees HTML to upload"; exit 0; }
+          test -s "${ATTN_HTML:-}" || { echo "No attendees HTML to upload"; exit 0; }
           DEST_ATT="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
           RAW_ATT="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
           PROXY_ATT="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.html"
@@ -571,8 +579,8 @@ jobs:
           if [ "${{ inputs.make_public }}" = "true" ]; then
             gsutil acl ch -u AllUsers:R "$DEST_ATT" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
           fi
-          echo "raw_attn=${RAW_ATT}"   >> "$GITHUB_OUTPUT"
-          echo "proxy_attn=${PROXY_ATT}" >> "$GITHUB_OUTPUT"
+          echo "raw_attn=${RAW_ATT}"       >> "$GITHUB_OUTPUT"
+          echo "proxy_attn=${PROXY_ATT}"   >> "$GITHUB_OUTPUT"
 
       - name: Derive space date time and update post
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
@@ -624,11 +632,10 @@ jobs:
           set -euxo pipefail
           JFILE="${ARTDIR}/register.json"
           TXFILE="${TX_PATH:-${ARTDIR}/${BASE}.txt}"
-          ATFILE="${ATTN_HTML:-}"
           [ -f "$TXFILE" ] || : > "$TXFILE"
           AT_HTML=""
-          if [ -n "${ATFILE}" ] && [ -f "${ATFILE}" ]; then
-            AT_HTML="$(cat "${ATFILE}")"
+          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML}" ]; then
+            AT_HTML="$(cat "${ATTN_HTML}")"
           fi
           jq -n \
             --arg title "${TITLE_IN}" \
@@ -643,24 +650,14 @@ jobs:
               + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
               + (if ($tx|length)>0 then {transcript:$tx} else {} end)
               + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
-              + (if ($attendees_url|length)>0 then {attendees_html_url:$attendees_url} else {} end)
+              + (if ($attendees_url|length)>0 then {artifacts:{attendees_html_url:$attendees_url}} else {} end)
               + ( ($pid|tonumber? // null) as $maybe
                   | if $maybe then {post_id:$maybe} else {} end )
-            ' > "$JFILE"
+          ' > "$JFILE"
           RESP="${ARTDIR}/register.out.json"
           curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
             -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
             --data-binary @"${JFILE}" > "${RESP}"
-          PERMA=$(jq -r '.permalink // ""' "${RESP}")
-          EDIT_URL="${WP_URL%/}/wp-admin/post.php?post=${POST_ID_IN}&action=edit"
-          if [ -n "${POST_ID_IN}" ]; then
-            curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
-              -X POST "${WP_URL%/}/wp-json/ss3k/v1/worker-status" \
-              -d "$(jq -n --arg pid "${POST_ID_IN}" --arg status "complete" \
-                         --arg msg "Worker finished View and Edit URLs ready" \
-                         --arg run "${{ github.run_id }}" --argjson progress 100 \
-                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-          fi
           jq . "${RESP}" || true
 
       - name: Patch transcript vtt only
@@ -686,7 +683,7 @@ jobs:
               { post_id: ($pid|tonumber), status:"complete", progress:100 }
               + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
               + (if ($tx|length)>0 then {transcript:$tx} else {} end)
-              + (if ($attendees_url|length)>0 then {attendees_html_url:$attendees_url} else {} end)
+              + (if ($attendees_url|length)>0 then {artifacts:{attendees_html_url:$attendees_url}} else {} end)
           ')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
@@ -696,16 +693,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ATFILE="${ATTN_HTML:-}"
           AT_HTML=""
-          if [ -n "${ATFILE}" ] && [ -f "${ATFILE}" ]; then
-            AT_HTML="$(cat "${ATFILE}")"
+          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML}" ]; then
+            AT_HTML="$(cat "${ATTN_HTML}")"
           fi
           BODY="$(jq -n --arg pid "${{ inputs.post_id }}" --arg attendees_html "${AT_HTML}" \
             --arg attendees_url "${{ steps.upload_attendees.outputs.proxy_attn }}" '
             { post_id: ($pid|tonumber), status:"complete", progress:100 }
             + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
-            + (if ($attendees_url|length)>0 then {attendees_html_url:$attendees_url} else {} end)')"
+            + (if ($attendees_url|length)>0 then {artifacts:{attendees_html_url:$attendees_url}} else {} end)')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
 
