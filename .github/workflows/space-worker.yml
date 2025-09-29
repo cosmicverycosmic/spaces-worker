@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X / Twitter Space URL (https://x.com/i/spaces/...)
+        description: X / Twitter Space URL
         required: true
         type: string
       post_id:
-        description: Existing WordPress post ID to patch (optional)
+        description: Existing WordPress post ID to patch 
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title (optional)
+        description: Fallback post title 
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default spaces/YYYY/MM)
+        description: GCS prefix 
         required: false
         type: string
         default: ""
@@ -35,7 +35,7 @@ on:
         options: ["true","false"]
         default: "true"
       space_id:
-        description: Space ID (auto-parsed from URL if blank)
+        description: Space ID 
         required: false
         type: string
         default: ""
@@ -46,7 +46,7 @@ on:
         options: ["", "transcript_only", "attendees_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only URL to existing MP3 (skips audio pipeline)
+        description: For transcript_only URL to existing MP3 
         required: false
         type: string
         default: ""
