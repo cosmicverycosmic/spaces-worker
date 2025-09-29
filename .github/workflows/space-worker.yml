@@ -478,7 +478,7 @@ PY
           echo "proxy_vtt=${PROXY_VTT}" >> "$GITHUB_OUTPUT"
 
       # ----------------------------
-      # ATTENDEES: light path first
+      # ATTENDEES: robust builders
       # ----------------------------
       - name: Build attendees.html (attendees_only via WP peek)
         if: ${{ inputs.mode == 'attendees_only' }}
@@ -503,7 +503,6 @@ data=urllib.request.urlopen(req).read().decode()
 d=json.loads(data)
 html=d.get("html","")
 if not html:
-  # fallback simple UL from roles
   roles=[]
   for k,t in (("host","Host"),("cohosts","Co-hosts"),("speakers","Speakers")):
     L=d.get(k,[]) or []
@@ -517,8 +516,10 @@ if not html:
         name=item[0] if len(item)>0 else ""
         handle=item[1] if len(item)>1 else ""
         link=item[2] if len(item)>2 else ""
-        if name and link:
-          out.append(f'    <li><a href="{link}" target="_blank">{name} (@{handle})</a></li>')
+        if (handle or name):
+          if not link and handle: link=f"https://x.com/{handle}"
+          label=f"{name} (@{handle})" if name else f"@{handle}"
+          out.append(f'    <li><a href="{link}" target="_blank" rel="noopener">{label}</a></li>')
       out.append("  </ul></li>")
     out.append("</ul>")
     html="\n".join(out)
@@ -528,7 +529,7 @@ print("OK")
 PY
           echo "ATTN_HTML=${ATTN_HTML}" >> "$GITHUB_ENV"
 
-      - name: Upload attendees.html to GCS (optional)
+      - name: Upload attendees.html to GCS (optional, attendees_only)
         if: ${{ inputs.mode == 'attendees_only' && inputs.upload_attendees_file == 'true' }}
         shell: bash
         run: |
@@ -550,8 +551,16 @@ auth=("%s:%s" % (os.environ["WP_USER"], os.environ["WP_APP_PASSWORD"])).encode()
 hdr={"Authorization":"Basic "+base64.b64encode(auth).decode(), "Content-Type":"application/json"}
 pid=int(os.environ["GITHUB_INPUT_POST_ID"])
 html=open(os.environ["ATTN_HTML"],"r",encoding="utf-8").read() if os.environ.get("ATTN_HTML") else ""
+attj=os.path.join(os.environ["ARTDIR"],"attendees.json")
+grouped={}
+try:
+  d=json.load(open(attj,"r",encoding="utf-8"))
+  grouped={"Host":d.get("host",[]),"Co-hosts":d.get("cohosts",[]),"Speakers":d.get("speakers",[])}
+except Exception:
+  pass
 body={"post_id":pid,"status":"complete","progress":100}
 if html: body["attendees_html"]=html
+if grouped: body["attendees_grouped"]=grouped; body["attendees_json"]=d
 url=os.environ.get("ATTENDEES_URL","")
 if url: body["attendees_url"]=url
 data=json.dumps(body).encode()
@@ -559,14 +568,15 @@ req=urllib.request.Request(wp+"/wp-json/ss3k/v1/patch-assets", data=data, header
 with urllib.request.urlopen(req) as r: print(r.read().decode())
 PY
 
-      # Also build attendees in FULL so /register can include it
-      - name: Build attendees.html (full via WP peek)
+      # Build attendees for FULL mode too (robust)
+      - name: Build attendees.html (full via WP peek, robust)
         if: ${{ inputs.mode == '' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
         run: |
           set -euo pipefail
+          ATTN_JSON="${ARTDIR}/attendees.json"
           ATTN_HTML="${ARTDIR}/attendees.html"
           python3 - "$@" <<'PY'
 import json, os, sys, urllib.parse, urllib.request, base64
@@ -577,11 +587,43 @@ q="space_url="+urllib.parse.quote(url)+"&space_id="+urllib.parse.quote(sid)
 req=urllib.request.Request(wp+"/wp-json/ss3k/v1/peek?"+q, headers={"Accept":"application/json"})
 if user and app:
   req.add_header("Authorization","Basic "+base64.b64encode(f"{user}:{app}".encode()).decode())
-d=json.loads(urllib.request.urlopen(req).read().decode())
+data=urllib.request.urlopen(req).read().decode()
+d=json.loads(data)
 html=d.get("html","") or ""
+if not html:
+  roles=[]
+  for k,t in (("host","Host"),("cohosts","Co-hosts"),("speakers","Speakers")):
+    L=d.get(k,[]) or []
+    if L: roles.append((t,L))
+  if roles:
+    out=["<ul>"]
+    for title,L in roles:
+      out.append(f"  <li><strong>{title}</strong><ul>")
+      for item in L:
+        name=item[0] if len(item)>0 else ""
+        handle=item[1] if len(item)>1 else ""
+        link=item[2] if len(item)>2 else ""
+        if (handle or name):
+          if not link and handle: link=f"https://x.com/{handle}"
+          label=f"{name} (@{handle})" if name else f"@{handle}"
+          out.append(f'    <li><a href="{link}" target="_blank" rel="noopener">{label}</a></li>')
+      out.append("  </ul></li>")
+    out.append("</ul>")
+    html="\n".join(out)
+open(os.environ["ARTDIR"]+"/attendees.json","w",encoding="utf-8").write(data)
 open(os.environ["ARTDIR"]+"/attendees.html","w",encoding="utf-8").write(html)
 PY
           echo "ATTN_HTML=${ATTN_HTML}" >> "$GITHUB_ENV"
+
+      - name: Upload attendees.html to GCS (optional, full mode)
+        if: ${{ inputs.mode == '' && inputs.upload_attendees_file == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GS_PATH="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          gsutil -q cp -a public-read "${ATTN_HTML}" "${GS_PATH}"
+          URL="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          echo "ATTENDEES_URL=${URL}" | tee -a "$GITHUB_ENV"
 
       # -----------------------------------------
       # DATE/TIME update (skip in attendees_only)
@@ -620,8 +662,11 @@ PY
 
       # --------------------------------
       # Final WP register (FULL only)
+      #  - robust attendees propagation
+      #  - saves attendees_html, attendees_grouped, attendees_json
+      #  - safety /patch-assets if needed
       # --------------------------------
-      - name: Register in wordpress final only includes attendees
+      - name: Register in WordPress (final, with robust attendees)
         id: register
         if: ${{ inputs.mode == '' && steps.upload_mp3.outputs.proxy_url != '' }}
         shell: bash
@@ -633,31 +678,133 @@ PY
           TITLE_IN:   ${{ inputs.title }}
           POST_ID_IN: ${{ inputs.post_id }}
         run: |
+          # --- Improved register step: derive attendees HTML and grouped, include in payload, patch if needed ---
           set -euxo pipefail
-          JFILE="${ARTDIR}/register.json"
-          TXFILE="${TX_PATH:-${ARTDIR}/${BASE}.txt}"
-          ATFILE="${ATTN_HTML:-}"
-          [ -f "$TXFILE" ] || : > "$TXFILE"
-          AT_HTML=""
-          if [ -n "${ATFILE}" ] && [ -f "${ATFILE}" ]; then
-            AT_HTML="$(cat "${ATFILE}")"
+
+          : "${WP_URL:?}"; : "${WP_AUTH:?}"
+          : "${ARTDIR:?}"; : "${SPACE_ID:?}"; : "${BASE:?}"
+          : "${MEDIA_URL:?}"
+
+          AT_JSON="${ARTDIR}/attendees.json"
+          AT_HTML_FILE="${ARTDIR}/attendees.html"
+          REGISTER_JSON="${ARTDIR}/register.json"
+          REGISTER_OUT="${ARTDIR}/register.out.json"
+
+          # 1) If attendees.json missing, best-effort fetch via /peek
+          if [[ ! -s "$AT_JSON" ]]; then
+            curl -sS -u "${WP_AUTH}" --get \
+              --data-urlencode "space_url=${GITHUB_INPUT_SPACE_URL}" \
+              --data-urlencode "space_id=${SPACE_ID}" \
+              "${WP_URL%/}/wp-json/ss3k/v1/peek" > "$AT_JSON" || true
           fi
-          cat > "$JFILE" <<JSON
-{
-  "title": "${TITLE_IN}",
-  "gcs_url": "${MEDIA_URL}",
-  "mime": "audio/mpeg"
-  $( [ -n "${VTT_URL}" ] && printf ',\n  "vtt_url": "%s"' "${VTT_URL}" )
-  $( [ -s "${TXFILE}" ] && printf ',\n  "transcript": %s' "$(jq -Rs '.' < "${TXFILE}")" )
-  $( [ -n "${AT_HTML}" ] && printf ',\n  "attendees_html": %s' "$(printf '%s' "${AT_HTML}" | jq -Rs '.')" )
-  $( [ -n "${POST_ID_IN}" ] && printf ',\n  "post_id": %s' "${POST_ID_IN}" )
-}
-JSON
-          RESP="${ARTDIR}/register.out.json"
+
+          # 2) Build attendees HTML from (a) file, (b) json.html, (c) grouped → HTML
+          AT_HTML_CONTENT=""
+          if [[ -s "$AT_HTML_FILE" ]]; then
+            AT_HTML_CONTENT="$(cat "$AT_HTML_FILE")"
+          fi
+          if [[ -z "$AT_HTML_CONTENT" && -s "$AT_JSON" ]]; then
+            AT_HTML_CONTENT="$(jq -r '.html // empty' "$AT_JSON" || true)"
+          fi
+          if [[ -z "$AT_HTML_CONTENT" && -s "$AT_JSON" ]]; then
+            AT_HTML_CONTENT="$(jq -r '
+              def mkitem($n;$h;$u):
+                if ($h|length)>0 then
+                  "<li><a href=\"" + (if $u and ($u|length)>0 then $u else ("https://x.com/" + $h) end)
+                  + "\" target=\"_blank\" rel=\"noopener\">"
+                  + (if $n and ($n|length)>0 then ($n + " (@" + $h + ")") else ("@" + $h) end)
+                  + "</a></li>"
+                else empty end;
+              def group($title; $arr):
+                if ($arr|length)>0 then
+                  "<li><strong>" + $title + "</strong><ul>" +
+                  ( $arr | map(mkitem(.name // .display_name // ""; (.handle // .username // .screen_name // ""); .url // "")) | join("") ) +
+                  "</ul></li>"
+                else "" end;
+              . as $root
+              | (
+                  (group("Host";     ($root.host     // []))) +
+                  (group("Co-hosts"; ($root.cohosts  // []))) +
+                  (group("Speakers"; ($root.speakers // [])))
+                ) as $body
+              | if ($body|length)>0 then "<ul>" + $body + "</ul>" else "" end
+            ' "$AT_JSON" 2>/dev/null || true)"
+          fi
+
+          # Persist artifact file for logs/artifacts
+          if [[ -n "$AT_HTML_CONTENT" ]]; then
+            printf '%s\n' "$AT_HTML_CONTENT" > "$AT_HTML_FILE"
+          fi
+
+          # 3) Build /register payload (includes attendees_html + attendees_grouped + attendees_json when available)
+          JQ_ARGS=( --arg title "${TITLE_IN}" --arg media "${MEDIA_URL}" --arg mime "audio/mpeg" )
+          [[ -n "${VTT_URL:-}" && "${VTT_URL:-}" != "null" ]] && JQ_ARGS+=( --arg vtt "${VTT_URL}" )
+          TX_PATH="${TX_PATH:-${ARTDIR}/${BASE}.txt}"
+          [[ -s "$TX_PATH" ]] && JQ_ARGS+=( --rawfile tx "$TX_PATH" )
+          [[ -s "$AT_JSON" ]] && JQ_ARGS+=( --slurpfile att "$AT_JSON" )
+          if [[ -n "$AT_HTML_CONTENT" ]]; then
+            AT_HTML_TMP="$(mktemp)"; printf '%s\n' "$AT_HTML_CONTENT" > "$AT_HTML_TMP"
+            JQ_ARGS+=( --rawfile attendees_html "$AT_HTML_TMP" )
+          fi
+          [[ -n "${POST_ID_IN:-}" ]] && JQ_ARGS+=( --arg pid "${POST_ID_IN}" )
+
+          jq -n "${JQ_ARGS[@]}" '
+            { title: ($title // ""), gcs_url: $media, mime: $mime }
+            + (if ($pid|tonumber? // null) then {post_id: ($pid|tonumber)} else {} end)
+            + (if ($vtt // "" | length) > 0 then {vtt_url: $vtt} else {} end)
+            + (if ($tx  // "" | length) > 0 then {transcript: $tx} else {} end)
+            + (if ($att|length) > 0 then
+                 ( ($att[0] // {}) | {
+                     attendees_grouped: {
+                       "Host":     (.host     // []),
+                       "Co-hosts": (.cohosts  // []),
+                       "Speakers": (.speakers // [])
+                     },
+                     attendees_json: .
+                   }
+                   + (if (.html? // "" | length) > 0 and ($attendees_html // "" | length) == 0
+                        then {attendees_html: .html}
+                        else {}
+                      end)
+                 )
+               else {} end)
+            + (if ($attendees_html // "" | length) > 0 then {attendees_html: $attendees_html} else {} end)
+          ' > "$REGISTER_JSON"
+
           curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
             -X POST "${WP_URL%/}/wp-json/ss3k/v1/register" \
-            --data-binary @"${JFILE}" > "${RESP}"
-          jq . "${RESP}" || true
+            --data-binary @"${REGISTER_JSON}" > "${REGISTER_OUT}"
+
+          # 4) Safety patch to ensure attendees are saved even if register omitted them
+          if [[ -n "$AT_HTML_CONTENT" || -s "$AT_JSON" ]]; then
+            PATCH_JSON="$(mktemp)"
+            JQ_PATCH_ARGS=( )
+            [[ -n "${POST_ID_IN:-}" ]] && JQ_PATCH_ARGS+=( --arg pid "${POST_ID_IN}" )
+            [[ -n "$AT_HTML_CONTENT" ]] && JQ_PATCH_ARGS+=( --rawfile attendees_html "$AT_HTML_FILE" )
+            [[ -s "$AT_JSON" ]] && JQ_PATCH_ARGS+=( --slurpfile att "$AT_JSON" )
+            jq -n "${JQ_PATCH_ARGS[@]}" '
+              { post_id: ($pid|tonumber) }
+              + (if ($attendees_html // "" | length) > 0 then {attendees_html: $attendees_html} else {} end)
+              + (if ($att|length) > 0 then
+                   {
+                     attendees_grouped: {
+                       "Host":     ($att[0].host     // []),
+                       "Co-hosts": ($att[0].cohosts  // []),
+                       "Speakers": ($att[0].speakers // [])
+                     },
+                     attendees_json: $att[0]
+                   }
+                 else {} end)
+            ' > "$PATCH_JSON"
+            curl -sS -u "${WP_AUTH}" -H "Content-Type: application/json" \
+              -X POST "${WP_URL%/}/wp-json/ss3k/v1/patch-assets" \
+              --data-binary @"${PATCH_JSON}" >/dev/null || true
+          fi
+
+          # Expose permalink to logs (best-effort)
+          jq . "${REGISTER_OUT}" || true
+          PERMA="$(jq -r '.permalink // empty' "${REGISTER_OUT}" || true)"
+          echo "permalink=${PERMA:-}" || true
 
       # ---------------------------
       # transcript_only patch step
