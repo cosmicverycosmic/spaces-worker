@@ -235,7 +235,7 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      - name: Notify WP: crawler starting
+      - name: Notify WP crawler starting
         if: ${{ (inputs.mode != 'transcript_only') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
