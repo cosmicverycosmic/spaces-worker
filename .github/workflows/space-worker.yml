@@ -4,54 +4,49 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X Twitter Space URL https://x.com/i/spaces/...
+        description: X / Twitter Space URL (https://x.com/i/spaces/...)
         required: true
         type: string
-      title:
-        description: Post title to use in WordPress fallback if no post id
+      post_id:
+        description: Existing WordPress post ID to patch (optional)
         required: false
         type: string
         default: ""
-      post_id:
-        description: Existing WP post id to register or patch (optional)
+      title:
+        description: Fallback post title (optional)
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix folder, e.g. "spaces/2025/09" (empty = auto: spaces/YYYY/MM)
+        description: GCS prefix (default spaces/YYYY/MM)
         required: false
         type: string
         default: ""
       make_public:
-        description: Set GCS objects to public
+        description: Make uploaded artifacts public
         required: false
         type: choice
-        options: ["true", "false"]
+        options: ["true","false"]
         default: "true"
       do_transcript:
-        description: Generate diarized transcript & VTT (Deepgram) when crawler captions unavailable
+        description: Generate transcript with Deepgram if crawler captions unavailable
         required: false
         type: choice
-        options: ["true", "false"]
+        options: ["true","false"]
         default: "true"
-      wp_marker:
-        description: Opaque marker from WP (optional)
-        required: false
-        type: string
-        default: ""
       space_id:
-        description: Space ID (e.g. 1kvJpyzZOOkxE). Auto-parsed from URL if blank
+        description: Space ID (auto-parsed from URL if blank)
         required: false
         type: string
         default: ""
       mode:
-        description: Optional targeted mode
+        description: Limit processing to a specific area
         required: false
         type: choice
         options: ["", "transcript_only", "attendees_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only: URL of the already encoded MP3
+        description: For transcript_only URL to existing MP3 (skips audio pipeline)
         required: false
         type: string
         default: ""
@@ -65,14 +60,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Required
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
+  # Optional WP (enable if you want status pings + patch)
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
+  # Optional Deepgram
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-
-  # X / Twitter creds
+  # X / Twitter creds (any of these help; not all required)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN || vars.X_CSRF }}
@@ -81,13 +78,13 @@ env:
   ARTDIR:  ${{ github.workspace }}/out
 
 jobs:
-  run:
+  process:
     name: Process Space
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
-      - name: Start ping WP queued
+      - name: Start (optional WP queued)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         run: |
@@ -95,12 +92,14 @@ jobs:
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "queued" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                       --arg status "queued" \
                        --arg msg "Workflow received and queued" \
-                       --arg run "${{ github.run_id }}" --argjson progress 1 \
+                       --arg run "${{ github.run_id }}" \
+                       --argjson progress 1 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Install deps (ffmpeg, jq, yt-dlp, gcloud)
+      - name: Install deps & docker login
         shell: bash
         run: |
           set -euxo pipefail
@@ -111,8 +110,9 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Validate secrets, normalize prefix, compute bucket prefix
+      - name: Validate config & prefixes
         id: cfg
         shell: bash
         run: |
@@ -121,14 +121,11 @@ jobs:
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
-          if [ -z "$PFX" ]; then
-            PFX="spaces/$(date +%Y)/$(date +%m)"
-          fi
-          echo "prefix=${PFX}" >> "$GITHUB_OUTPUT"
-          echo "PREFIX=${PFX}" >> "$GITHUB_ENV"
+          if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
+          echo "PREFIX=$PFX"           >> "$GITHUB_ENV"
           echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
-      - name: Derive space id and base filename
+      - name: Derive Space ID + base
         id: ids
         shell: bash
         env:
@@ -140,21 +137,21 @@ jobs:
           if [ -z "$SID" ]; then
             SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
           fi
-          test -n "$SID" || { echo "Could not parse Space ID"; exit 1; }
+          test -n "$SID" || { echo "Could not parse Space ID from URL"; exit 1; }
           BASE="space-$(date +%m-%d-%Y)-${SID}"
+          echo "SPACE_ID=${SID}" >> "$GITHUB_ENV"
+          echo "BASE=${BASE}"    >> "$GITHUB_ENV"
           echo "space_id=${SID}" >> "$GITHUB_OUTPUT"
-          echo "BASE=${BASE}"     >> "$GITHUB_OUTPUT"
-          echo "SPACE_ID=${SID}"  >> "$GITHUB_ENV"
-          echo "BASE=${BASE}"     >> "$GITHUB_ENV"
+          echo "base=${BASE}"    >> "$GITHUB_OUTPUT"
 
-      - name: GCP auth (service account)
+      - name: GCP auth
         shell: bash
         run: |
           set -euxo pipefail
-          printf '%s\n' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
+          printf '%s' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      # ---------- RELAXED PREFLIGHT (lets crawler run even when /participants=404) ----------
+      # ---------- RELAXED PREFLIGHT ----------
       - name: X preflight auth sanity check
         id: x_preflight
         shell: bash
@@ -164,12 +161,11 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          # Require "Bearer " prefix for AUTH
+          # Require explicit "Bearer " prefix
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH=""
           fi
 
-          # Mask provided secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
@@ -182,7 +178,6 @@ jobs:
           [ -n "$AT" ] && [ -n "$CT" ] && HAS_COOKIE=1 || true
           [ -n "$AUTH" ] && HAS_BEARER=1 || true
 
-          # If we have any creds at all, allow the crawler
           if [ "$HAS_COOKIE" -eq 1 ] || [ "$HAS_BEARER" -eq 1 ]; then
             OK=1
             REASON="creds_present"
@@ -191,56 +186,42 @@ jobs:
           mkdir -p "${ARTDIR}"
           BASEH=(-H "User-Agent: Mozilla/5.0" -H "Accept: application/json, text/plain, */*" -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}")
 
-          # Diagnostics (not gating)
+          # diagnostics (non-gating)
           if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
             CVAL="auth_token=${AT}; ct0=${CT}"
             HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
               "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-              "${BASEH[@]}" \
-              -H "Authorization: ${AUTH}" \
-              -H "x-csrf-token: ${CT}" \
-              -H "Cookie: ${CVAL}" \
-              -H "x-twitter-active-user: yes" \
-              -H "x-twitter-client-language: en" \
-              -H "x-twitter-auth-type: OAuth2Session" || echo 000)
+              "${BASEH[@]}" -H "Authorization: ${AUTH}" -H "x-csrf-token: ${CT}" -H "Cookie: ${CVAL}" \
+              -H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" -H "x-twitter-auth-type: OAuth2Session" || echo 000)
             echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
           fi
 
           if [ "$HAS_BEARER" -eq 1 ]; then
             GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
               -X POST "https://api.twitter.com/1.1/guest/activate.json" \
-              -H "Authorization: ${AUTH}" \
-              -H "Content-Type: application/json" \
-              -d '{}' || echo 000)
+              -H "Authorization: ${AUTH}" -H "Content-Type: application/json" -d '{}' || echo 000)
             echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
-            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
-              OK=1
-              REASON="guest_ok"
-            fi
+            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then OK=1; REASON="guest_ok"; fi
             if [ "$GHTTP" = "200" ]; then
               GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
               if [ -n "$GUEST" ]; then
                 PHTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
                   "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-                  "${BASEH[@]}" \
-                  -H "Authorization: ${AUTH}" \
-                  -H "x-guest-token: ${GUEST}" \
-                  -H "x-twitter-active-user: yes" \
-                  -H "x-twitter-client-language: en" || echo 000)
+                  "${BASEH[@]}" -H "Authorization: ${AUTH}" -H "x-guest-token: ${GUEST}" \
+                  -H "x-twitter-active-user: yes" -H "x-twitter-client-language: en" || echo 000)
                 echo "diag_participants_guest_http=${PHTTP}" >> "$GITHUB_OUTPUT"
               fi
             fi
           fi
 
-          if [ "$OK" -ne 1 ] ; then
-            for PEEK in "https://x.com/i/spaces/${SPACE_ID}/peek" "https://twitter.com/i/spaces/${SPACE_ID}/peek"; do
+          if [ "$OK" -ne 1 ]; then
+            for PEEK in \
+              "https://x.com/i/spaces/${SPACE_ID}/peek" \
+              "https://twitter.com/i/spaces/${SPACE_ID}/peek"
+            do
               PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
               echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
-              if [ "$PHTTP" = "200" ]; then
-                OK=1
-                REASON="public_ok"
-                break
-              fi
+              if [ "$PHTTP" = "200" ]; then OK=1; REASON="public_ok"; break; fi
             done
           fi
 
@@ -248,22 +229,10 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # ---------- CRAWLER (run whenever not transcript_only) ----------
-      - name: Ping crawler attempting
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode != 'transcript_only' && env.WP_BASE_URL != '' && inputs.post_id != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ inputs.post_id }}" --arg status "processing" \
-                       --arg msg "twspace crawler fetching audio/captions/meta" \
-                       --arg run "${{ github.run_id }}" --argjson progress 8 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
-      - name: twspace crawler (audio/meta best-effort)
+      # ---------- ATTENDEES via twspace-crawler (no /peek) ----------
+      - name: Run crawler (always for attendees; also used for audio)
         id: crawl
-        if: ${{ steps.x_preflight.outputs.ok == '1' && inputs.mode != 'transcript_only' }}
+        if: ${{ steps.x_preflight.outputs.ok == '1' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -276,222 +245,299 @@ jobs:
           LOG_ERR="${ARTDIR}/logs/crawler_${SID}.err.log"
 
           set +e
-          timeout 10m docker run --rm \
+          timeout 12m docker run --rm \
             -e TWITTER_AUTHORIZATION \
             -e TWITTER_AUTH_TOKEN \
             -e TWITTER_CSRF_TOKEN \
             -v "${ARTDIR}:/app/download" \
             -v "${ARTDIR}/logs:/app/logs" \
             ghcr.io/hitomarukonpaku/twspace-crawler:latest \
-            --id "${SID}" --force \
-            > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
+            --id "${SID}" --force > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
           RC=$?
           set -e
-          echo "crawler_exit=$RC"
+          echo "crawler_exit=${RC}"
 
-          AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+          # Best-effort audio pick
+          AUDIO_FILE="$(find "${ARTDIR}" -maxdepth 1 -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "$AUDIO_FILE" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}"  >> "$GITHUB_OUTPUT"
           fi
 
-          # Expose log paths for attendees extraction
-          echo "crawler_log_std=${LOG_STD}" >> "$GITHUB_OUTPUT"
-          echo "crawler_log_err=${LOG_ERR}" >> "$GITHUB_OUTPUT"
+          # Try to pull a master playlist from logs if no audio file yet
+          if [ -z "${AUDIO_FILE:-}" ]; then
+            M3U8="$(grep -Eo 'https?://[^ ]+master_playlist\.m3u8' "$LOG_STD" "$LOG_ERR" 2>/dev/null | head -n1 || true)"
+            if [ -n "$M3U8" ]; then
+              DL_OUT="${ARTDIR}/${BASE}.m4a"
+              if ! ffmpeg -hide_banner -y -i "$M3U8" -vn -c copy -bsf:a aac_adtstoasc "$DL_OUT"; then
+                ffmpeg -hide_banner -y -i "$M3U8" -vn -c:a aac -b:a 192k "$DL_OUT"
+              fi
+              [ -s "$DL_OUT" ] && { echo "INPUT_FILE=${DL_OUT}" >> "$GITHUB_ENV"; echo "audio_file=${DL_OUT}" >> "$GITHUB_OUTPUT"; }
+            fi
+          fi
 
-      # ---------- ATTENDEES: parse directly from crawler logs ----------
-      - name: Extract attendees from crawler logs
-        id: attendees_from_logs
-        if: ${{ inputs.mode != 'transcript_only' }}
+          # Extract raw JSON line for audioSpace (contains participants)
+          AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
+          if [ -z "$AS_JSON_LINE" ]; then
+            AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
+          fi
+          if [ -n "$AS_JSON_LINE" ]; then
+            printf '%s\n' "$AS_JSON_LINE" > "${ARTDIR}/_as_line.json"
+          fi
+          [ -s "${ARTDIR}/_as_line.json" ] && echo "as_json=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
+
+      - name: Build attendees JSON+HTML from crawler logs
+        id: attendees
+        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_json != '' }}
         shell: bash
         env:
-          LOG_STD: ${{ steps.crawl.outputs.crawler_log_std }}
-          LOG_ERR: ${{ steps.crawl.outputs.crawler_log_err }}
-          OUT_JSON: ${{ env.ARTDIR }}/attendees.json
-          OUT_HTML: ${{ env.ARTDIR }}/attendees.html
+          AS_LINE: ${{ steps.crawl.outputs.as_json }}
         run: |
           set -euxo pipefail
-          : "${LOG_STD:=}"
-          : "${LOG_ERR:=}"
-          python3 - <<'PY'
-import json, re, sys, os, html
-log_paths = [os.environ.get('LOG_STD',''), os.environ.get('LOG_ERR','')]
-log_paths = [p for p in log_paths if p and os.path.exists(p)]
-buf = ""
-for p in log_paths:
-    try:
-        with open(p,'r',encoding='utf-8',errors='ignore') as f:
-            buf += f.read()+"\n"
-    except Exception:
-        pass
+          OUT_JSON="${ARTDIR}/attendees.json"
+          OUT_HTML="${ARTDIR}/attendees.html"
 
-def iter_json_objects(s):
-    # find {...} after "audioSpace" or "participants"
-    starts = [m.start() for m in re.finditer(r'(\{"audioSpace":|\{"participants":)', s)]
-    for st in starts:
-        # back up to the opening brace
-        i = s.find('{', st)
-        if i < 0: continue
-        depth = 0; in_str=False; esc=False
-        for j,ch in enumerate(s[i:], start=i):
-            if in_str:
-                if esc: esc=False
-                elif ch == '\\\\': esc=True
-                elif ch == '"': in_str=False
-            else:
-                if ch == '"': in_str=True
-                elif ch == '{': depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        yield s[i:j+1]
-                        break
+          # Pull the embedded audioSpace object if nested
+          jq -c 'def first_audioSpace:
+                   (.. | .audioSpace? // empty) | select(.!=null) | . | halt;
+                 . as $root
+                 | try first_audioSpace catch . ' "$AS_LINE" > "${ARTDIR}/_as_obj.json" || true
 
-objs=[]
-for js in iter_json_objects(buf):
-    try:
-        o=json.loads(js)
-        objs.append(o)
-    except Exception:
-        # Try to salvage common mask artifacts *** by stripping them
-        try:
-            o=json.loads(js.replace('***',''))
-            objs.append(o)
-        except Exception:
-            pass
-
-# Consolidate participants regardless of wrapper shape
-hosts=[]; cohosts=[]; speakers=[]; listeners=[]
-def push(lst, disp, handle):
-    if not handle: return
-    url=f"https://twitter.com/{handle}"
-    lst.append({"display":disp or handle, "handle":handle, "url":url})
-
-for o in objs:
-    if "audioSpace" in o:
-        a=o["audioSpace"]
-    else:
-        a=o
-    p=a.get("participants") or {}
-    # Older shapes: admins/cohosts/speakers/listeners; sometimes objects have twitter_screen_name or screen_name
-    for src, target in [("admins",hosts), ("cohosts",cohosts), ("speakers",speakers), ("listeners",listeners)]:
-        for ent in p.get(src, []):
-            handle = ent.get("twitter_screen_name") or ent.get("screen_name") or ent.get("twitterScreenName")
-            disp   = ent.get("display_name") or ent.get("name") or ent.get("displayName")
-            push(target, disp, handle)
-
-# Deduplicate by handle within each bucket
-def dedup(lst):
-    seen=set(); out=[]
-    for x in lst:
-        h=x["handle"].lower()
-        if h in seen: continue
-        seen.add(h); out.append(x)
-    return out
-
-hosts=dedup(hosts); cohosts=dedup(cohosts); speakers=dedup(speakers); listeners=dedup(listeners)
-
-# Build output
-out = {
-  "host": hosts,
-  "cohosts": cohosts,
-  "speakers": speakers,
-  "listeners": listeners
-}
-out_path=os.environ["OUT_JSON"]
-with open(out_path,"w",encoding="utf-8") as f:
-    json.dump(out,f,ensure_ascii=False,indent=2)
-
-# HTML render (only if we have at least one <a> item)
-def section(title, items):
-    if not items: return ""
-    lines=[f"<li><strong>{html.escape(title)}</strong><ul>"]
-    for it in items:
-        lines.append(f'  <li><a href="{html.escape(it["url"])}" target="_blank">{html.escape(it["display"])} (@{html.escape(it["handle"])})</a></li>')
-    lines.append("</ul></li>")
-    return "\n".join(lines)
-
-html_out = []
-for label, items in [("Host", hosts), ("Co-hosts", cohosts), ("Speakers", speakers), ("Listeners", listeners)]:
-    sec = section(label, items)
-    if sec: html_out.append(sec)
-
-html_str = "<ul>\n" + "\n".join(html_out) + "\n</ul>\n" if html_out else ""
-if html_out:
-    with open(os.environ["OUT_HTML"],"w",encoding="utf-8") as f:
-        f.write(html_str)
-    print("ATTENDEE_HTML_WRITTEN=1")
-else:
-    print("ATTENDEE_HTML_WRITTEN=0")
-PY
-
-          if [ -s "${OUT_HTML}" ] && grep -qi '<li[^>]*><a ' "${OUT_HTML}"; then
-            echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
-            echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
-          else
-            echo "No attendees extracted from logs"
-            echo "ATTN_HTML=" >> "$GITHUB_ENV"
-            echo "attendees_html=" >> "$GITHUB_OUTPUT"
+          SRC="${ARTDIR}/_as_obj.json"
+          if ! jq -e type "${SRC}" >/dev/null 2>&1; then
+            # The line itself may already be the audioSpace object
+            SRC="$AS_LINE"
           fi
 
-      - name: Upload attendees HTML to GCS (only if non-empty)
+          # Normalize attendees (host from creator_results; admins->cohosts)
+          jq -r '
+            def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + h)} | select(.handle!=null and .handle!="" and .url!=null);
+            def uniqh: unique_by(.handle);
+
+            {
+              host: (
+                [ .metadata?.creator_results?.result?.legacy? ]
+                | map(mk(.screen_name; .name)) | uniqh
+              ),
+              cohosts: (
+                ( .participants?.admins // [] )
+                | map(mk(.twitter_screen_name; .display_name)) | uniqh
+              ),
+              speakers: (
+                ( .participants?.speakers // [] )
+                | map(mk(.twitter_screen_name; .display_name)) | uniqh
+              )
+            }
+          ' "$SRC" > "$OUT_JSON" || true
+
+          # Create HTML only if we have at least one item
+          if jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null; then
+            jq -r '
+              def li: "    <li><a href=\"" + .url + "\" target=\"_blank\">" + ((.name // "") + " (@" + .handle + ")") + "</a></li>";
+              "<ul>\n" +
+              (if (.host|length)>0 then "  <li><strong>Host</strong>\n  <ul>\n" + (.host|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
+              (if (.cohosts|length)>0 then "  <li><strong>Co-hosts</strong>\n  <ul>\n" + (.cohosts|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
+              (if (.speakers|length)>0 then "  <li><strong>Speakers</strong>\n  <ul>\n" + (.speakers|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
+              "</ul>\n"
+            ' "$OUT_JSON" > "$OUT_HTML"
+            if grep -qi '<li[^>]*><a ' "$OUT_HTML"; then
+              echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
+              echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Upload attendees HTML to GCS
         id: upload_attendees
+        if: ${{ steps.attendees.outputs.attendees_html != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          test -n "${ATTN_HTML:-}" && test -s "${ATTN_HTML:-}" || { echo "No attendees HTML to upload"; exit 0; }
-          DEST_ATT="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
-          RAW_ATT="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
-          PROXY_ATT="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.html"
-          gsutil cp "${ATTN_HTML}" "$DEST_ATT"
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.html"
+          gsutil cp "${ATTN_HTML}" "$DEST"
           if [ "${{ inputs.make_public }}" = "true" ]; then
-            gsutil acl ch -u AllUsers:R "$DEST_ATT" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}" || true
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "raw_attn=${RAW_ATT}"     >> "$GITHUB_OUTPUT"
-          echo "proxy_attn=${PROXY_ATT}" >> "$GITHUB_OUTPUT"
+          echo "raw_attendees_url=${RAW}"   >> "$GITHUB_OUTPUT"
+          echo "proxy_attendees_url=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      # ---------- (Optional) AUDIO → VTT / TRANSCRIPT (unchanged; runs when mode == '' ) ----------
-      # Add your existing audio normalization / Deepgram steps here as before.
-      # Keep them conditioned on: inputs.mode == ''.
+      # ---------- AUDIO / TRANSCRIPT (skippable if attendees_only) ----------
+      - name: Ping processing audio
+        if: ${{ inputs.mode != 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ inputs.post_id }}" \
+                         --arg status "processing" \
+                         --arg msg "Processing audio" \
+                         --arg run "${{ github.run_id }}" --argjson progress 10 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      # ---------- PATCH WORDPRESS WITH RESULTS ----------
-      - name: Patch WordPress assets/status
+      - name: Fallback download via yt-dlp (if crawler gave no audio)
+        if: ${{ inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && inputs.existing_mp3_url == '' }}
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          URL: ${{ inputs.space_url }}
+        run: |
+          set -euxo pipefail
+          yt-dlp -o "%(title)s.%(ext)s" -f "bestaudio/best" "$URL"
+          IN="$(ls -S | head -n1 || true)"
+          test -f "$IN" || { echo "No file downloaded"; exit 1; }
+          echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
+
+      - name: Use provided MP3 (transcript_only mode)
+        if: ${{ inputs.mode == 'transcript_only' && inputs.existing_mp3_url != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L "${{ inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
+          echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
+
+      - name: Trim head/tail silence
+        if: ${{ inputs.mode != 'attendees_only' && env.INPUT_FILE != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TRIM_WAV="${WORKDIR}/trim_${{ github.run_id }}.wav"
+          ffmpeg -hide_banner -y -i "$INPUT_FILE" \
+            -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
+            -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
+          echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
+
+      - name: Loudness normalize → MP3
+        if: ${{ inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PASS1_JSON="${WORKDIR}/loudnorm1.json"
+          ffmpeg -hide_banner -y -i "$AUDIO_IN" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/pass1.log" || true
+          awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+          # Use pass1 values if available
+          if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
+            I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON"); LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+          else
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+          fi
+          echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
+
+      - name: Upload MP3 to GCS
+        id: upload_mp3
+        if: ${{ inputs.mode != 'attendees_only' && env.MP3_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
+          gsutil cp "${MP3_PATH}" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
+
+      - name: Captions via crawler (VTT) if present
+        id: crawl_cc
+        if: ${{ inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC_FILE="$(find "${ARTDIR}" -maxdepth 1 -type f -iname '*cc.jsonl' -o -iname '*caption*.jsonl' | head -n1 || true)"
+          if [ -n "$CC_FILE" ]; then
+            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download/$(basename "$CC_FILE")" > "${ARTDIR}/${BASE}.vtt" || true
+          fi
+          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+
+      - name: VTT via Deepgram (fallback)
+        id: dg
+        if: ${{ inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEGGG != '' && inputs.do_transcript == 'true' }}
+        shell: bash
+        env:
+          DEGGG: ${{ env.DEEPGRAM_API_KEY }}
+        run: |
+          set -euxo pipefail
+          # Placeholder for your Deepgram call (omitted here if you already have a step/script)
+          true
+
+      - name: Upload VTT to GCS
+        id: upload_vtt
+        if: ${{ inputs.mode != 'attendees_only' && env.VTT_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.vtt"
+          gsutil cp "${VTT_PATH}" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
+
+      # ---------- PATCH WP ----------
+      - name: Patch WP with artifacts (optional)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
-          ATTN_HTML_PATH: ${{ steps.attendees_from_logs.outputs.attendees_html }}
-          ATTN_URL_PROXY: ${{ steps.upload_attendees.outputs.proxy_attn }}
+          PID: ${{ inputs.post_id }}
+          ATN: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}
+          AUD: ${{ steps.upload_mp3.outputs.audio_proxy }}
+          VTT: ${{ steps.upload_vtt.outputs.vtt_proxy }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           AT_HTML=""
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
           BODY="$(jq -n \
-            --arg pid "${{ inputs.post_id }}" \
-            --arg attendees_html "${AT_HTML}" \
-            --arg attendees_url "${ATTN_URL_PROXY:-}" \
-            '
-            { post_id: ($pid|tonumber), status:"complete", progress:100 }
-            + (if ($attendees_html|length)>0 then {attendees_html:$attendees_html} else {} end)
-            + (if ($attendees_url|length)>0 then {artifacts:{attendees_html_url:$attendees_url}} else {} end)
-            ')"
+            --arg pid    "${PID}" \
+            --arg aud    "${AUD}" \
+            --arg vtt    "${VTT}" \
+            --arg aturl  "${ATN}" \
+            --arg athtml "${AT_HTML}" '
+            {
+              post_id: ($pid|tonumber),
+              status: "complete",
+              progress: 100
+            }
+            + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
+            + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+            + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
+            + (if ($aturl|length)>0 then {artifacts:{attendees_html_url:$aturl}} else {} end)
+          ')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
 
       - name: Summary
         shell: bash
+        env:
+          SID: ${{ steps.ids.outputs.space_id }}
         run: |
           {
             echo "### Space Worker Summary"
             echo "- Space URL: ${{ inputs.space_url }}"
-            echo "- Space ID:  ${{ steps.ids.outputs.space_id }}"
+            echo "- Space ID:  ${SID}"
             echo "- Post ID:   ${{ inputs.post_id }}"
-            if [ -n "${{ steps.upload_attendees.outputs.proxy_attn }}" ]; then
-              echo "- Attendees HTML: ${{ steps.upload_attendees.outputs.proxy_attn }}"
-            else
-              echo "- Attendees HTML: (none)"
+            if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
+              echo "- Audio:     ${{ steps.upload_mp3.outputs.audio_proxy }}"
             fi
-            echo "- Crawler preflight OK: ${{ steps.x_preflight.outputs.ok == '1' && 'yes' || 'no' }} reason ${{ steps.x_preflight.outputs.reason }}"
-            echo "- Mode: ${{ inputs.mode }}"
+            if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
+              echo "- VTT:       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
+            fi
+            if [ -n "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ]; then
+              echo "- Attendees: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
+            elif [ -n "${ATTN_HTML:-}" ]; then
+              echo "- Attendees embedded in WP"
+            else
+              echo "- Attendees: (none extracted)"
+            fi
+            echo "- Preflight: ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
+            echo "- Mode:      ${{ inputs.mode }}"
           } >> "$GITHUB_STEP_SUMMARY"
