@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X Twitter Space URL https://x.com/i/spaces
+        description: X Twitter Space URL
         required: true
         type: string
       title:
@@ -56,7 +56,7 @@ on:
         type: string
         default: ""
       upload_attendees_file:
-        description: Also upload attendees.html to GCS (like we do for VTT)
+        description: Also upload attendees.html to GCS 
         required: false
         type: choice
         options: ["false","true"]
