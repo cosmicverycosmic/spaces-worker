@@ -117,7 +117,7 @@ jobs:
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
           PFX="$(echo "${{ inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
-          echo "PREFIX=$PFX"                  >> "$GITHUB_ENV"
+          echo "PREFIX=$PFX"                 >> "$GITHUB_ENV"
           echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
       - name: Derive Space ID and base
@@ -146,7 +146,6 @@ jobs:
           printf '%s' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
 
-      # === Preflight that previously worked (integrated) ===
       - name: X preflight auth sanity check
         id: x_preflight
         shell: bash
@@ -156,12 +155,10 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          # Keep AUTH only if it starts with "Bearer "
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH=""
           fi
 
-          # Mask provided secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
@@ -174,23 +171,14 @@ jobs:
           [ -n "$AT" ] && [ -n "$CT" ] && HAS_COOKIE=1 || true
           [ -n "$AUTH" ] && HAS_BEARER=1 || true
 
-          # If we have any creds at all, allow the crawler (diagnostics below still run)
           if [ "$HAS_COOKIE" -eq 1 ] || [ "$HAS_BEARER" -eq 1 ]; then
             OK=1
             REASON="creds_present"
           fi
 
           mkdir -p "${ARTDIR}"
+          BASEH=(-H "User-Agent: Mozilla/5.0" -H "Accept: application/json, text/plain, */*" -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}")
 
-          # Common headers for diag calls
-          BASEH=(
-            -H "User-Agent: Mozilla/5.0"
-            -H "Accept: application/json, text/plain, */*"
-            -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
-          )
-
-          # --- Diagnostics only (do not gate on these) ---
-          # Try participants with cookie+auth
           if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
             CVAL="auth_token=${AT}; ct0=${CT}"
             HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
@@ -205,7 +193,6 @@ jobs:
             echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Guest activation (bearer-only)
           if [ "$HAS_BEARER" -eq 1 ]; then
             GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
               -X POST "https://api.twitter.com/1.1/guest/activate.json" \
@@ -213,14 +200,10 @@ jobs:
               -H "Content-Type: application/json" \
               -d '{}' || echo 000)
             echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
-
-            # If we didn’t already allow the crawler, a successful guest activation is enough
             if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
               OK=1
               REASON="guest_ok"
             fi
-
-            # Try participants with guest token (diag)
             if [ "$GHTTP" = "200" ]; then
               GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
               if [ -n "$GUEST" ]; then
@@ -236,14 +219,12 @@ jobs:
             fi
           fi
 
-          # Public peek (if this works, we definitely can try the crawler)
           if [ "$OK" -ne 1 ]; then
             for PEEK in \
               "https://x.com/i/spaces/${SPACE_ID}/peek" \
               "https://twitter.com/i/spaces/${SPACE_ID}/peek"
             do
-              PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" \
-                "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
+              PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
               echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
               if [ "$PHTTP" = "200" ]; then
                 OK=1
@@ -252,7 +233,6 @@ jobs:
               fi
             done
           fi
-          # --- end diagnostics ---
 
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
@@ -352,9 +332,13 @@ jobs:
             }
           ' "$SRC" > "$OUT_JSON" || true
 
-          # Count entries across groups
+          # Expose JSON path for later upload regardless of HTML presence
+          if [ -s "$OUT_JSON" ]; then
+            echo "ATTN_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
+            echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
+          fi
+
           if jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null; then
-            # Make HTML
             jq -r '
               def li: "    <li><a href=\"" + .url + "\" target=\"_blank\">" + ((.name // "") + " (@" + .handle + ")") + "</a></li>";
               "<ul>\n" +
@@ -363,16 +347,10 @@ jobs:
               (if (.speakers|length)>0 then "  <li><strong>Speakers</strong>\n  <ul>\n" + (.speakers|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
               "</ul>\n"
             ' "$OUT_JSON" > "$OUT_HTML"
-
-            # Publish outputs/env for HTML (if it actually has links)
             if grep -qi '<li[^>]*><a ' "$OUT_HTML"; then
-              echo "ATTN_HTML=${OUT_HTML}"      >> "$GITHUB_ENV"
+              echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
               echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
             fi
-
-            # Always expose JSON when we have attendees
-            echo "ATTN_JSON=${OUT_JSON}"      >> "$GITHUB_ENV"
-            echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Try attendees from public peek best effort
@@ -395,36 +373,38 @@ jobs:
             fi
           fi
 
-      # === Upload attendees (HTML preferred, fallback to JSON) and surface URL ===
       - name: Upload attendees HTML to GCS
         id: upload_attendees
-        if: ${{ steps.attendees.outputs.attendees_html != '' || steps.peek_attendees.outputs.attendees_html != '' || steps.attendees.outputs.attendees_json != '' }}
+        if: ${{ steps.attendees.outputs.attendees_html != '' || steps.peek_attendees.outputs.attendees_html != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          FILE=""
-          EXT=""
-          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            FILE="${ATTN_HTML}"
-            EXT="html"
-          elif [ -n "${ATTN_JSON:-}" ] && [ -s "${ATTN_JSON:-}" ]; then
-            FILE="${ATTN_JSON}"
-            EXT="json"
-          fi
-
-          test -n "$FILE" && test -n "$EXT"
-
-          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.${EXT}"
-          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.${EXT}"
-          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.${EXT}"
-
-          gsutil cp "${FILE}" "$DEST"
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.html"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.html"
+          gsutil cp "${ATTN_HTML}" "$DEST"
           if [ "${{ inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-
           echo "raw_attendees_url=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "proxy_attendees_url=${PROXY}" >> "$GITHUB_OUTPUT"
+
+      # NEW: Upload attendees JSON to GCS (fallback or secondary artifact)
+      - name: Upload attendees JSON to GCS
+        id: upload_attendees_json
+        if: ${{ steps.attendees.outputs.attendees_json != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.json"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees.json"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}-attendees.json"
+          gsutil cp "${ATTN_JSON}" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "raw_attendees_json_url=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "proxy_attendees_json_url=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Ping processing audio
         if: ${{ inputs.mode != 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
@@ -552,6 +532,7 @@ jobs:
         env:
           PID: ${{ inputs.post_id }}
           ATN: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}
+          JTN: ${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}
           AUD: ${{ steps.upload_mp3.outputs.audio_proxy }}
           VTT: ${{ steps.upload_vtt.outputs.vtt_proxy }}
         run: |
@@ -560,11 +541,13 @@ jobs:
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
+
           BODY="$(jq -n \
             --arg pid    "${PID}" \
             --arg aud    "${AUD}" \
             --arg vtt    "${VTT}" \
             --arg aturl  "${ATN}" \
+            --arg jturl  "${JTN}" \
             --arg athtml "${AT_HTML}" '
             {
               post_id: ($pid|tonumber),
@@ -574,8 +557,20 @@ jobs:
             + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
             + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
             + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
-            + (if ($aturl|length)>0 then {artifacts:{attendees_html_url:$aturl}, ss3k_attendees_html_url:$aturl} else {} end)
+            + (if ($aturl|length)>0 or ($jturl|length)>0 then
+                 { artifacts:
+                    ( ({} 
+                        + (if ($aturl|length)>0 then {attendees_html_url:$aturl} else {} end)
+                        + (if ($jturl|length)>0 then {attendees_json_url:$jturl} else {} end)
+                      )
+                    )
+                 }
+               else {} end)
+            + (if ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
+               else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
+               else {} end end)
           ')"
+
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
 
@@ -598,9 +593,15 @@ jobs:
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             fi
             if [ -n "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ]; then
-              echo "- Attendees ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
+              echo "- Attendees HTML ${{
+                steps.upload_attendees.outputs.proxy_attendees_url
+              }}"
             elif [ -n "${ATTN_HTML:-}" ]; then
               echo "- Attendees embedded in WP"
+            elif [ -n "${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}" ]; then
+              echo "- Attendees JSON ${{
+                steps.upload_attendees_json.outputs.proxy_attendees_json_url
+              }}"
             else
               echo "- Attendees none extracted"
             fi
