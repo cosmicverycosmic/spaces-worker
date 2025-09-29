@@ -50,6 +50,11 @@ on:
         required: false
         type: string
         default: ""
+      wp_marker:
+        description: Internal correlation marker from WP (ignored by the worker)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -155,12 +160,10 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          # Keep AUTH only if it starts with "Bearer "
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
             AUTH=""
           fi
 
-          # Mask provided secrets
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
@@ -173,23 +176,14 @@ jobs:
           [ -n "$AT" ] && [ -n "$CT" ] && HAS_COOKIE=1 || true
           [ -n "$AUTH" ] && HAS_BEARER=1 || true
 
-          # If we have any creds at all, allow the crawler (diagnostics below still run)
           if [ "$HAS_COOKIE" -eq 1 ] || [ "$HAS_BEARER" -eq 1 ]; then
             OK=1
             REASON="creds_present"
           fi
 
           mkdir -p "${ARTDIR}"
+          BASEH=(-H "User-Agent: Mozilla/5.0" -H "Accept: application/json, text/plain, */*" -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}")
 
-          # Common headers for diag calls
-          BASEH=(
-            -H "User-Agent: Mozilla/5.0"
-            -H "Accept: application/json, text/plain, */*"
-            -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}"
-          )
-
-          # --- Diagnostics only (do not gate on these) ---
-          # Try participants with cookie+auth
           if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
             CVAL="auth_token=${AT}; ct0=${CT}"
             HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
@@ -204,7 +198,6 @@ jobs:
             echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Guest activation (bearer-only)
           if [ "$HAS_BEARER" -eq 1 ]; then
             GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
               -X POST "https://api.twitter.com/1.1/guest/activate.json" \
@@ -212,14 +205,10 @@ jobs:
               -H "Content-Type: application/json" \
               -d '{}' || echo 000)
             echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
-
-            # If we didn’t already allow the crawler, a successful guest activation is enough
             if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
               OK=1
               REASON="guest_ok"
             fi
-
-            # Try participants with guest token (diag)
             if [ "$GHTTP" = "200" ]; then
               GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
               if [ -n "$GUEST" ]; then
@@ -234,7 +223,23 @@ jobs:
               fi
             fi
           fi
-          # --- end diagnostics ---
+
+          # Note: we keep this peek diagnostic only as a last resort to green-light the crawler.
+          # There is NO separate "peek attendees" publishing step later.
+          if [ "$OK" -ne 1 ]; then
+            for PEEK in \
+              "https://x.com/i/spaces/${SPACE_ID}/peek" \
+              "https://twitter.com/i/spaces/${SPACE_ID}/peek"
+            do
+              PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
+              echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
+              if [ "$PHTTP" = "200" ]; then
+                OK=1
+                REASON="public_ok"
+                break
+              fi
+            done
+          fi
 
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
@@ -334,7 +339,7 @@ jobs:
             }
           ' "$SRC" > "$OUT_JSON" || true
 
-          # Always expose JSON path so we can upload it too
+          # Surface the JSON path for upload whether or not HTML renders
           if [ -s "$OUT_JSON" ]; then
             echo "ATTN_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
             echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
@@ -354,6 +359,8 @@ jobs:
               echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
             fi
           fi
+
+      # NOTE: The "Try attendees from public peek best effort" step has been removed on purpose.
 
       - name: Upload attendees HTML to GCS
         id: upload_attendees
@@ -523,21 +530,12 @@ jobs:
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
 
-          # Prefer HTML URL, else fall back to JSON URL — both set top-level as attendees_html_url
-          ATTENDEE_FILE_URL=""
-          if [ -n "${ATN:-}" ]; then
-            ATTENDEE_FILE_URL="${ATN}"
-          elif [ -n "${JTN:-}" ]; then
-            ATTENDEE_FILE_URL="${JTN}"
-          fi
-
           BODY="$(jq -n \
             --arg pid    "${PID}" \
             --arg aud    "${AUD}" \
             --arg vtt    "${VTT}" \
             --arg aturl  "${ATN}" \
             --arg jturl  "${JTN}" \
-            --arg fileu  "${ATTENDEE_FILE_URL}" \
             --arg athtml "${AT_HTML}" '
             {
               post_id: ($pid|tonumber),
@@ -547,15 +545,18 @@ jobs:
             + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
             + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
             + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
-            + (if ($fileu|length)>0 then {attendees_html_url:$fileu} else {} end)
-            + (if (($aturl|length)>0 or ($jturl|length)>0) then
-                 {artifacts:
-                    ( {}
-                      + (if ($aturl|length)>0 then {attendees_html_url:$aturl} else {} end)
-                      + (if ($jturl|length)>0 then {attendees_json_url:$jturl} else {} end)
+            + (if ($aturl|length)>0 or ($jturl|length)>0 then
+                 { artifacts:
+                    ( ({} 
+                        + (if ($aturl|length)>0 then {attendees_html_url:$aturl} else {} end)
+                        + (if ($jturl|length)>0 then {attendees_json_url:$jturl} else {} end)
+                      )
                     )
                  }
                else {} end)
+            + (if ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
+               else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
+               else {} end end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
@@ -581,8 +582,6 @@ jobs:
             fi
             if [ -n "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ]; then
               echo "- Attendees HTML ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
-            elif [ -n "${ATTN_HTML:-}" ]; then
-              echo "- Attendees embedded in WP"
             elif [ -n "${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}" ]; then
               echo "- Attendees JSON ${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}"
             else
