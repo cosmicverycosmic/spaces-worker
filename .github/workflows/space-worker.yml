@@ -224,8 +224,7 @@ jobs:
             fi
           fi
 
-          # Note: we keep this peek diagnostic only as a last resort to green-light the crawler.
-          # There is NO separate "peek attendees" publishing step later.
+          # Diagnostic public peek (no publishing here)
           if [ "$OK" -ne 1 ]; then
             for PEEK in \
               "https://x.com/i/spaces/${SPACE_ID}/peek" \
@@ -285,52 +284,58 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Robust extraction of the JSON payload after the last " | "
+          # Extract raw attendees-related line (don't try to fully parse JSON)
           RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
           fi
           if [ -n "$RAW" ]; then
-            JSON_SEG="$(printf '%s' "$RAW" | awk -F'\\| ' '{print $NF}')"
-            # Trim anything before the first { or [
-            JSON_SEG="$(printf '%s' "$JSON_SEG" | sed -E 's/^[^\\[{]*([\\[{].*)$/\\1/')"
-            # If still not valid JSON, keep from first {/[ to last }/]
-            if ! printf '%s' "$JSON_SEG" | jq -e . >/dev/null 2>&1; then
-              JSON_SEG="$(printf '%s' "$JSON_SEG" | sed -nE 's/^.*([\\[{].*[\\}\\]]).*$/\\1/p')"
-            fi
-            printf '%s\n' "$JSON_SEG" > "${ARTDIR}/_as_line.json"
+            printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
+            # Also try to capture the portion after the pipe for convenience (may still not be valid JSON)
+            printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line_after_pipe.txt" || true
           fi
-          [ -s "${ARTDIR}/_as_line.json" ] && echo "as_json=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
+          [ -s "${ARTDIR}/_as_line.txt" ] && echo "as_line=${ARTDIR}/_as_line.txt" >> "$GITHUB_OUTPUT" || true
 
       - name: Build attendees JSON and HTML from crawler logs
         id: attendees
-        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_json != '' }}
+        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
         env:
-          AS_LINE: ${{ steps.crawl.outputs.as_json }}
+          AS_LINE: ${{ steps.crawl.outputs.as_line }}
         run: |
           set -euxo pipefail
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
 
-          # Pick the inner .audioSpace object when present, otherwise treat the whole file as the object.
-          jq -r '
-            def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + (h//""))} | select(.handle!=null and .handle!="" and .url!=null);
-            def uniqh: unique_by(.handle);
-            (.audioSpace // .) as $a |
-            {
-              host:    ( [ $a.metadata?.creator_results?.result?.legacy? ] | map(mk(.screen_name; .name)) | uniqh ),
-              cohosts: ( ( $a.participants?.admins   // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh ),
-              speakers:( ( $a.participants?.speakers // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh )
-            }
-          ' "$AS_LINE" > "$OUT_JSON"
-
-          if [ -s "$OUT_JSON" ]; then
-            echo "ATTN_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
-            echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
+          # Best-effort: try to coerce to JSON when possible; ignore failures.
+          # Grab the part after the pipe and try a couple of safe trims.
+          CAND="${ARTDIR}/_as_line_after_pipe.txt"
+          if [ -s "$CAND" ]; then
+            TRY="$(sed -E 's/^[^\\[{]*([\\[{].*)$/\\1/' "$CAND" || true)"
+            if printf '%s' "$TRY" | jq -e . >/dev/null 2>&1; then
+              printf '%s' "$TRY" > "${ARTDIR}/_as_line.json"
+            else
+              TRY2="$(sed -nE 's/^.*([\\[{].*[\\}\\]]).*$/\\1/p' "$CAND" || true)"
+              if printf '%s' "$TRY2" | jq -e . >/dev/null 2>&1; then
+                printf '%s' "$TRY2" > "${ARTDIR}/_as_line.json"
+              fi
+            fi
           fi
 
-          if jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null; then
+          if [ -s "${ARTDIR}/_as_line.json" ]; then
+            jq -r '
+              def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + (h//""))} | select(.handle!=null and .handle!="" and .url!=null);
+              def uniqh: unique_by(.handle);
+              (.audioSpace // .) as $a |
+              {
+                host:    ( [ $a.metadata?.creator_results?.result?.legacy? ] | map(mk(.screen_name; .name)) | uniqh ),
+                cohosts: ( ( $a.participants?.admins   // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh ),
+                speakers:( ( $a.participants?.speakers // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh )
+              }
+            ' "${ARTDIR}/_as_line.json" > "$OUT_JSON" || true
+          fi
+
+          if [ -s "$OUT_JSON" ] && jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null 2>&1; then
             jq -r '
               def li: "    <li><a href=\"" + (.url//"#") + "\" target=\"_blank\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               "<ul>\n" +
@@ -338,14 +343,66 @@ jobs:
               (if (.cohosts|length)>0 then "  <li><strong>Co-hosts</strong>\n  <ul>\n" + (.cohosts|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
               (if (.speakers|length)>0 then "  <li><strong>Speakers</strong>\n  <ul>\n" + (.speakers|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
               "</ul>\n"
-            ' "$OUT_JSON" > "$OUT_HTML"
+            ' "$OUT_JSON" > "$OUT_HTML" || true
             if grep -qi '<li[^>]*><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
               echo "attendees_html=${OUT_HTML}" >> "$GITHUB_OUTPUT"
             fi
+            echo "ATTN_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
+            echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
           fi
 
-      # NOTE: The "Try attendees from public peek best effort" step has been removed on purpose.
+      # NEW: Always assemble and upload a raw attendees dump, regardless of parsing success
+      - name: Assemble attendees RAW dump
+        id: assemble_attendees_raw
+        shell: bash
+        env:
+          SID: ${{ steps.ids.outputs.space_id }}
+        run: |
+          set -euxo pipefail
+          RAW_TXT="${ARTDIR}/${BASE}-attendees-raw.txt"
+          {
+            echo "### Raw attendees capture for Space ${SID}"
+            echo
+            for F in \
+              "${ARTDIR}/_as_line.txt" \
+              "${ARTDIR}/_as_line_after_pipe.txt" \
+              "${ARTDIR}/_as_line.json" \
+              "${ARTDIR}/x_participants_cookie.json" \
+              "${ARTDIR}/x_participants_guest.json" \
+              "${ARTDIR}/x_peek.json" \
+              "${ARTDIR}/logs/crawler_${SID}.out.log" \
+              "${ARTDIR}/logs/crawler_${SID}.err.log"
+            do
+              if [ -f "$F" ] && [ -s "$F" ]; then
+                echo "===== BEGIN $(basename "$F") ====="
+                cat "$F"
+                echo
+                echo "===== END $(basename "$F") ====="
+                echo
+              fi
+            done
+          } > "$RAW_TXT"
+          if [ -s "$RAW_TXT" ]; then
+            echo "RAW_TXT=${RAW_TXT}" >> "$GITHUB_ENV"
+            echo "raw_txt=${RAW_TXT}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload attendees RAW to GCS
+        id: upload_attendees_raw
+        if: ${{ steps.assemble_attendees_raw.outputs.raw_txt != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees-raw.txt"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}-attendees-raw.txt"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}-attendees-raw.txt"
+          gsutil cp "${RAW_TXT}" "$DEST"
+          if [ "${{ inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "raw_attendees_raw_url=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "proxy_attendees_raw_url=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Upload attendees HTML to GCS
         id: upload_attendees
@@ -507,6 +564,7 @@ jobs:
           PID: ${{ inputs.post_id }}
           ATN: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}
           JTN: ${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}
+          RAWN: ${{ steps.upload_attendees_raw.outputs.proxy_attendees_raw_url }}
           AUD: ${{ steps.upload_mp3.outputs.audio_proxy }}
           VTT: ${{ steps.upload_vtt.outputs.vtt_proxy }}
         run: |
@@ -522,27 +580,31 @@ jobs:
             --arg vtt    "${VTT}" \
             --arg aturl  "${ATN}" \
             --arg jturl  "${JTN}" \
+            --arg rawurl "${RAWN}" \
             --arg athtml "${AT_HTML}" '
-            {
-              post_id: ($pid|tonumber),
-              status: "complete",
-              progress: 100
-            }
-            + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
-            + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
-            + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
-            + (if ($aturl|length)>0 or ($jturl|length)>0 then
-                 { artifacts:
-                    ( ({} 
-                        + (if ($aturl|length)>0 then {attendees_html_url:$aturl} else {} end)
-                        + (if ($jturl|length)>0 then {attendees_json_url:$jturl} else {} end)
-                      )
-                    )
-                 }
-               else {} end)
-            + (if ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
-               else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
-               else {} end end)
+            def maybe_artifacts(a; j; r):
+              ({} 
+                + (if (a|length)>0 then {attendees_html_url:a} else {} end)
+                + (if (j|length)>0 then {attendees_json_url:j} else {} end)
+                + (if (r|length)>0 then {attendees_raw_url:r} else {} end)
+              );
+            . as $root
+            | ({
+                post_id: ($pid|tonumber),
+                status: "complete",
+                progress: 100
+              }
+              + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
+              + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
+              + (if ($athtml|length)>0 then {attendees_html:$athtml} else {} end)
+            )
+            | . + ( if ( ($aturl|length)>0 or ($jturl|length)>0 or ($rawurl|length)>0 )
+                    then { artifacts: maybe_artifacts($aturl; $jturl; $rawurl) }
+                    else {} end)
+            | . + ( if      ($aturl|length)>0 then {ss3k_attendees_html_url:$aturl}
+                    else if ($jturl|length)>0 then {ss3k_attendees_html_url:$jturl}
+                    else if ($rawurl|length)>0 then {ss3k_attendees_html_url:$rawurl}
+                    else {} end end end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
@@ -568,7 +630,13 @@ jobs:
               echo "- Attendees HTML ${{ steps.upload_attendees.outputs.proxy_attendees_url }}"
             elif [ -n "${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}" ]; then
               echo "- Attendees JSON ${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}"
-            else
+            fi
+            if [ -n "${{ steps.upload_attendees_raw.outputs.proxy_attendees_raw_url }}" ]; then
+              echo "- Attendees RAW  ${{ steps.upload_attendees_raw.outputs.proxy_attendees_raw_url }}"
+            fi
+            if [ -z "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ] && \
+               [ -z "${{ steps.upload_attendees_json.outputs.proxy_attendees_json_url }}" ] && \
+               [ -z "${{ steps.upload_attendees_raw.outputs.proxy_attendees_raw_url }}" ]; then
               echo "- Attendees none extracted"
             fi
             echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
