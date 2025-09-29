@@ -285,30 +285,20 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Second fallback: fetch m3u8 from logs and re-mux with ffmpeg (no transcode)
-          if [ -z "${AUDIO_FILE:-}" ] || [ ! -f "${AUDIO_FILE:-}" ]; then
-            M3U8="$(grep -hEo 'https?://[^ ]+playlist_[^ ]+\.m3u8[^ ]*' "$LOG_STD" "$LOG_ERR" | head -n1 || true)"
-            if [ -z "$M3U8" ]; then
-              M3U8="$(grep -hEo 'https?://[^ ]+master_playlist\.m3u8[^ ]*' "$LOG_STD" "$LOG_ERR" | head -n1 || true)"
-            fi
-            if [ -n "$M3U8" ]; then
-              DL_OUT="${ARTDIR}/${BASE}.m4a"
-              if ! ffmpeg -hide_banner -y -protocol_whitelist "file,http,https,tcp,tls" -i "$M3U8" -vn -c copy -bsf:a aac_adtstoasc "$DL_OUT"; then
-                ffmpeg -hide_banner -y -protocol_whitelist "file,http,https,tcp,tls" -i "$M3U8" -vn -c:a aac -b:a 192k "$DL_OUT"
-              fi
-              if [ -s "$DL_OUT" ]; then
-                echo "INPUT_FILE=${DL_OUT}" >> "$GITHUB_ENV"
-                echo "audio_file=${DL_OUT}" >> "$GITHUB_OUTPUT"
-              fi
-            fi
+          # Robust extraction of the JSON payload after the last " | "
+          RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
+          if [ -z "$RAW" ]; then
+            RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
           fi
-
-          AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
-          if [ -z "$AS_JSON_LINE" ]; then
-            AS_JSON_LINE="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" | sed 's/^[^|]*| //; s/[[:space:]]*$//' || true)"
-          fi
-          if [ -n "$AS_JSON_LINE" ]; then
-            printf '%s\n' "$AS_JSON_LINE" > "${ARTDIR}/_as_line.json"
+          if [ -n "$RAW" ]; then
+            JSON_SEG="$(printf '%s' "$RAW" | awk -F'\\| ' '{print $NF}')"
+            # Trim anything before the first { or [
+            JSON_SEG="$(printf '%s' "$JSON_SEG" | sed -E 's/^[^\\[{]*([\\[{].*)$/\\1/')"
+            # If still not valid JSON, keep from first {/[ to last }/]
+            if ! printf '%s' "$JSON_SEG" | jq -e . >/dev/null 2>&1; then
+              JSON_SEG="$(printf '%s' "$JSON_SEG" | sed -nE 's/^.*([\\[{].*[\\}\\]]).*$/\\1/p')"
+            fi
+            printf '%s\n' "$JSON_SEG" > "${ARTDIR}/_as_line.json"
           fi
           [ -s "${ARTDIR}/_as_line.json" ] && echo "as_json=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
@@ -323,37 +313,18 @@ jobs:
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
 
-          jq -c 'def first_audioSpace:
-                   (.. | .audioSpace? // empty) | select(.!=null) | . | halt;
-                 . as $root
-                 | try first_audioSpace catch . ' "$AS_LINE" > "${ARTDIR}/_as_obj.json" || true
-
-          SRC="${ARTDIR}/_as_obj.json"
-          if ! jq -e type "${SRC}" >/dev/null 2>&1; then
-            SRC="$AS_LINE"
-          fi
-
+          # Pick the inner .audioSpace object when present, otherwise treat the whole file as the object.
           jq -r '
-            def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + h)} | select(.handle!=null and .handle!="" and .url!=null);
+            def mk(h; n): {handle:h, name:n, url: ("https://x.com/" + (h//""))} | select(.handle!=null and .handle!="" and .url!=null);
             def uniqh: unique_by(.handle);
-
+            (.audioSpace // .) as $a |
             {
-              host: (
-                [ .metadata?.creator_results?.result?.legacy? ]
-                | map(mk(.screen_name; .name)) | uniqh
-              ),
-              cohosts: (
-                ( .participants?.admins // [] )
-                | map(mk(.twitter_screen_name; .display_name)) | uniqh
-              ),
-              speakers: (
-                ( .participants?.speakers // [] )
-                | map(mk(.twitter_screen_name; .display_name)) | uniqh
-              )
+              host:    ( [ $a.metadata?.creator_results?.result?.legacy? ] | map(mk(.screen_name; .name)) | uniqh ),
+              cohosts: ( ( $a.participants?.admins   // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh ),
+              speakers:( ( $a.participants?.speakers // [] ) | map(mk(.twitter_screen_name; .display_name)) | uniqh )
             }
-          ' "$SRC" > "$OUT_JSON" || true
+          ' "$AS_LINE" > "$OUT_JSON"
 
-          # Surface the JSON path for upload whether or not HTML renders
           if [ -s "$OUT_JSON" ]; then
             echo "ATTN_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
             echo "attendees_json=${OUT_JSON}" >> "$GITHUB_OUTPUT"
@@ -361,7 +332,7 @@ jobs:
 
           if jq -e '([(.host//[]),(.cohosts//[]),(.speakers//[])] | add | length) > 0' "$OUT_JSON" >/dev/null; then
             jq -r '
-              def li: "    <li><a href=\"" + .url + "\" target=\"_blank\">" + ((.name // "") + " (@" + .handle + ")") + "</a></li>";
+              def li: "    <li><a href=\"" + (.url//"#") + "\" target=\"_blank\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               "<ul>\n" +
               (if (.host|length)>0 then "  <li><strong>Host</strong>\n  <ul>\n" + (.host|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
               (if (.cohosts|length)>0 then "  <li><strong>Co-hosts</strong>\n  <ul>\n" + (.cohosts|map(li)|join("\n")) + "\n  </ul>\n  </li>\n" else "" end) +
@@ -494,7 +465,6 @@ jobs:
           set -euxo pipefail
           CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
-            # Translate host path to container path
             REL_PATH="${CC_FILE#"${ARTDIR}"}"
             docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download${REL_PATH}" > "${ARTDIR}/${BASE}.vtt" || true
           fi
@@ -585,9 +555,7 @@ jobs:
         run: |
           {
             echo "### Space Worker Summary"
-            echo "- Space URL ${{
-              inputs.space_url
-            }}"
+            echo "- Space URL ${{ inputs.space_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ inputs.post_id }}"
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
