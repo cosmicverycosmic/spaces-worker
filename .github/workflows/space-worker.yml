@@ -4,54 +4,54 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X Twitter Space URL https://x.com/i/spaces/...
+        description: "X Twitter Space URL https://x.com/i/spaces/..."
         required: true
         type: string
       title:
-        description: Post title (fallback if no post id)
+        description: "Post title (fallback if no post id)"
         required: false
         type: string
         default: ""
       post_id:
-        description: Existing WP post id to patch (optional)
+        description: "Existing WP post id to patch (optional)"
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix folder, e.g. "spaces/2025/02" (empty → spaces/YYYY/MM)
+        description: "GCS prefix folder, e.g. spaces/2025/02 (empty → spaces/YYYY/MM)"
         required: false
         type: string
         default: ""
       make_public:
-        description: Set GCS objects to public
+        description: "Set GCS objects to public"
         required: false
         type: choice
         options: ["true", "false"]
         default: "true"
       do_transcript:
-        description: Generate transcript/VTT (Deepgram) when crawler captions unavailable
+        description: "Generate transcript/VTT (Deepgram) when crawler captions unavailable"
         required: false
         type: choice
         options: ["true", "false"]
         default: "true"
       wp_marker:
-        description: Opaque marker from WP (optional)
+        description: "Opaque marker from WP (optional)"
         required: false
         type: string
         default: ""
       space_id:
-        description: Space ID (e.g. 1kvJpyzZOOkxE). Auto-parsed from URL if blank
+        description: "Space ID (e.g. 1kvJpyzZOOkxE). Auto-parsed from URL if blank"
         required: false
         type: string
         default: ""
       mode:
-        description: Optional targeted mode
+        description: "Optional targeted mode"
         required: false
         type: choice
         options: ["", "transcript_only", "attendees_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only: URL of already-encoded MP3
+        description: "For transcript_only: URL of already-encoded MP3"
         required: false
         type: string
         default: ""
@@ -235,7 +235,6 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # -------------------- CRAWLER (always for "" or attendees_only) --------------------
       - name: Notify WP: crawler starting
         if: ${{ (inputs.mode != 'transcript_only') && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
@@ -264,7 +263,6 @@ jobs:
 
           set +e
           if [ "${{ inputs.mode }}" = "attendees_only" ]; then
-            # short run just to capture metadata lines
             timeout 90s docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
@@ -289,7 +287,6 @@ jobs:
           set -e
           echo "crawler_exit=$RC"
 
-          # Try to locate an audio file (only for full mode)
           if [ "${{ inputs.mode }}" != "attendees_only" ]; then
             AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
             if [ -n "$AUDIO_FILE" ]; then
@@ -298,7 +295,6 @@ jobs:
             fi
           fi
 
-          # Captions (if any)
           CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
             set +e
@@ -313,7 +309,6 @@ jobs:
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
           fi
 
-      # -------------------- EXTRACT ATTENDEES FROM CRAWLER OUTPUT --------------------
       - name: Extract attendees (GraphQL from crawler logs)
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' }}
@@ -345,11 +340,8 @@ def read(p):
 
 blob = (read(log_std) + "\n" + read(log_err))
 
-# Try to carve out the JSON object that contains "audioSpace"
-# Strategy: find the nearest '{' before the first "audioSpace" and brace-match to extract a valid JSON object
 m = re.search(r'\{[^{}]*"audioSpace"\s*:', blob)
 if not m:
-    # Fallback: try a more permissive search
     m = re.search(r'(\{.*"participants"\s*:.*\})', blob, re.DOTALL)
     start = m.start(1) if m else -1
 else:
@@ -369,8 +361,6 @@ if start >= 0:
                 break
     if end > start:
         chunk = blob[start:end]
-        # Remove trailing log ornaments if any
-        # Try a few parses
         for candidate in [chunk, chunk.replace('\n',' ')]:
             try:
                 obj = json.loads(candidate)
@@ -378,9 +368,7 @@ if start >= 0:
             except Exception:
                 pass
 
-# If we couldn't parse, bail quietly
 if not obj:
-    # Write nothing; shell will handle empty
     sys.exit(0)
 
 space = obj.get("audioSpace") or obj
@@ -393,7 +381,6 @@ def extract_people(arr):
     for a in arr:
         handle = a.get("twitter_screen_name")
         name = a.get("display_name")
-        # try nested
         if not handle:
             ur = (a.get("user_results") or {}).get("result") or {}
             leg = ur.get("legacy") or {}
@@ -402,7 +389,6 @@ def extract_people(arr):
         if handle:
             url = f"https://x.com/{handle}"
             people.append({"name": name or handle, "handle": handle, "url": url})
-    # de-dup by handle, keep first
     seen = set()
     uniq = []
     for p in people:
@@ -415,7 +401,6 @@ admins   = extract_people(participants.get("admins") or [])
 speakers = extract_people(participants.get("speakers") or [])
 listeners= extract_people(participants.get("listeners") or [])
 
-# Host/co-hosts heuristic: first admin = host, rest = co-hosts
 host = admins[:1]
 cohosts = admins[1:]
 
@@ -423,14 +408,12 @@ data = {
     "host": host,
     "cohosts": cohosts,
     "speakers": speakers,
-    "listeners_sample": listeners[:50]  # avoid giant dumps
+    "listeners_sample": listeners[:50]
 }
 
-# Write JSON
 with open(attn_json, "w") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
 
-# Build HTML only if we have at least one person
 def li(p): return f'<li><a href="{p["url"]}" target="_blank">{p["name"]} (@{p["handle"]})</a></li>'
 
 sections = []
@@ -441,15 +424,11 @@ if cohosts:
 if speakers:
     sections.append("<li><strong>Speakers</strong><ul>" + "".join(li(p) for p in speakers) + "</ul></li>")
 
-html = ""
-if sections:
-    html = "<ul>" + "".join(sections) + "</ul>"
-
+html = "<ul>" + "".join(sections) + "</ul>" if sections else ""
 if html:
     with open(attn_html, "w") as f:
         f.write(html)
 PY
-          # Announce outputs
           if [ -s "$ATTN_HTML" ]; then
             echo "attendees_html=$ATTN_HTML" >> "$GITHUB_OUTPUT"
             echo "ATTN_HTML=$ATTN_HTML" >> "$GITHUB_ENV"
@@ -459,7 +438,7 @@ PY
           fi
 
       - name: Upload attendees HTML (if present)
-        id: upload_attendees
+        id: up_attendees
         shell: bash
         run: |
           set -euxo pipefail
@@ -474,23 +453,7 @@ PY
           echo "raw_attendees_url=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "proxy_attendees_url=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Patch WP with attendees (inline HTML and/or URL)
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
-        shell: bash
-        env:
-          AHTML: ${{ steps.attendees.outputs.attendees_html }}
-          AURL:  ${{ steps.upload_attendees.outputs.proxy_attendees_url }}
-        run: |
-          set -euo pipefail
-          BODY="$(jq -n --arg pid "${{ inputs.post_id }}" --arg attendees_html "$AHTML" --arg attendees_url "$AURL" '
-            { post_id: ($pid|tonumber), status:"processing", progress:85 }
-            + (if ($attendees_html|length)>0 then { attendees_html:$attendees_html } else {} end)
-            + (if ($attendees_url|length)>0  then { artifacts: { attendees_html_url:$attendees_url } } else {} end)
-          ')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "${BODY}"
-
-      # -------------------- AUDIO / TRANSCRIPT PIPELINE (full mode only) --------------------
+      # ---------------- AUDIO / TRANSCRIPT (full mode only) ----------------
       - name: Fallback download (yt-dlp) if crawler produced no audio
         if: ${{ inputs.mode == '' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') }}
         shell: bash
@@ -532,6 +495,7 @@ PY
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
       - name: Upload MP3 to GCS
+        id: up_mp3
         if: ${{ inputs.mode == '' && env.MP3_PATH != '' }}
         shell: bash
         run: |
@@ -547,6 +511,7 @@ PY
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Upload VTT (if crawler captions)
+        id: up_vtt
         if: ${{ inputs.mode == '' && env.VTT_PATH != '' }}
         shell: bash
         run: |
@@ -565,18 +530,21 @@ PY
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
-          AURL: ${{ steps.upload_attendees.outputs.proxy_attendees_url }}
-          MP3:  ${{ steps.upload_attendees.outcome && steps.upload_attendees.outputs.nothing == 'nope' && steps.upload_attendees.outputs.nothing || '' }}
+          AURL_PROXY: ${{ steps.up_attendees.outputs.proxy_attendees_url }}
+          AURL_RAW:   ${{ steps.up_attendees.outputs.raw_attendees_url }}
+          MP3_PROXY:  ${{ steps.up_mp3.outputs.audio_proxy }}
+          MP3_RAW:    ${{ steps.up_mp3.outputs.audio_raw }}
+          VTT_PROXY:  ${{ steps.up_vtt.outputs.vtt_proxy }}
+          VTT_RAW:    ${{ steps.up_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
-          # Build artifacts object from any known URLs
           ART='{}'
-          [ -n "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" ] && ART="$(jq -n --arg u "${{ steps.upload_attendees.outputs.proxy_attendees_url }}" '{attendees_html_url:$u}')" || true
-          [ -n "${{ steps.upload_attendees.outputs.raw_attendees_url }}" ] && ART="$(jq -n --arg u "${{ steps.upload_attendees.outputs.raw_attendees_url }}" --argjson prev "${ART}" '$prev + {attendees_html_url_raw:$u}')" || true
-          [ -n "${{ steps.Upload_MP3.outputs.audio_proxy || '' }}" ] && ART="$(jq -n --arg u "${{ steps.Upload_MP3.outputs.audio_proxy }}" --argjson prev "${ART}" '$prev + {audio_url:$u}')" || true
-          [ -n "${{ steps.Upload_MP3.outputs.audio_raw || '' }}" ] && ART="$(jq -n --arg u "${{ steps.Upload_MP3.outputs.audio_raw }}" --argjson prev "${ART}" '$prev + {audio_url_raw:$u}')" || true
-          [ -n "${{ steps.Upload_VTT.outputs.vtt_proxy || '' }}" ] && ART="$(jq -n --arg u "${{ steps.Upload_VTT.outputs.vtt_proxy }}" --argjson prev "${ART}" '$prev + {vtt_url:$u}')" || true
-          [ -n "${{ steps.Upload_VTT.outputs.vtt_raw || '' }}" ] && ART="$(jq -n --arg u "${{ steps.Upload_VTT.outputs.vtt_raw }}" --argjson prev "${ART}" '$prev + {vtt_url_raw:$u}')" || true
+          [ -n "${AURL_PROXY:-}" ] && ART="$(jq -n --arg u "${AURL_PROXY}" --argjson prev "${ART}" '$prev + {attendees_html_url:$u}')" || true
+          [ -n "${AURL_RAW:-}" ]   && ART="$(jq -n --arg u "${AURL_RAW}"   --argjson prev "${ART}" '$prev + {attendees_html_url_raw:$u}')" || true
+          [ -n "${MP3_PROXY:-}" ]  && ART="$(jq -n --arg u "${MP3_PROXY}"  --argjson prev "${ART}" '$prev + {audio_url:$u}')" || true
+          [ -n "${MP3_RAW:-}" ]    && ART="$(jq -n --arg u "${MP3_RAW}"    --argjson prev "${ART}" '$prev + {audio_url_raw:$u}')" || true
+          [ -n "${VTT_PROXY:-}" ]  && ART="$(jq -n --arg u "${VTT_PROXY}"  --argjson prev "${ART}" '$prev + {vtt_url:$u}')" || true
+          [ -n "${VTT_RAW:-}" ]    && ART="$(jq -n --arg u "${VTT_RAW}"    --argjson prev "${ART}" '$prev + {vtt_url_raw:$u}')" || true
 
           BODY="$(jq -n --arg pid "${{ inputs.post_id }}" --argjson artifacts "${ART}" '
             { post_id: ($pid|tonumber), status:"complete", progress:100 }
