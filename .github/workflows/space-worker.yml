@@ -362,6 +362,24 @@ jobs:
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           fi
 
+      - name: Validate VTT (must contain header and cues)
+        if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -s "$VTT_PATH" ]; then
+            echo "VTT empty; clearing"
+            echo "VTT_PATH=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          HDR="$(head -n1 "$VTT_PATH" || true)"
+          CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
+          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt 1 ]; then
+            echo "Invalid VTT (hdr=${HDR:-none} cues=${CUES}); removing and clearing"
+            rm -f "$VTT_PATH" || true
+            echo "VTT_PATH=" >> "$GITHUB_ENV"
+          fi
+
       - name: VTT via Deepgram (fallback)
         id: deepgram
         if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
@@ -375,6 +393,52 @@ jobs:
             "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
             -o "${ARTDIR}/${BASE}.vtt" || true
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+
+      - name: Validate Deepgram VTT
+        if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH != '' && (steps.deepgram.outcome == 'success' || steps.deepgram.outcome == 'skipped') }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "$VTT_PATH" ]; then
+            HDR="$(head -n1 "$VTT_PATH" || true)"
+            CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
+            if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt 1 ]; then
+              echo "Deepgram VTT invalid or empty; clearing VTT_PATH"
+              rm -f "$VTT_PATH" || true
+              echo "VTT_PATH=" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Build transcript text (from CC JSONL or VTT)
+        id: transcript
+        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT_TXT="${ARTDIR}/${BASE}.txt"
+          rm -f "$OUT_TXT" || true
+
+          # Prefer CC JSONL textual dump if available (often cleaner than VTT)
+          CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
+          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
+            jq -s -r '
+              .[] | ( .text // .caption // .content // "" )
+              | gsub("\r";"")
+              | select(. != "")
+            ' "$CC_JSONL" > "$OUT_TXT" || true
+          fi
+
+          # If still empty, derive from VTT (strip timestamps/indices/headers)
+          if [ ! -s "$OUT_TXT" ] && [ -n "${VTT_PATH:-}" ] && [ -s "${VTT_PATH}" ]; then
+            awk 'BEGIN{skip=0} !/-->/ && $0!="WEBVTT" && $0!~/^[[:space:]]*NOTE/ && $0!~/^[0-9]+$/ {print}' "$VTT_PATH" \
+              | sed '/^[[:space:]]*$/d' > "$OUT_TXT" || true
+          fi
+
+          if [ -s "$OUT_TXT" ]; then
+            echo "TRANSCRIPT_PATH=${OUT_TXT}" >> "$GITHUB_ENV"
+          else
+            echo "No transcript text generated."
+          fi
 
       - name: Upload VTT to GCS
         id: upload_vtt
@@ -455,7 +519,9 @@ jobs:
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
 
-          BODY="$(jq -n \
+          # Read transcript file if present
+          TR_PATH="${TRANSCRIPT_PATH:-}"
+          BODY_BASE="$(jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
             --arg pid   "${PID}" \
@@ -472,10 +538,18 @@ jobs:
             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
           ')"
 
+          if [ -n "$TR_PATH" ] && [ -s "$TR_PATH" ]; then
+            jq -n --rawfile tr "$TR_PATH" \
+              --slurpfile base <(printf '%s' "$BODY_BASE") \
+              '$base[0] + {transcript: $tr}' > "${WORKDIR}/wp_register_body.json"
+          else
+            printf '%s' "$BODY_BASE" > "${WORKDIR}/wp_register_body.json"
+          fi
+
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            -d "$BODY" | jq -r .
+            -d "@${WORKDIR}/wp_register_body.json" | jq -r .
 
       - name: Patch WP — attendees only
         if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -518,6 +592,13 @@ jobs:
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
+            else
+              echo "- VTT       (none)"
+            fi
+            if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH:-}" ]; then
+              echo "- Transcript text: present (uploaded inline to WP)"
+            else
+              echo "- Transcript text: (none)"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees saved to WP (HTML)"
