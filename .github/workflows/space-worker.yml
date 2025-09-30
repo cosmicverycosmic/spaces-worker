@@ -420,7 +420,7 @@ jobs:
             TID="$(jq -r '(.audioSpace // .) | (.metadata.tweet_id // .metadata.discussionTweetId // .metadata.associated_tweet_id // empty)' "${ARTDIR}/_as_line_after_pipe.txt" || true)"
             [ "$TID" = "null" ] && TID=""
           fi
-          if [ -z "$TID" ]; then
+          if [ -z "$TID" ] && [ -n "${SID:-}" ]; then
             snscrape --jsonl twitter-search "url:x.com/i/spaces/${SID}" | jq -r 'select(.inReplyToTweetId==null) | .id' | head -n1 > "${WORKDIR}/tid.txt" || true
             [ -s "${WORKDIR}/tid.txt" ] && TID="$(cat "${WORKDIR}/tid.txt")"
           fi
@@ -434,49 +434,25 @@ jobs:
           fi
           echo "$TID" > "${ARTDIR}/purple_parent_tid.txt"
 
-          cat > "${WORKDIR}/scrape_links.py" <<'PY'
-import os, sys, json, re, html
-import subprocess
+          snscrape --jsonl twitter-search "conversation_id:${TID}" \
+            | jq -r '.outlinks[]?, .content' \
+            | grep -Eo 'https?://[^")'\''<>[:space:]]+' \
+            | sed -E 's/[).,;]+$//' \
+            | sort -fu > "${WORKDIR}/links.txt" || true
 
-ARTDIR = os.environ.get("ARTDIR",".")
-tid_path = os.path.join(ARTDIR, "purple_parent_tid.txt")
-if not os.path.exists(tid_path):
-    sys.exit(0)
-tid = open(tid_path,"r",encoding="utf-8").read().strip()
-if not tid:
-    sys.exit(0)
-
-links = set()
-
-cmd = ["snscrape","--jsonl","twitter-search", f"conversation_id:{tid}"]
-p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-for line in p.stdout:
-    try:
-        o=json.loads(line)
-    except Exception:
-        continue
-    outs = o.get("outlinks") or []
-    for u in outs:
-        if isinstance(u,str):
-            links.add(u)
-    txt = o.get("content","") or ""
-    for u in re.findall(r'https?://\\S+', txt):
-        u=u.rstrip(').,;\\'\"')
-        links.add(u)
-
-links = sorted({u for u in links if u.lower().startswith(("http://","https://"))})
-
-out = os.path.join(ARTDIR,"shared_links.html")
-with open(out,"w",encoding="utf-8") as f:
-    f.write("<ul>\\n")
-    for u in links:
-        esc = html.escape(u)
-        f.write(f'  <li><a href="{esc}" target="_blank" rel="noopener">{esc}</a></li>\\n')
-    f.write("</ul>\\n")
-print(out)
-PY
-          python3 "${WORKDIR}/scrape_links.py"
-          if [ -f "${ARTDIR}/shared_links.html" ]; then
+          if [ -s "${WORKDIR}/links.txt" ]; then
+            {
+              echo "<ul>"
+              while IFS= read -r u; do
+                esc="$u"
+                esc="${esc//&/&amp;}"
+                esc="${esc//\"/&quot;}"
+                esc="${esc//</&lt;}"
+                esc="${esc//>/"&gt;"}"
+                echo "  <li><a href=\"$esc\" target=\"_blank\" rel=\"noopener\">$esc</a></li>"
+              done < "${WORKDIR}/links.txt"
+              echo "</ul>"
+            } > "${ARTDIR}/shared_links.html"
             echo "LINKS_HTML=${ARTDIR}/shared_links.html" >> "$GITHUB_ENV"
           fi
 
