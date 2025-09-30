@@ -5,8 +5,9 @@ on:
     inputs:
       space_url:
         description: X or Twitter Space URL
-        required: true
+        required: false
         type: string
+        default: ""
       post_id:
         description: Existing WordPress post ID optional
         required: false
@@ -40,10 +41,10 @@ on:
         type: string
         default: ""
       mode:
-        description: Limit processing to a specific area
+        description: Limit processing to a specific area ('' = full)
         required: false
         type: choice
-        options: ["", "transcript_only", "attendees_only"]
+        options: ["", "transcript_only", "attendees_only", "watch"]
         default: ""
       existing_mp3_url:
         description: For transcript_only provide URL to existing MP3 to skip audio pipeline
@@ -55,13 +56,23 @@ on:
         required: false
         type: string
         default: ""
+      watch_users:
+        description: Comma-separated X usernames to monitor (used when mode=watch)
+        required: false
+        type: string
+        default: ""
+      watch_duration_minutes:
+        description: Minutes to monitor in watch mode (<= job timeout)
+        required: false
+        type: number
+        default: 170
 
 permissions:
   contents: read
   packages: read
 
 concurrency:
-  group: ${{ format('space-worker-{0}-{1}', github.ref, inputs.post_id != '' && inputs.post_id || github.run_id) }}
+  group: ${{ format('space-worker-{0}-{1}-{2}', github.ref, inputs.post_id != '' && inputs.post_id || github.run_id, inputs.watch_users) }}
   cancel-in-progress: false
 
 env:
@@ -134,10 +145,11 @@ jobs:
         run: |
           set -euxo pipefail
           SID="${INP_SPACE_ID}"
-          if [ -z "$SID" ]; then
+          if [ -z "$SID" ] && [ -n "$URL" ]; then
             SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
           fi
-          test -n "$SID" || { echo "Could not parse Space ID from URL"; exit 1; }
+          # In watch mode we may not have a specific SID yet
+          if [ -z "$SID" ]; then SID="watch"; fi
           BASE="space-$(date +%m-%d-%Y)-${SID}"
           echo "SPACE_ID=${SID}" >> "$GITHUB_ENV"
           echo "BASE=${BASE}"    >> "$GITHUB_ENV"
@@ -160,96 +172,30 @@ jobs:
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
 
-          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
-            AUTH=""
-          fi
-
+          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
 
-          OK=0
-          REASON="no_creds"
-
-          HAS_COOKIE=0
-          HAS_BEARER=0
-          [ -n "$AT" ] && [ -n "$CT" ] && HAS_COOKIE=1 || true
-          [ -n "$AUTH" ] && HAS_BEARER=1 || true
-
-          if [ "$HAS_COOKIE" -eq 1 ] || [ "$HAS_BEARER" -eq 1 ]; then
-            OK=1
-            REASON="creds_present"
-          fi
-
-          mkdir -p "${ARTDIR}"
-          BASEH=(-H "User-Agent: Mozilla/5.0" -H "Accept: application/json, text/plain, */*" -H "Referer: https://x.com/i/spaces/${SPACE_ID:-home}")
-
-          if [ "$HAS_COOKIE" -eq 1 ] && [ "$HAS_BEARER" -eq 1 ]; then
-            CVAL="auth_token=${AT}; ct0=${CT}"
-            HTTP=$(curl -sS -o "${ARTDIR}/x_participants_cookie.json" -w "%{http_code}" \
-              "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-              "${BASEH[@]}" \
-              -H "Authorization: ${AUTH}" \
-              -H "x-csrf-token: ${CT}" \
-              -H "Cookie: ${CVAL}" \
-              -H "x-twitter-active-user: yes" \
-              -H "x-twitter-client-language: en" \
-              -H "x-twitter-auth-type: OAuth2Session" || echo 000)
-            echo "diag_participants_cookie_http=${HTTP}" >> "$GITHUB_OUTPUT"
-          fi
-
-          if [ "$HAS_BEARER" -eq 1 ]; then
-            GHTTP=$(curl -sS -o "${ARTDIR}/x_guest.json" -w "%{http_code}" \
-              -X POST "https://api.twitter.com/1.1/guest/activate.json" \
-              -H "Authorization: ${AUTH}" \
-              -H "Content-Type: application/json" \
-              -d '{}' || echo 000)
-            echo "diag_guest_activate_http=${GHTTP}" >> "$GITHUB_OUTPUT"
-            if [ "$OK" -ne 1 ] && [ "$GHTTP" = "200" ]; then
-              OK=1
-              REASON="guest_ok"
-            fi
-            if [ "$GHTTP" = "200" ]; then
-              GUEST=$(jq -r '.guest_token // empty' "${ARTDIR}/x_guest.json" 2>/dev/null || true)
-              if [ -n "$GUEST" ]; then
-                PHTTP=$(curl -sS -o "${ARTDIR}/x_participants_guest.json" -w "%{http_code}" \
-                  "https://x.com/i/api/spaces/${SPACE_ID}/participants" \
-                  "${BASEH[@]}" \
-                  -H "Authorization: ${AUTH}" \
-                  -H "x-guest-token: ${GUEST}" \
-                  -H "x-twitter-active-user: yes" \
-                  -H "x-twitter-client-language: en" || echo 000)
-                echo "diag_participants_guest_http=${PHTTP}" >> "$GITHUB_OUTPUT"
-              fi
-            fi
-          fi
-
-          # Diagnostic public peek
-          if [ "$OK" -ne 1 ]; then
-            for PEEK in \
-              "https://x.com/i/spaces/${SPACE_ID}/peek" \
-              "https://twitter.com/i/spaces/${SPACE_ID}/peek"
-            do
-              PHTTP=$(curl -sS -o "${ARTDIR}/x_peek.json" -w "%{http_code}" "$PEEK" -H "User-Agent: Mozilla/5.0" -H "Accept: application/json" || echo 000)
-              echo "diag_peek_http=${PHTTP}" >> "$GITHUB_OUTPUT"
-              if [ "$PHTTP" = "200" ]; then
-                OK=1
-                REASON="public_ok"
-                break
-              fi
-            done
-          fi
+          OK=0; REASON="no_creds"
+          [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
+          [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
 
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      - name: Run crawler (attendees + audio + captions first)
+      # ——————————————————————————————————————————————
+      # CRAWLER-FIRST: attendees, audio, captions
+      # ——————————————————————————————————————————————
+      - name: Run crawler (by id or watch users) for attendees/audio/captions
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
+          WATCH_USERS: ${{ inputs.watch_users }}
+          WATCH_MIN: ${{ inputs.watch_duration_minutes }}
         run: |
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
@@ -259,48 +205,65 @@ jobs:
           LOG_ERR="${ARTDIR}/logs/crawler_${SID}.err.log"
 
           set +e
-          timeout 12m docker run --rm \
-            -e TWITTER_AUTHORIZATION \
-            -e TWITTER_AUTH_TOKEN \
-            -e TWITTER_CSRF_TOKEN \
-            -v "${ARTDIR}:/app/download" \
-            -v "${ARTDIR}/logs:/app/logs" \
-            ghcr.io/hitomarukonpaku/twspace-crawler:latest \
-            --id "${SID}" --force > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
+          if [ "${{ inputs.mode }}" = "watch" ] && [ -n "${WATCH_USERS:-}" ]; then
+            # Monitor users; job-level timeout still applies
+            timeout "${WATCH_MIN}m" docker run --rm \
+              -e TWITTER_AUTHORIZATION \
+              -e TWITTER_AUTH_TOKEN \
+              -e TWITTER_CSRF_TOKEN \
+              -v "${ARTDIR}:/app/download" \
+              -v "${ARTDIR}/logs:/app/logs" \
+              ghcr.io/hitomarukonpaku/twspace-crawler:latest \
+              --user "${WATCH_USERS}" > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
+          else
+            # Process a single space id
+            timeout 20m docker run --rm \
+              -e TWITTER_AUTHORIZATION \
+              -e TWITTER_AUTH_TOKEN \
+              -e TWITTER_CSRF_TOKEN \
+              -v "${ARTDIR}:/app/download" \
+              -v "${ARTDIR}/logs:/app/logs" \
+              ghcr.io/hitomarukonpaku/twspace-crawler:latest \
+              --id "${SID}" --force > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
+          fi
           RC=$?
           set -e
           echo "crawler_exit=${RC}"
 
-          # AUDIO from crawler
-          AUDIO_FILE="$(grep -hEo '"/app/download[^"]+\.(m4a|mp3|mp4|aac|webm|ogg|wav|ts)"' "$LOG_STD" "$LOG_ERR" | tr -d '"' | sed "s|^/app/download|$ARTDIR|" | tail -n1 || true)"
-          if [[ -z "${AUDIO_FILE:-}" || ! -f "$AUDIO_FILE" ]]; then
-            AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-          fi
-          if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE:-}" ]; then
+          # Pick newest audio-like file created by crawler
+          AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+          if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Attendees JSON line (after the pipe)
-          RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
+          # Extract the LAST audioSpace blob from logs (works in watch mode too)
+          RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
-            RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
+            RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           fi
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
             printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line_after_pipe.txt" || true
+            [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
           fi
           [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
 
-          # CAPTIONS from crawler -> VTT (correct subcommand)
-          CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
-          if [ -n "$CC_FILE" ]; then
-            REL_PATH="${CC_FILE#"${ARTDIR}"}"
-            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc vtt "/app/download${REL_PATH}" > "${ARTDIR}/${BASE}.vtt" || true
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+          # Prefer any VTT the crawler may have already produced
+          CRAWLER_VTT="$(find "${ARTDIR}" -type f \( -iname '*.vtt' -o -iname '*.webvtt' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+          if [ -n "${CRAWLER_VTT:-}" ] && [ -s "${CRAWLER_VTT}" ]; then
+            cp "${CRAWLER_VTT}" "${ARTDIR}/${BASE}.vtt"
+            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+          else
+            # If JSONL captions exist, run official extractor to plaintext (best-effort)
+            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
+            if [ -n "${CC_JSONL:-}" ]; then
+              docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc e "/app/download${CC_JSONL#"${ARTDIR}"}" || true
+              # The extractor usually creates a "CC.txt" alongside. We keep Deepgram as fallback for proper VTT.
+            fi
           fi
 
-      - name: Build attendees HTML (save contents only)
+      - name: Build attendees JSON and HTML from crawler logs
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
@@ -311,31 +274,25 @@ jobs:
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
 
-          if jq -e . "${CAND}" >/dev/null 2>&1; then
-            cp "${CAND}" "${ARTDIR}/_as_line.json"
-          fi
+          jq -r '
+            def mkp:
+              { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
+                name:   (.display_name       // .user_results?.result?.legacy?.name)
+              }
+              | select(.handle!=null and .handle!="")
+              | . + { url: ("https://x.com/" + .handle) };
 
-          if [ -s "${ARTDIR}/_as_line.json" ]; then
-            jq -r '
-              def mkp:
-                { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
-                  name:   (.display_name       // .user_results?.result?.legacy?.name)
-                }
-                | select(.handle!=null and .handle!="")
-                | . + { url: ("https://x.com/" + .handle) };
+            (.audioSpace // .) as $a
+            | ($a.metadata?.creator_results?.result?.legacy?) as $h
+            | ($h.screen_name // empty) as $H
+            | {
+                host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
+                cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
+                speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
+              }
+          ' "${CAND}" > "$OUT_JSON" || true
 
-              (.audioSpace // .) as $a
-              | ($a.metadata?.creator_results?.result?.legacy?) as $h
-              | ($h.screen_name // empty) as $H
-              | {
-                  host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
-                  cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
-                  speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
-                }
-            ' "${ARTDIR}/_as_line.json" > "$OUT_JSON" || true
-          fi
-
-          if [ -s "$OUT_JSON" ] && jq -e . "$OUT_JSON" >/dev/null 2>&1; then
+          if [ -s "$OUT_JSON" ]; then
             jq -r '
               def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
@@ -343,16 +300,14 @@ jobs:
                 then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
                 else ""
                 end;
-
               . as $d
               | section("Host"; $d.host)
               + section( (if ($d.cohosts|length)==1 then "Co-host" else "Co-hosts" end); $d.cohosts)
               + section("Speakers"; $d.speakers)
-            ' "$OUT_JSON" > "$OUT_HTML" || true
-
+            ' "$OUT_JSON" > "$OUT_HTML"
             if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
-              echo "ATTENDEES_OK=1"        >> "$GITHUB_ENV"
+              echo "ATTENDEES_OK=1"       >> "$GITHUB_ENV"
             fi
           fi
 
@@ -370,8 +325,9 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: FALLBACK audio via yt-dlp (only if crawler audio missing)
-        if: ${{ inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && inputs.existing_mp3_url == '' }}
+      # Fallbacks only if crawler didn't give us audio
+      - name: Fallback download via yt-dlp if no crawler audio
+        if: ${{ inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && inputs.existing_mp3_url == '' && inputs.space_url != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -434,7 +390,16 @@ jobs:
           echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: FALLBACK captions via Deepgram (only if crawler captions missing)
+      # Prefer crawler captions; Deepgram only if none found
+      - name: Use captions from crawler if present
+        id: crawl_cc
+        if: ${{ inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+
+      - name: VTT via Deepgram when needed (fallback)
         id: deepgram
         if: ${{ inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
@@ -464,7 +429,7 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Patch WP (save attendees HTML into attendees field)
+      - name: Patch WP (save attendees HTML into `attendees`; keep other fields)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -473,17 +438,16 @@ jobs:
           VTT: ${{ steps.upload_vtt.outputs.vtt_proxy }}
         run: |
           set -euo pipefail
-          AT_HTML_MIN=""
+          AT_HTML=""
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            # Minify to one line to avoid newline escaping weirdness
-            AT_HTML_MIN="$(tr -d '\r' < "${ATTN_HTML}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')"
+            AT_HTML="$(cat "${ATTN_HTML}")"
           fi
 
           BODY="$(jq -n \
             --arg pid    "${PID}" \
             --arg aud    "${AUD}" \
             --arg vtt    "${VTT}" \
-            --arg athtml "${AT_HTML_MIN}" '
+            --arg athtml "${AT_HTML}" '
             {
               post_id: ($pid|tonumber),
               status: "complete",
@@ -491,7 +455,7 @@ jobs:
             }
             + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
             + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
-            + (if ($athtml|length)>0 then {attendees_html:$athtml, attendees:$athtml} else {} end)
+            + (if ($athtml|length)>0 then {attendees:$athtml} else {} end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
@@ -517,7 +481,10 @@ jobs:
               echo "- Attendees saved to WP (HTML)"
             else
               echo "- Attendees not extracted"
-            fi>
+            fi
             echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
             echo "- Mode      ${{ inputs.mode }}"
+            if [ "${{ inputs.mode }}" = "watch" ]; then
+              echo "- Watch users: ${{ inputs.watch_users }} (for ${{ inputs.watch_duration_minutes }}m)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
