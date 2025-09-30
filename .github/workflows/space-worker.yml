@@ -35,11 +35,6 @@ on:
         type: choice
         options: ["true","false"]
         default: "true"
-      space_id:
-        description: Space ID will be parsed from URL when blank
-        required: false
-        type: string
-        default: ""
       mode:
         description: Limit processing to a specific area ('' = full)
         required: false
@@ -47,17 +42,12 @@ on:
         options: ["", "transcript_only", "attendees_only", "watch"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only provide URL to existing MP3 to skip audio pipeline
-        required: false
-        type: string
-        default: ""
-      wp_marker:
-        description: Internal correlation marker from WP (ignored by the worker)
+        description: For transcript_only provide URL to existing MP3
         required: false
         type: string
         default: ""
       watch_users:
-        description: Comma-separated X usernames to monitor (used when mode=watch)
+        description: Comma-separated X usernames to monitor (mode=watch)
         required: false
         type: string
         default: ""
@@ -89,13 +79,12 @@ jobs:
     name: Process Space
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    # Move concurrency to the job and reference github.event.inputs (safe):
     concurrency:
       group: ${{ format('space-worker-{0}-{1}-{2}', github.ref, github.event.inputs.post_id != '' && github.event.inputs.post_id || github.run_id, github.event.inputs.watch_users) }}
       cancel-in-progress: false
 
     steps:
-      - name: Checkout (safe default)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Notify WP — queued
@@ -113,7 +102,7 @@ jobs:
                        --argjson progress 1 \
                        '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Install deps (ffmpeg, jq, yt-dlp, gcloud)
+      - name: Install deps
         shell: bash
         run: |
           set -euxo pipefail
@@ -124,7 +113,6 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # GHCR login isn't required for public pulls; don't fail the job if login is restricted
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -144,12 +132,11 @@ jobs:
         id: ids
         shell: bash
         env:
-          INP_SPACE_ID: ${{ github.event.inputs.space_id }}
-          URL:          ${{ github.event.inputs.space_url }}
+          URL: ${{ github.event.inputs.space_url }}
         run: |
           set -euxo pipefail
-          SID="${INP_SPACE_ID}"
-          if [ -z "$SID" ] && [ -n "$URL" ]; then
+          SID=""
+          if [ -n "$URL" ]; then
             SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
           fi
           [ -z "$SID" ] && SID="watch"
@@ -188,10 +175,7 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # ——————————————————————————————————————————————
-      # CRAWLER-FIRST: attendees, audio, captions
-      # ——————————————————————————————————————————————
-      - name: Run crawler (by id or watch users) for attendees/audio/captions
+      - name: Run crawler (id or watch users)
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' }}
         shell: bash
@@ -273,7 +257,7 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: Fallback download via yt-dlp if no crawler audio
+      - name: Fallback download via yt-dlp
         if: ${{ github.event.inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
@@ -423,7 +407,6 @@ jobs:
             fi
           fi
 
-      # FINALIZE — use the plugin's /register endpoint so audio/VTT attach properly
       - name: Register assets in WP (finalize)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
         shell: bash
@@ -434,13 +417,11 @@ jobs:
           TTL:  ${{ github.event.inputs.title }}
         run: |
           set -euo pipefail
-
           AT_HTML=""
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
 
-          # Build body for /register
           BODY="$(jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
@@ -463,7 +444,6 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
             -d "$BODY" | jq -r .
 
-      # Attendees-only patch (no audio pipeline)
       - name: Patch WP — attendees only
         if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
