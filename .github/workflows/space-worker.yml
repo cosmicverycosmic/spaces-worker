@@ -244,7 +244,7 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      - name: Run crawler for attendees, audio, and captions (primary source)
+      - name: Run crawler (attendees + audio + captions first)
         id: crawl
         if: ${{ steps.x_preflight.outputs.ok == '1' }}
         shell: bash
@@ -271,7 +271,7 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          # CRAWLER AUDIO (primary)
+          # AUDIO from crawler
           AUDIO_FILE="$(grep -hEo '"/app/download[^"]+\.(m4a|mp3|mp4|aac|webm|ogg|wav|ts)"' "$LOG_STD" "$LOG_ERR" | tr -d '"' | sed "s|^/app/download|$ARTDIR|" | tail -n1 || true)"
           if [[ -z "${AUDIO_FILE:-}" || ! -f "$AUDIO_FILE" ]]; then
             AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
@@ -281,7 +281,7 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Extract attendees JSON (already clean JSON after the pipe)
+          # Attendees JSON line (after the pipe)
           RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
@@ -292,11 +292,11 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
 
-          # CRAWLER CAPTIONS (primary)
-          CC_FILE="$(find "${ARTDIR}" -type f -iname '*cc.jsonl' -o -iname '*caption*.jsonl' | head -n1 || true)"
+          # CAPTIONS from crawler -> VTT (correct subcommand)
+          CC_FILE="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
             REL_PATH="${CC_FILE#"${ARTDIR}"}"
-            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download${REL_PATH}" > "${ARTDIR}/${BASE}.vtt" || true
+            docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc vtt "/app/download${REL_PATH}" > "${ARTDIR}/${BASE}.vtt" || true
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           fi
 
@@ -370,7 +370,7 @@ jobs:
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
-      - name: FALLBACK audio download via yt-dlp (only if crawler audio missing)
+      - name: FALLBACK audio via yt-dlp (only if crawler audio missing)
         if: ${{ inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && inputs.existing_mp3_url == '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
@@ -464,7 +464,7 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Patch WP (save attendees HTML to attendees field only)
+      - name: Patch WP (save attendees HTML into attendees field)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -473,16 +473,17 @@ jobs:
           VTT: ${{ steps.upload_vtt.outputs.vtt_proxy }}
         run: |
           set -euo pipefail
-          AT_HTML=""
+          AT_HTML_MIN=""
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            AT_HTML="$(cat "${ATTN_HTML}")"
+            # Minify to one line to avoid newline escaping weirdness
+            AT_HTML_MIN="$(tr -d '\r' < "${ATTN_HTML}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')"
           fi
 
           BODY="$(jq -n \
             --arg pid    "${PID}" \
             --arg aud    "${AUD}" \
             --arg vtt    "${VTT}" \
-            --arg athtml "${AT_HTML}" '
+            --arg athtml "${AT_HTML_MIN}" '
             {
               post_id: ($pid|tonumber),
               status: "complete",
@@ -490,7 +491,7 @@ jobs:
             }
             + (if ($aud|length)>0 then {audio_url:$aud} else {} end)
             + (if ($vtt|length)>0 then {vtt_url:$vtt, has_transcript:true} else {} end)
-            + (if ($athtml|length)>0 then {attendees:$athtml} else {} end)
+            + (if ($athtml|length)>0 then {attendees_html:$athtml, attendees:$athtml} else {} end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
@@ -516,7 +517,7 @@ jobs:
               echo "- Attendees saved to WP (HTML)"
             else
               echo "- Attendees not extracted"
-            fi
+            fi>
             echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
             echo "- Mode      ${{ inputs.mode }}"
           } >> "$GITHUB_STEP_SUMMARY"
