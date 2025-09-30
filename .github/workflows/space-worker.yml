@@ -109,7 +109,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          python3 -m pip install --no-cache-dir yt-dlp snscrape
+          python3 -m pip install --no-cache-dir yt-dlp
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
@@ -215,12 +215,14 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
+          # Prefer crawler audio-like artifacts
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
+          # Extract latest audioSpace JSON chunk from logs
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -232,11 +234,13 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
 
+          # If crawler already produced VTT, keep it
           CRAWLER_VTT="$(find "${ARTDIR}" -type f \( -iname '*.vtt' -o -iname '*.webvtt' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${CRAWLER_VTT:-}" ] && [ -s "${CRAWLER_VTT}" ]; then
             cp "${CRAWLER_VTT}" "${ARTDIR}/${BASE}.vtt"
             echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
           else
+            # If captions JSONL exist, extract plaintext now; VTT conversion handled in a later step
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
             if [ -n "${CC_JSONL:-}" ]; then
               docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc e "/app/download${CC_JSONL#"${ARTDIR}"}" || true
@@ -296,7 +300,7 @@ jobs:
           set -euxo pipefail
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/pass1.log" || true
-          awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+          awk '/^{/{f=1} f{print} /}/{f=0}/' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
             I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON"); LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
@@ -328,6 +332,35 @@ jobs:
         run: |
           set -euxo pipefail
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+
+      - name: Convert crawler JSONL captions to VTT
+        if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH == '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
+          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
+            jq -s -r '
+              def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+              def ms3(n): (1000 + (n%1000)|tostring)[1:4];
+              def ts(ms):
+                ( (ms/3600000)|floor ) as $h |
+                ( (ms%3600000)/60000|floor ) as $m |
+                ( (ms%60000)/1000|floor ) as $s |
+                ( ms%1000 ) as $ms |
+                ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
+              "WEBVTT", "",
+              ( .[]
+                | {s: (.startMs // .start_ms // .start // .offsetMs // 0),
+                   d: (.durationMs // .duration_ms // .duration // .lenMs // 0),
+                   t: (.text // .caption // .content // "")}
+                | .e = (.s + .d)
+                | select(.t != "")
+                | (ts(.s) + " --> " + ts(.e)), (.t | gsub("\r";"")), ""
+              )
+            ' "$CC_JSONL" > "${ARTDIR}/${BASE}.vtt" || true
+            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+          fi
 
       - name: VTT via Deepgram (fallback)
         id: deepgram
@@ -407,55 +440,6 @@ jobs:
             fi
           fi
 
-      - name: Harvest Purple Pill reply links
-        id: links
-        shell: bash
-        env:
-          SID: ${{ steps.ids.outputs.space_id }}
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
-          TID=""
-          if [ -s "${ARTDIR}/_as_line_after_pipe.txt" ]; then
-            TID="$(jq -r '(.audioSpace // .) | (.metadata.tweet_id // .metadata.discussionTweetId // .metadata.associated_tweet_id // empty)' "${ARTDIR}/_as_line_after_pipe.txt" || true)"
-            [ "$TID" = "null" ] && TID=""
-          fi
-          if [ -z "$TID" ] && [ -n "${SID:-}" ]; then
-            snscrape --jsonl twitter-search "url:x.com/i/spaces/${SID}" | jq -r 'select(.inReplyToTweetId==null) | .id' | head -n1 > "${WORKDIR}/tid.txt" || true
-            [ -s "${WORKDIR}/tid.txt" ] && TID="$(cat "${WORKDIR}/tid.txt")"
-          fi
-          if [ -z "$TID" ]; then
-            snscrape --jsonl twitter-search "x.com/i/spaces/${SID}" | jq -r 'select(.inReplyToTweetId==null) | .id' | head -n1 > "${WORKDIR}/tid2.txt" || true
-            [ -s "${WORKDIR}/tid2.txt" ] && TID="$(cat "${WORKDIR}/tid2.txt")"
-          fi
-          if [ -z "$TID" ]; then
-            echo "No parent tweet id found"
-            exit 0
-          fi
-          echo "$TID" > "${ARTDIR}/purple_parent_tid.txt"
-
-          snscrape --jsonl twitter-search "conversation_id:${TID}" \
-            | jq -r '.outlinks[]?, .content' \
-            | grep -Eo 'https?://[^")'\''<>[:space:]]+' \
-            | sed -E 's/[).,;]+$//' \
-            | sort -fu > "${WORKDIR}/links.txt" || true
-
-          if [ -s "${WORKDIR}/links.txt" ]; then
-            {
-              echo "<ul>"
-              while IFS= read -r u; do
-                esc="$u"
-                esc="${esc//&/&amp;}"
-                esc="${esc//\"/&quot;}"
-                esc="${esc//</&lt;}"
-                esc="${esc//>/"&gt;"}"
-                echo "  <li><a href=\"$esc\" target=\"_blank\" rel=\"noopener\">$esc</a></li>"
-              done < "${WORKDIR}/links.txt"
-              echo "</ul>"
-            } > "${ARTDIR}/shared_links.html"
-            echo "LINKS_HTML=${ARTDIR}/shared_links.html" >> "$GITHUB_ENV"
-          fi
-
       - name: Register assets in WP (finalize)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
         shell: bash
@@ -515,26 +499,6 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
             -d "$BODY" | jq -r .
 
-      - name: Patch WP — shared links
-        if: ${{ env.LINKS_HTML != '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          LHTML=""
-          if [ -n "${LINKS_HTML:-}" ] && [ -s "${LINKS_HTML:-}" ]; then
-            LHTML="$(cat "${LINKS_HTML}")"
-          fi
-          [ -z "$LHTML" ] && exit 0
-          BODY="$(jq -n \
-            --arg pid "${{ github.event.inputs.post_id }}" \
-            --arg lhtml "${LHTML}" \
-            '{post_id: ($pid|tonumber), shared_links_html: $lhtml}'
-          )"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
-            -d "$BODY" | jq -r .
-
       - name: Summary
         shell: bash
         env:
@@ -559,11 +523,6 @@ jobs:
               echo "- Attendees saved to WP (HTML)"
             else
               echo "- Attendees not extracted"
-            fi
-            if [ -n "${LINKS_HTML:-}" ]; then
-              echo "- Purple Pill reply links captured and patched to WP"
-            else
-              echo "- No Purple Pill links captured"
             fi
             echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
             echo "- Mode      ${{ github.event.inputs.mode }}"
