@@ -122,6 +122,15 @@ jobs:
           # Watch controls (used when mode=watch)
           echo "WATCH_USERS=$(jq -r '.watch_users // ""' "$WORKDIR/inputs.json" 2>/dev/null)"             >> "$GITHUB_ENV"
           echo "WATCH_MIN=$(jq -r '.watch_duration_minutes // ""' "$WORKDIR/inputs.json" 2>/dev/null)"    >> "$GITHUB_ENV"
+          # Optional radio polish controls (defaults on)
+          rp="$(jq -r '.radio_enhance // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          mm="$(jq -r '.mix_mono      // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          echo "RADIO_ENHANCE=$rp"                                  >> "$GITHUB_ENV"
+          echo "MIX_MONO=$mm"                                       >> "$GITHUB_ENV"
+          echo "HPF=$(jq -r '.highpass_hz   // 80'    "$WORKDIR/inputs.json" 2>/dev/null)"      >> "$GITHUB_ENV"
+          echo "LPF=$(jq -r '.lowpass_hz    // 13500' "$WORKDIR/inputs.json" 2>/dev/null)"      >> "$GITHUB_ENV"
+          echo "COMP_THRESH=$(jq -r '.comp_thresh_db // -18'  "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
+          echo "COMP_RATIO=$(jq -r '.comp_ratio    // 3'     "$WORKDIR/inputs.json" 2>/dev/null)"  >> "$GITHUB_ENV"
 
       - name: Notify WP — queued
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -307,16 +316,27 @@ jobs:
           curl -L "${{ github.event.inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
-      - name: Trim head and tail silence
+      - name: Prep audio (trim + optional radio polish)
         if: ${{ env.MODE == '' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          TRIM_WAV="${WORKDIR}/trim_${{ github.run_id }}.wav"
-          ffmpeg -hide_banner -y -i "$INPUT_FILE" \
-            -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
-            -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
-          echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
+          IN="$INPUT_FILE"
+          OUT="${WORKDIR}/pre_${{ github.run_id }}.wav"
+
+          # Base: trim head/tail silence
+          F="silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse"
+
+          # Optional radio polish: mono, high/low-pass, gentle compression
+          if [ "${RADIO_ENHANCE}" = "true" ]; then
+            if [ "${MIX_MONO}" = "true" ]; then
+              F="${F},pan=mono|c0=0.5*FL+0.5*FR"
+            fi
+            F="${F},highpass=f=${HPF},lowpass=f=${LPF},acompressor=threshold=${COMP_THRESH}dB:ratio=${COMP_RATIO}:attack=5:release=80:makeup=6"
+          fi
+
+          ffmpeg -hide_banner -y -i "$IN" -af "$F" -ar 48000 -c:a pcm_s16le "$OUT"
+          echo "AUDIO_IN=${OUT}" >> "$GITHUB_ENV"
 
       - name: Loudness normalize to MP3
         if: ${{ env.MODE == '' && env.AUDIO_IN != '' }}
@@ -617,6 +637,14 @@ jobs:
               echo "No base MP3 present; cannot build ads version"; exit 0
             fi
           fi
+
+          # Require at least one ad file; otherwise skip creating an ads MP3
+          AD_COUNT=$(ls -1 "${ADS_DIR}"/ad_*.mp3 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${AD_COUNT:-0}" -eq 0 ]; then
+            echo "No ads found (and/or Ads disabled) — skipping ads version."
+            exit 0
+          fi
+
           MAP=""
           INDX=0
           for f in "${ADS_DIR}"/ad_*.mp3; do
@@ -630,6 +658,23 @@ jobs:
           eval ffmpeg -hide_banner -y ${MAP} -filter_complex "concat=n=${INDX}:v=0:a=1" -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}-ads.mp3"
           if [ -s "${ARTDIR}/${BASE}-ads.mp3" ]; then
             echo "MP3_ADS_PATH=${ARTDIR}/${BASE}-ads.mp3" >> "$GITHUB_ENV"
+          fi
+
+      - name: Re-normalize Ads MP3 to -16 LUFS
+        if: ${{ env.ENABLE_ADS == 'true' && env.MP3_ADS_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PASS1="${WORKDIR}/ln_ads1.json"
+          ffmpeg -hide_banner -y -i "${MP3_ADS_PATH}" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/ln_ads1.log" || true
+          awk '/^{/{f=1} f{print} /}/{f=0}/' "${WORKDIR}/ln_ads1.log" > "$PASS1" || true
+          if jq -e . "$PASS1" >/dev/null 2>&1; then
+            I=$(jq -r '.input_i // "-16"'  "$PASS1"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1")
+            LRA=$(jq -r '.input_lra // "11"' "$PASS1"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1")
+            ffmpeg -hide_banner -y -i "${MP3_ADS_PATH}" \
+              -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
+              -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}-ads.norm.mp3"
+            mv "${ARTDIR}/${BASE}-ads.norm.mp3" "${ARTDIR}/${BASE}-ads.mp3"
           fi
 
       - name: Upload Ads MP3 to GCS
@@ -824,4 +869,5 @@ jobs:
               echo "- Watch users: ${WATCH_USERS:-} (for ${WATCH_MIN:-}m)"
             fi
             echo "- Toggles   transcript=${ENABLE_TRANSCRIPT} attendees=${ENABLE_ATTENDEES} vtt=${ENABLE_VTT} ads=${ENABLE_ADS}"
+            echo "- Radio     enhance=${RADIO_ENHANCE} mono=${MIX_MONO} HPF=${HPF}Hz LPF=${LPF}Hz comp=${COMP_THRESH}dB/${COMP_RATIO}x"
           } >> "$GITHUB_STEP_SUMMARY"
