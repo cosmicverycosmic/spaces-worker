@@ -246,7 +246,7 @@ jobs:
             timeout 20m docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
-              -e TWITTER_CSRF_TOKEN \
+              -e TWITTER_CSR_TOKEN \
               -v "${ARTDIR}:/app/download" \
               -v "${ARTDIR}/logs:/app/logs" \
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
@@ -457,7 +457,56 @@ jobs:
             fi
           fi
 
-      - name: Build transcript text (from CC JSONL or VTT or Deepgram)
+      # NEW: Get diarized JSON (utterances + paragraphs) from Deepgram for robust VTT + transcript
+      - name: Deepgram JSON diarized (for clean VTT + transcript)
+        id: dgjson
+        if: ${{ (env.ENABLE_VTT == 'true' || env.ENABLE_TRANSCRIPT == 'true') && env.DEEPGRAM_API_KEY != '' && ( (env.MODE == '' && env.MP3_PATH != '') || env.MODE == 'vtt_only' || env.MODE == 'transcript_only' || env.MODE == 'patch_all_from_mp3' ) }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          J="${ARTDIR}/${BASE}.deepgram.json"
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${MP3_PATH}" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&paragraphs=true&utterances=true" \
+            -o "$J" || true
+          [ -s "$J" ] && echo "DG_JSON=$J" >> "$GITHUB_ENV" || true
+
+      # NEW: Build WEBVTT from Deepgram JSON if VTT is still missing
+      - name: Build VTT from Deepgram JSON (fallback fix)
+        if: ${{ env.ENABLE_VTT == 'true' && env.VTT_PATH == '' && env.DG_JSON != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="${ARTDIR}/${BASE}.vtt"
+          jq -r '
+            def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+            def ms3(n): (1000 + (n % 1000 | floor)|tostring)[1:4];
+            def ts(x):
+              ( (x/3600)|floor ) as $h |
+              ( ((x%3600)/60)|floor ) as $m |
+              ( (x%60)|floor ) as $s |
+              ( ((x*1000)|floor) % 1000 ) as $ms |
+              ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
+            "WEBVTT", "",
+            (
+              if (.results.utterances|length > 0)
+              then
+                .results.utterances[]
+                | {s:.start, e:.end, t:(.transcript // (.words|map(.punctuated_word // .word)|join(" ")))}
+              else
+                (.results.channels[0].alternatives[0].paragraphs.paragraphs // [])[]
+                | .sentences[]
+                | {s:.start, e:.end, t:.text}
+              end
+            )
+            | select(.t != null and .t != "")
+            | (ts(.s) + " --> " + ts(.e)), (.t), ""
+          ' "$DG_JSON" > "$OUT"
+          [ -s "$OUT" ] && echo "VTT_PATH=$OUT" >> "$GITHUB_ENV" || true
+
+      - name: Build transcript text (from Deepgram JSON OR CC JSONL OR VTT)
         id: transcript
         if: ${{ env.ENABLE_TRANSCRIPT == 'true' && ( env.MODE != 'attendees_only' && env.MODE != 'links_only' && env.MODE != 'ads_only' && env.MODE != 'delete_ads_version' ) }}
         shell: bash
@@ -465,18 +514,51 @@ jobs:
           set -euxo pipefail
           OUT_TXT="${ARTDIR}/${BASE}.txt"
           rm -f "$OUT_TXT" || true
-          CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
-          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            jq -s -r '
-              .[] | ( .text // .caption // .content // "" )
-              | gsub("\r";"")
-              | select(. != "")
-            ' "$CC_JSONL" > "$OUT_TXT" || true
+
+          # 1) Prefer diarized Deepgram JSON if present
+          if [ -n "${DG_JSON:-}" ] && [ -s "${DG_JSON:-}" ]; then
+            jq -r '
+              def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+              def hhmmss(x):
+                ( (x/3600)|floor ) as $h |
+                ( ((x%3600)/60)|floor ) as $m |
+                ( (x%60)|floor ) as $s |
+                "[" + ($h|tostring) + ":" + two($m) + ":" + two($s) + "]";
+              if (.results.utterances|length > 0) then
+                .results.utterances[]
+                | (hhmmss(.start) + " Speaker " + (.speaker|tostring) + ": "
+                   + ( .transcript // (.words|map(.punctuated_word // .word)|join(" ")) ) )
+              else
+                (.results.channels[0].alternatives[0].paragraphs.paragraphs // [])[]
+                | {
+                    s: (.sentences[0].start),
+                    speaker: (.speaker // 1),
+                    t: (.sentences | map(.text) | join(" "))
+                  }
+                | (hhmmss(.s) + " Speaker " + (.speaker|tostring) + ": " + .t)
+              end
+            ' "$DG_JSON" > "$OUT_TXT" || true
           fi
+
+          # 2) Otherwise, try CC JSONL from crawler (flattened text)
+          if [ ! -s "$OUT_TXT" ]; then
+            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
+            if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
+              jq -s -r '
+                .[] | ( .text // .caption // .content // "" )
+                | gsub("\r";"")
+                | select(. != "")
+              ' "$CC_JSONL" > "$OUT_TXT" || true
+            fi
+          fi
+
+          # 3) Otherwise, derive from VTT (strip times)
           if [ ! -s "$OUT_TXT" ] && [ -n "${VTT_PATH:-}" ] && [ -s "${VTT_PATH}" ]; then
             awk 'BEGIN{skip=0} !/-->/ && $0!="WEBVTT" && $0!~/^[[:space:]]*NOTE/ && $0!~/^[0-9]+$/ {print}' "$VTT_PATH" \
               | sed '/^[[:space:]]*$/d' > "$OUT_TXT" || true
           fi
+
+          # 4) Last resort — direct Deepgram TXT (only if explicitly allowed)
           if [ ! -s "$OUT_TXT" ] && [ -n "${MP3_PATH:-}" ] && [ -s "${MP3_PATH}" ] && [ "${{ github.event.inputs.do_transcript }}" = "true" ] && [ -n "${DEEPGRAM_API_KEY:-}" ]; then
             curl -sS -X POST \
               -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
@@ -485,11 +567,8 @@ jobs:
               "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=txt" \
               -o "$OUT_TXT" || true
           fi
-          if [ -s "$OUT_TXT" ]; then
-            echo "TRANSCRIPT_PATH=${OUT_TXT}" >> "$GITHUB_ENV"
-          else
-            echo "No transcript text generated."
-          fi
+
+          [ -s "$OUT_TXT" ] && echo "TRANSCRIPT_PATH=${OUT_TXT}" >> "$GITHUB_ENV" || echo "No transcript text generated."
 
       - name: Upload VTT to GCS
         id: upload_vtt
@@ -842,7 +921,7 @@ jobs:
               echo "- VTT       (none)"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH:-}" ]; then
-              echo "- Transcript text: present"
+              echo "- Transcript text: present (diarized if JSON available)"
             else
               echo "- Transcript text: (none)"
             fi
