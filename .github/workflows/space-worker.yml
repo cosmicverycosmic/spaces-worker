@@ -56,7 +56,7 @@ on:
         type: string
         default: ""
       inputs_json:
-        description: JSON bag for extra toggles (enable_* / ads_urls / purple_tweet_url / audio_ads_url / watch_users / watch_duration_minutes)
+        description: JSON bag for extra toggles (enable_* / ads_urls / purple_tweet_url / audio_ads_url / watch_users / watch_duration_minutes / radio_enhance / mix_mono / highpass_hz / lowpass_hz / comp_thresh_db / comp_ratio / enable_diarization / crawler_max_minutes / vtt_min_cues)
         required: false
         type: string
         default: ""
@@ -99,29 +99,36 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
-          # Save inputs_json to file for jq
-          printf '%s' '${{ github.event.inputs.inputs_json }}' > "$WORKDIR/inputs.json"
+          printf '%s' '${{ github.event.inputs.inputs_json }}' > "$WORKDIR/inputs.json" || true
+
           # Toggles default to true
           et="$(jq -r '.enable_transcript // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
           ea="$(jq -r '.enable_attendees  // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
           ev="$(jq -r '.enable_vtt        // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
           ed="$(jq -r '.enable_ads        // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          echo "ENABLE_TRANSCRIPT=$et" >> "$GITHUB_ENV"
-          echo "ENABLE_ATTENDEES=$ea"  >> "$GITHUB_ENV"
-          echo "ENABLE_VTT=$ev"        >> "$GITHUB_ENV"
-          echo "ENABLE_ADS=$ed"        >> "$GITHUB_ENV"
+          dz="$(jq -r '.enable_diarization // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          echo "ENABLE_TRANSCRIPT=$et"    >> "$GITHUB_ENV"
+          echo "ENABLE_ATTENDEES=$ea"     >> "$GITHUB_ENV"
+          echo "ENABLE_VTT=$ev"           >> "$GITHUB_ENV"
+          echo "ENABLE_ADS=$ed"           >> "$GITHUB_ENV"
+          echo "ENABLE_DIARIZATION=$dz"   >> "$GITHUB_ENV"
+
           # Mode / MP3 override
           echo "MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_ENV"
           echo "EXISTING_MP3_URL=${{ github.event.inputs.existing_mp3_url }}" >> "$GITHUB_ENV"
+
           # Ads list
           jq -r '.ads_urls // ""' "$WORKDIR/inputs.json" 2>/dev/null | tr ',' '\n' | sed -E '/^\s*$/d' > "$WORKDIR/ads.list"
           echo "ADS_LIST=$WORKDIR/ads.list" >> "$GITHUB_ENV"
+
           # Purple tweet URL + Ads mp3 for deletion
           echo "PURPLE_TWEET_URL=$(jq -r '.purple_tweet_url // ""' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
           echo "AUDIO_ADS_URL=$(jq -r '.audio_ads_url // ""' "$WORKDIR/inputs.json" 2>/dev/null)"     >> "$GITHUB_ENV"
+
           # Watch controls (used when mode=watch)
           echo "WATCH_USERS=$(jq -r '.watch_users // ""' "$WORKDIR/inputs.json" 2>/dev/null)"             >> "$GITHUB_ENV"
           echo "WATCH_MIN=$(jq -r '.watch_duration_minutes // ""' "$WORKDIR/inputs.json" 2>/dev/null)"    >> "$GITHUB_ENV"
+
           # Optional radio polish controls (defaults on)
           rp="$(jq -r '.radio_enhance // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
           mm="$(jq -r '.mix_mono      // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
@@ -131,6 +138,12 @@ jobs:
           echo "LPF=$(jq -r '.lowpass_hz    // 13500' "$WORKDIR/inputs.json" 2>/dev/null)"      >> "$GITHUB_ENV"
           echo "COMP_THRESH=$(jq -r '.comp_thresh_db // -18'  "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
           echo "COMP_RATIO=$(jq -r '.comp_ratio    // 3'     "$WORKDIR/inputs.json" 2>/dev/null)"  >> "$GITHUB_ENV"
+
+          # Crawler control: short bail on nuked spaces (minutes)
+          echo "CRAWLER_MAX_MIN=$(jq -r '.crawler_max_minutes // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
+
+          # VTT validation threshold
+          echo "VTT_MIN_CUES=$(jq -r '.vtt_min_cues // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
 
       - name: Notify WP — queued
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -226,6 +239,7 @@ jobs:
           SID: ${{ steps.ids.outputs.space_id }}
           WATCH_USERS: ${{ env.WATCH_USERS }}
           WATCH_MIN: ${{ env.WATCH_MIN }}
+          CMAX: ${{ env.CRAWLER_MAX_MIN }}
         run: |
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
@@ -243,10 +257,11 @@ jobs:
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
               --user "${WATCH_USERS}" > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
           else
-            timeout 20m docker run --rm \
+            # Short-stop timeout (default 3m) for nuked/missing spaces
+            timeout "${CMAX:-3}m" docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
-              -e TWITTER_CSR_TOKEN \
+              -e TWITTER_CSRF_TOKEN \
               -v "${ARTDIR}:/app/download" \
               -v "${ARTDIR}/logs:/app/logs" \
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
@@ -281,19 +296,62 @@ jobs:
             fi
           fi
 
+      - name: Derive Space date/time (for WP post date)
+        if: ${{ steps.crawl.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Try crawler JSON first
+          CAND_JSON="${ARTDIR}/_as_line.json"
+          OUT_ISO=""
+          to_iso() {
+            v="$1"
+            if [ -z "$v" ]; then return 1; fi
+            # numeric? seconds or millis
+            if [[ "$v" =~ ^[0-9]+$ ]]; then
+              if [ "${#v}" -ge 13 ]; then s=$((v/1000)); else s=$v; fi
+              date -u -d "@$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null && return 0 || return 1
+            else
+              date -u -d "$v" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null && return 0 || return 1
+            fi
+          }
+          if [ -s "$CAND_JSON" ]; then
+            # Probe several likely fields
+            RAW="$(jq -r '(.audioSpace // .) as $a | (
+                $a.metadata.created_at // $a.metadata.createdAt // $a.metadata.started_at // $a.metadata.start // 
+                $a.metadata.start_time // $a.metadata.scheduled_start // $a.metadata.startedAt // $a.metadata.updated_at // ""
+              )' "$CAND_JSON" 2>/dev/null || true)"
+            if to_iso "$RAW"; then OUT_ISO="$(to_iso "$RAW")"; fi
+          fi
+          # Fallback to audio file mtime if needed
+          if [ -z "${OUT_ISO:-}" ]; then
+            CAND_FILE="${INPUT_FILE:-${ARTDIR}/${BASE}.mp3}"
+            if [ -n "$CAND_FILE" ] && [ -e "$CAND_FILE" ]; then
+              TS=$(stat -c %Y "$CAND_FILE" 2>/dev/null || stat -f %m "$CAND_FILE" 2>/dev/null || echo "")
+              if [ -n "$TS" ]; then OUT_ISO="$(date -u -d "@$TS" +%Y-%m-%dT%H:%M:%SZ)"; fi
+            fi
+          fi
+          if [ -n "${OUT_ISO:-}" ]; then
+            echo "SPACE_DATE_ISO=${OUT_ISO}" >> "$GITHUB_ENV"
+            printf '%s' "$OUT_ISO" > "${WORKDIR}/space_date.txt"
+          fi
+
       - name: Notify WP — processing audio
         if: ${{ env.MODE == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
+          MSG="Processing audio"
+          if [ -n "${SPACE_DATE_ISO:-}" ]; then MSG="${MSG} (space date ${SPACE_DATE_ISO})"; fi
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
             -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
                          --arg status "processing" \
-                         --arg msg "Processing audio" \
+                         --arg msg "$MSG" \
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
-                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+                         --arg sd "${SPACE_DATE_ISO:-}" \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress} + (if ($sd|length)>0 then {space_date:$sd} else {} end)')"
 
       - name: Fallback download via yt-dlp
         if: ${{ env.MODE == '' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
@@ -323,18 +381,13 @@ jobs:
           set -euxo pipefail
           IN="$INPUT_FILE"
           OUT="${WORKDIR}/pre_${{ github.run_id }}.wav"
-
-          # Base: trim head/tail silence
           F="silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse"
-
-          # Optional radio polish: mono, high/low-pass, gentle compression
           if [ "${RADIO_ENHANCE}" = "true" ]; then
             if [ "${MIX_MONO}" = "true" ]; then
               F="${F},pan=mono|c0=0.5*FL+0.5*FR"
             fi
             F="${F},highpass=f=${HPF},lowpass=f=${LPF},acompressor=threshold=${COMP_THRESH}dB:ratio=${COMP_RATIO}:attack=5:release=80:makeup=6"
           fi
-
           ffmpeg -hide_banner -y -i "$IN" -af "$F" -ar 48000 -c:a pcm_s16le "$OUT"
           echo "AUDIO_IN=${OUT}" >> "$GITHUB_ENV"
 
@@ -422,14 +475,14 @@ jobs:
           fi
           HDR="$(head -n1 "$VTT_PATH" || true)"
           CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
-          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt 1 ]; then
-            echo "Invalid VTT; clearing"
+          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ]; then
+            echo "Invalid or too-few cues (${CUES}); clearing"
             rm -f "$VTT_PATH" || true
             echo "VTT_PATH=" >> "$GITHUB_ENV"
           fi
 
       - name: VTT via Deepgram (fallback or vtt_only)
-        id: deepgram
+        id: deepgram_vtt
         if: ${{ env.ENABLE_VTT == 'true' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && ( (env.MODE == '' && env.MP3_PATH != '') || (env.MODE == 'vtt_only' && env.MP3_PATH != '') || (env.MODE == 'patch_all_from_mp3' && env.MP3_PATH != '') ) }}
         shell: bash
         run: |
@@ -442,71 +495,65 @@ jobs:
             -o "${ARTDIR}/${BASE}.vtt" || true
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
-      - name: Validate Deepgram VTT
-        if: ${{ env.ENABLE_VTT == 'true' && env.VTT_PATH != '' && (steps.deepgram.outcome == 'success' || steps.deepgram.outcome == 'skipped') }}
+      - name: If Deepgram VTT weak, rebuild VTT from Deepgram JSON utterances
+        if: ${{ env.ENABLE_VTT == 'true' && env.DEEPGRAM_API_KEY != '' && (env.VTT_PATH == '' || always()) }}
         shell: bash
         run: |
           set -euxo pipefail
-          if [ -f "$VTT_PATH" ]; then
-            HDR="$(head -n1 "$VTT_PATH" || true)"
+          NEED=0
+          if [ -z "${VTT_PATH:-}" ] || [ ! -s "${VTT_PATH:-}" ]; then
+            NEED=1
+          else
             CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
-            if [ "${HDR:-}" != "WEBVTT" || "${CUES:-0}" -lt 1 ]; then
-              echo "Deepgram VTT invalid; clearing"
-              rm -f "$VTT_PATH" || true
-              echo "VTT_PATH=" >> "$GITHUB_ENV"
-            fi
+            [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ] && NEED=1 || true
           fi
-
-      # NEW: Get diarized JSON (utterances + paragraphs) from Deepgram for robust VTT + transcript
-      - name: Deepgram JSON diarized (for clean VTT + transcript)
-        id: dgjson
-        if: ${{ (env.ENABLE_VTT == 'true' || env.ENABLE_TRANSCRIPT == 'true') && env.DEEPGRAM_API_KEY != '' && ( (env.MODE == '' && env.MP3_PATH != '') || env.MODE == 'vtt_only' || env.MODE == 'transcript_only' || env.MODE == 'patch_all_from_mp3' ) }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          J="${ARTDIR}/${BASE}.deepgram.json"
+          [ "$NEED" -eq 0 ] && exit 0
+          # Pull Deepgram JSON with utterances
+          DGJSON="${WORKDIR}/${BASE}.dg.json"
           curl -sS -X POST \
             -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
             -H "Content-Type: audio/mpeg" \
             --data-binary @"${MP3_PATH}" \
-            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&paragraphs=true&utterances=true" \
-            -o "$J" || true
-          [ -s "$J" ] && echo "DG_JSON=$J" >> "$GITHUB_ENV" || true
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true&format=json" \
+            -o "${DGJSON}" || true
+          if [ ! -s "${DGJSON}" ]; then
+            echo "No Deepgram JSON; cannot rebuild VTT"
+            exit 0
+          fi
+          # Build clean WEBVTT from utterances (speaker + start/end)
+          jq -r '
+            def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+            def ms3(n): (1000 + (n%1000)|tostring)[1:4];
+            def ts(sec):
+              ( (sec/3600)|floor ) as $h |
+              ( ((sec%3600)/60)|floor ) as $m |
+              ( (sec%60)|floor ) as $s |
+              ( (sec*1000|round)%1000 ) as $ms |
+              ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
+            "WEBVTT", "",
+            ( .results.utterances // [] )[]
+            | (ts(.start) + " --> " + ts(.end)),
+              ("Speaker " + ((.speaker // 0 | tonumber) + 1 | tostring) + ": " + (.transcript // "")),
+              ""
+          ' "${DGJSON}" > "${ARTDIR}/${BASE}.vtt" || true
+          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+          fi
 
-      # NEW: Build WEBVTT from Deepgram JSON if VTT is still missing
-      - name: Build VTT from Deepgram JSON (fallback fix)
-        if: ${{ env.ENABLE_VTT == 'true' && env.VTT_PATH == '' && env.DG_JSON != '' }}
+      - name: Validate VTT (final)
+        if: ${{ env.ENABLE_VTT == 'true' && env.VTT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          OUT="${ARTDIR}/${BASE}.vtt"
-          jq -r '
-            def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
-            def ms3(n): (1000 + (n % 1000 | floor)|tostring)[1:4];
-            def ts(x):
-              ( (x/3600)|floor ) as $h |
-              ( ((x%3600)/60)|floor ) as $m |
-              ( (x%60)|floor ) as $s |
-              ( ((x*1000)|floor) % 1000 ) as $ms |
-              ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
-            "WEBVTT", "",
-            (
-              if (.results.utterances|length > 0)
-              then
-                .results.utterances[]
-                | {s:.start, e:.end, t:(.transcript // (.words|map(.punctuated_word // .word)|join(" ")))}
-              else
-                (.results.channels[0].alternatives[0].paragraphs.paragraphs // [])[]
-                | .sentences[]
-                | {s:.start, e:.end, t:.text}
-              end
-            )
-            | select(.t != null and .t != "")
-            | (ts(.s) + " --> " + ts(.e)), (.t), ""
-          ' "$DG_JSON" > "$OUT"
-          [ -s "$OUT" ] && echo "VTT_PATH=$OUT" >> "$GITHUB_ENV" || true
+          HDR="$(head -n1 "$VTT_PATH" || true)"
+          CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
+          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ]; then
+            echo "Final VTT invalid; clearing"
+            rm -f "$VTT_PATH" || true
+            echo "VTT_PATH=" >> "$GITHUB_ENV"
+          fi
 
-      - name: Build transcript text (from Deepgram JSON OR CC JSONL OR VTT)
+      - name: Build transcript text (from CC JSONL or VTT or Deepgram txt)
         id: transcript
         if: ${{ env.ENABLE_TRANSCRIPT == 'true' && ( env.MODE != 'attendees_only' && env.MODE != 'links_only' && env.MODE != 'ads_only' && env.MODE != 'delete_ads_version' ) }}
         shell: bash
@@ -514,51 +561,18 @@ jobs:
           set -euxo pipefail
           OUT_TXT="${ARTDIR}/${BASE}.txt"
           rm -f "$OUT_TXT" || true
-
-          # 1) Prefer diarized Deepgram JSON if present
-          if [ -n "${DG_JSON:-}" ] && [ -s "${DG_JSON:-}" ]; then
-            jq -r '
-              def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
-              def hhmmss(x):
-                ( (x/3600)|floor ) as $h |
-                ( ((x%3600)/60)|floor ) as $m |
-                ( (x%60)|floor ) as $s |
-                "[" + ($h|tostring) + ":" + two($m) + ":" + two($s) + "]";
-              if (.results.utterances|length > 0) then
-                .results.utterances[]
-                | (hhmmss(.start) + " Speaker " + (.speaker|tostring) + ": "
-                   + ( .transcript // (.words|map(.punctuated_word // .word)|join(" ")) ) )
-              else
-                (.results.channels[0].alternatives[0].paragraphs.paragraphs // [])[]
-                | {
-                    s: (.sentences[0].start),
-                    speaker: (.speaker // 1),
-                    t: (.sentences | map(.text) | join(" "))
-                  }
-                | (hhmmss(.s) + " Speaker " + (.speaker|tostring) + ": " + .t)
-              end
-            ' "$DG_JSON" > "$OUT_TXT" || true
+          CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
+          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
+            jq -s -r '
+              .[] | ( .text // .caption // .content // "" )
+              | gsub("\r";"")
+              | select(. != "")
+            ' "$CC_JSONL" > "$OUT_TXT" || true
           fi
-
-          # 2) Otherwise, try CC JSONL from crawler (flattened text)
-          if [ ! -s "$OUT_TXT" ]; then
-            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
-            if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-              jq -s -r '
-                .[] | ( .text // .caption // .content // "" )
-                | gsub("\r";"")
-                | select(. != "")
-              ' "$CC_JSONL" > "$OUT_TXT" || true
-            fi
-          fi
-
-          # 3) Otherwise, derive from VTT (strip times)
           if [ ! -s "$OUT_TXT" ] && [ -n "${VTT_PATH:-}" ] && [ -s "${VTT_PATH}" ]; then
             awk 'BEGIN{skip=0} !/-->/ && $0!="WEBVTT" && $0!~/^[[:space:]]*NOTE/ && $0!~/^[0-9]+$/ {print}' "$VTT_PATH" \
               | sed '/^[[:space:]]*$/d' > "$OUT_TXT" || true
           fi
-
-          # 4) Last resort — direct Deepgram TXT (only if explicitly allowed)
           if [ ! -s "$OUT_TXT" ] && [ -n "${MP3_PATH:-}" ] && [ -s "${MP3_PATH}" ] && [ "${{ github.event.inputs.do_transcript }}" = "true" ] && [ -n "${DEEPGRAM_API_KEY:-}" ]; then
             curl -sS -X POST \
               -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
@@ -567,8 +581,52 @@ jobs:
               "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=txt" \
               -o "$OUT_TXT" || true
           fi
+          if [ -s "$OUT_TXT" ]; then
+            echo "TRANSCRIPT_PATH=${OUT_TXT}" >> "$GITHUB_ENV"
+          else
+            echo "No transcript text generated."
+          fi
 
-          [ -s "$OUT_TXT" ] && echo "TRANSCRIPT_PATH=${OUT_TXT}" >> "$GITHUB_ENV" || echo "No transcript text generated."
+      - name: Diarized transcript via Deepgram (utterances)
+        id: diarize
+        if: ${{ env.ENABLE_TRANSCRIPT == 'true' && env.ENABLE_DIARIZATION == 'true' && env.DEEPGRAM_API_KEY != '' && ( (env.MODE == '' && env.MP3_PATH != '') || (env.MODE == 'transcript_only' && env.MP3_PATH != '') || (env.MODE == 'patch_all_from_mp3' && env.MP3_PATH != '') ) }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DGJSON="${WORKDIR}/${BASE}.dg.json"
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${MP3_PATH}" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true&format=json" \
+            -o "${DGJSON}" || true
+          if [ -s "${DGJSON}" ]; then
+            # Build diarized paragraphs with timestamps
+            DTXT="${ARTDIR}/${BASE}.diarized.txt"
+            jq -r '
+              def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+              def ts(sec):
+                ( (sec/3600)|floor ) as $h |
+                ( ((sec%3600)/60)|floor ) as $m |
+                ( (sec%60)|floor ) as $s |
+                ($h|tostring)+":"+two($m)+":"+two($s);
+              ( .results.utterances // [] )[]
+              | "[" + ts(.start) + " - " + ts(.end) + "] " +
+                "SPEAKER " + ((.speaker // 0 | tonumber) + 1 | tostring) + ": " +
+                (.transcript // "")
+            ' "${DGJSON}" > "${DTXT}" || true
+            if [ -s "${DTXT}" ]; then
+              echo "DIARIZED_TXT=${DTXT}" >> "$GITHUB_ENV"
+              echo "DIARIZED_JSON=${DGJSON}" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Prefer diarized transcript if available
+        if: ${{ env.ENABLE_TRANSCRIPT == 'true' && env.DIARIZED_TXT != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "TRANSCRIPT_PATH=${DIARIZED_TXT}" >> "$GITHUB_ENV"
 
       - name: Upload VTT to GCS
         id: upload_vtt
@@ -716,14 +774,11 @@ jobs:
               echo "No base MP3 present; cannot build ads version"; exit 0
             fi
           fi
-
-          # Require at least one ad file; otherwise skip creating an ads MP3
           AD_COUNT=$(ls -1 "${ADS_DIR}"/ad_*.mp3 2>/dev/null | wc -l | tr -d ' ')
           if [ "${AD_COUNT:-0}" -eq 0 ]; then
             echo "No ads found (and/or Ads disabled) — skipping ads version."
             exit 0
           fi
-
           MAP=""
           INDX=0
           for f in "${ADS_DIR}"/ad_*.mp3; do
@@ -817,6 +872,8 @@ jobs:
             --arg ath   "${AT_HTML}" \
             --arg lhtml "${LINKS_HTML}" \
             --arg aads  "${{ steps.upload_ads.outputs.audio_ads_proxy || steps.upload_ads.outputs.audio_ads_raw }}" \
+            --arg sd    "${SPACE_DATE_ISO:-}" \
+            --arg dj    "${DIARIZED_JSON:-}" \
             '{
               gcs_url: $gcs,
               mime:    $mime,
@@ -826,10 +883,12 @@ jobs:
             + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
             + (if ($lhtml|length)>0 then {links_html:$lhtml} else {} end)
+            + (if ($sd|length)>0 then {space_date:$sd} else {} end)
             + {artifacts:
                 ( {}
                   + (if ($aads|length)>0 then {audio_ads_url:$aads} else {} end)
                   + {audio_noads_url:$gcs}
+                  + (if ($dj|length)>0 then {diarized_json_path:$dj} else {} end)
                 )
               }' )"
           TR_PATH="${TRANSCRIPT_PATH:-}"
@@ -861,6 +920,7 @@ jobs:
             --arg ath   "${AT_HTML}" \
             --arg lhtml "${LINKS_HTML}" \
             --arg aads  "${{ steps.upload_ads.outputs.audio_ads_proxy || steps.upload_ads.outputs.audio_ads_raw }}" \
+            --arg sd    "${SPACE_DATE_ISO:-}" \
             --arg status "complete" \
             --argjson progress 100 \
             '{
@@ -872,6 +932,7 @@ jobs:
             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
             + (if ($lhtml|length)>0 then {links_html:$lhtml} else {} end)
             + (if ($aads|length)>0 then {audio_ads_url:$aads} else {} end)
+            + (if ($sd|length)>0 then {space_date:$sd} else {} end)
           ' > "${WORKDIR}/wp_patch_body.json"
           if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH:-}" ]; then
             jq -n --rawfile tr "${TRANSCRIPT_PATH}" --slurpfile base "${WORKDIR}/wp_patch_body.json" \
@@ -906,6 +967,11 @@ jobs:
             echo "- Space URL ${{ github.event.inputs.space_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
+            if [ -n "${SPACE_DATE_ISO:-}" ]; then
+              echo "- Space Date (ISO) ${SPACE_DATE_ISO}"
+            else
+              echo "- Space Date (ISO) (unknown)"
+            fi
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
               echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
             elif [ -n "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
@@ -921,9 +987,12 @@ jobs:
               echo "- VTT       (none)"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH:-}" ]; then
-              echo "- Transcript text: present (diarized if JSON available)"
+              echo "- Transcript text: present $(basename "${TRANSCRIPT_PATH}")"
             else
               echo "- Transcript text: (none)"
+            fi
+            if [ -n "${DIARIZED_TXT:-}" ]; then
+              echo "- Diarized transcript: $(basename "${DIARIZED_TXT}")"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees extracted"
@@ -947,6 +1016,7 @@ jobs:
             if [ "${{ github.event.inputs.mode }}" = "watch" ]; then
               echo "- Watch users: ${WATCH_USERS:-} (for ${WATCH_MIN:-}m)"
             fi
-            echo "- Toggles   transcript=${ENABLE_TRANSCRIPT} attendees=${ENABLE_ATTENDEES} vtt=${ENABLE_VTT} ads=${ENABLE_ADS}"
+            echo "- Toggles   transcript=${ENABLE_TRANSCRIPT} attendees=${ENABLE_ATTENDEES} vtt=${ENABLE_VTT} ads=${ENABLE_ADS} diarize=${ENABLE_DIARIZATION}"
             echo "- Radio     enhance=${RADIO_ENHANCE} mono=${MIX_MONO} HPF=${HPF}Hz LPF=${LPF}Hz comp=${COMP_THRESH}dB/${COMP_RATIO}x"
+            echo "- Crawler   max_minutes=${CRAWLER_MAX_MIN}"
           } >> "$GITHUB_STEP_SUMMARY"
