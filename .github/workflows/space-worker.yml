@@ -101,17 +101,17 @@ jobs:
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
           printf '%s' '${{ github.event.inputs.inputs_json }}' > "$WORKDIR/inputs.json" || true
 
-          # Toggles default to true
-          et="$(jq -r '.enable_transcript // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          ea="$(jq -r '.enable_attendees  // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          ev="$(jq -r '.enable_vtt        // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          ed="$(jq -r '.enable_ads        // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          dz="$(jq -r '.enable_diarization // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
-          echo "ENABLE_TRANSCRIPT=$et"    >> "$GITHUB_ENV"
-          echo "ENABLE_ATTENDEES=$ea"     >> "$GITHUB_ENV"
-          echo "ENABLE_VTT=$ev"           >> "$GITHUB_ENV"
-          echo "ENABLE_ADS=$ed"           >> "$GITHUB_ENV"
-          echo "ENABLE_DIARIZATION=$dz"   >> "$GITHUB_ENV"
+          # Toggles (ads default OFF unless explicitly enabled)
+          et="$(jq -r '.enable_transcript // "true"'   "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          ea="$(jq -r '.enable_attendees  // "true"'   "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          ev="$(jq -r '.enable_vtt        // "true"'   "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          ed="$(jq -r '.enable_ads        // "false"'  "$WORKDIR/inputs.json" 2>/dev/null || echo false)"
+          dz="$(jq -r '.enable_diarization // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
+          echo "ENABLE_TRANSCRIPT=$et"  >> "$GITHUB_ENV"
+          echo "ENABLE_ATTENDEES=$ea"   >> "$GITHUB_ENV"
+          echo "ENABLE_VTT=$ev"         >> "$GITHUB_ENV"
+          echo "ENABLE_ADS=$ed"         >> "$GITHUB_ENV"
+          echo "ENABLE_DIARIZATION=$dz" >> "$GITHUB_ENV"
 
           # Mode / MP3 override
           echo "MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_ENV"
@@ -126,8 +126,8 @@ jobs:
           echo "AUDIO_ADS_URL=$(jq -r '.audio_ads_url // ""' "$WORKDIR/inputs.json" 2>/dev/null)"     >> "$GITHUB_ENV"
 
           # Watch controls (used when mode=watch)
-          echo "WATCH_USERS=$(jq -r '.watch_users // ""' "$WORKDIR/inputs.json" 2>/dev/null)"             >> "$GITHUB_ENV"
-          echo "WATCH_MIN=$(jq -r '.watch_duration_minutes // ""' "$WORKDIR/inputs.json" 2>/dev/null)"    >> "$GITHUB_ENV"
+          echo "WATCH_USERS=$(jq -r '.watch_users // ""' "$WORKDIR/inputs.json" 2>/dev/null)"          >> "$GITHUB_ENV"
+          echo "WATCH_MIN=$(jq -r '.watch_duration_minutes // 0' "$WORKDIR/inputs.json" 2>/dev/null)"  >> "$GITHUB_ENV"
 
           # Optional radio polish controls (defaults on)
           rp="$(jq -r '.radio_enhance // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true)"
@@ -139,11 +139,11 @@ jobs:
           echo "COMP_THRESH=$(jq -r '.comp_thresh_db // -18'  "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
           echo "COMP_RATIO=$(jq -r '.comp_ratio    // 3'     "$WORKDIR/inputs.json" 2>/dev/null)"  >> "$GITHUB_ENV"
 
-          # Crawler control: give the crawler time to run (default 20m)
-          echo "CRAWLER_MAX_MIN=$(jq -r '.crawler_max_minutes // 20' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
+          # Crawler control: short bail on nuked spaces (minutes)
+          echo "CRAWLER_MAX_MIN=$(jq -r '.crawler_max_minutes // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
 
-          # VTT validation threshold (match prior success: allow 1+ cue)
-          echo "VTT_MIN_CUES=$(jq -r '.vtt_min_cues // 1' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
+          # VTT validation threshold
+          echo "VTT_MIN_CUES=$(jq -r '.vtt_min_cues // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
 
       - name: Notify WP — queued
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -158,7 +158,7 @@ jobs:
                        --arg msg "Workflow received and queued" \
                        --arg run "${{ github.run_id }}" \
                        --argjson progress 1 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')" || true
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Install deps (ffmpeg / jq / python / yt-dlp)
         shell: bash
@@ -257,8 +257,8 @@ jobs:
               ghcr.io/hitomarukonpaku/twspace-crawler:latest \
               --user "${WATCH_USERS}" > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
           else
-            # Generous timeout for live/archived pull (default from inputs_json: 20m)
-            timeout "${CMAX:-20}m" docker run --rm \
+            # Short-stop timeout (default 3m) for nuked/missing spaces
+            timeout "${CMAX:-3}m" docker run --rm \
               -e TWITTER_AUTHORIZATION \
               -e TWITTER_AUTH_TOKEN \
               -e TWITTER_CSRF_TOKEN \
@@ -296,18 +296,16 @@ jobs:
             fi
           fi
 
-      - name: Derive Space date/time (for WP post date)
+      - name: Derive Space date/time & title (for WP)
         if: ${{ steps.crawl.outcome == 'success' }}
         shell: bash
         run: |
           set -euxo pipefail
-          # Try crawler JSON first
           CAND_JSON="${ARTDIR}/_as_line.json"
           OUT_ISO=""
           to_iso() {
             v="$1"
             if [ -z "$v" ]; then return 1; fi
-            # numeric? seconds or millis
             if [[ "$v" =~ ^[0-9]+$ ]]; then
               if [ "${#v}" -ge 13 ]; then s=$((v/1000)); else s=$v; fi
               date -u -d "@$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null && return 0 || return 1
@@ -321,8 +319,9 @@ jobs:
                 $a.metadata.start_time // $a.metadata.scheduled_start // $a.metadata.startedAt // $a.metadata.updated_at // ""
               )' "$CAND_JSON" 2>/dev/null || true)"
             if to_iso "$RAW"; then OUT_ISO="$(to_iso "$RAW")"; fi
+            TITLE="$(jq -r '(.audioSpace // .) | .metadata?.title // empty' "$CAND_JSON" 2>/dev/null || true)"
+            [ -n "${TITLE:-}" ] && echo "SPACE_TITLE=${TITLE}" >> "$GITHUB_ENV"
           fi
-          # Fallback to audio file mtime if needed
           if [ -z "${OUT_ISO:-}" ]; then
             CAND_FILE="${INPUT_FILE:-${ARTDIR}/${BASE}.mp3}"
             if [ -n "$CAND_FILE" ] && [ -e "$CAND_FILE" ]; then
@@ -333,20 +332,6 @@ jobs:
           if [ -n "${OUT_ISO:-}" ]; then
             echo "SPACE_DATE_ISO=${OUT_ISO}" >> "$GITHUB_ENV"
             printf '%s' "$OUT_ISO" > "${WORKDIR}/space_date.txt"
-          fi
-
-      - name: Derive Space title (fallback WP post title)
-        if: ${{ steps.crawl.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          CAND_JSON="${ARTDIR}/_as_line.json"
-          T=""
-          if [ -s "$CAND_JSON" ]; then
-            T="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.display_name // $a.metadata.topic // $a.title // empty)' "$CAND_JSON" 2>/dev/null || true)"
-          fi
-          if [ -n "${T:-}" ] && [ "${T:-}" != "null" ]; then
-            echo "SPACE_TITLE=${T}" >> "$GITHUB_ENV"
           fi
 
       - name: Notify WP — processing audio
@@ -364,7 +349,7 @@ jobs:
                          --arg msg "$MSG" \
                          --arg run "${{ github.run_id }}" --argjson progress 10 \
                          --arg sd "${SPACE_DATE_ISO:-}" \
-                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress} + (if ($sd|length)>0 then {space_date:$sd} else {} end)')" || true
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress} + (if ($sd|length)>0 then {space_date:$sd} else {} end)')"
 
       - name: Fallback download via yt-dlp
         if: ${{ env.MODE == '' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
@@ -488,7 +473,7 @@ jobs:
           fi
           HDR="$(head -n1 "$VTT_PATH" || true)"
           CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
-          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-1}" ]; then
+          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ]; then
             echo "Invalid or too-few cues (${CUES}); clearing"
             rm -f "$VTT_PATH" || true
             echo "VTT_PATH=" >> "$GITHUB_ENV"
@@ -518,7 +503,7 @@ jobs:
             NEED=1
           else
             CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
-            [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-1}" ] && NEED=1 || true
+            [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ] && NEED=1 || true
           fi
           [ "$NEED" -eq 0 ] && exit 0
           DGJSON="${WORKDIR}/${BASE}.dg.json"
@@ -558,7 +543,7 @@ jobs:
           set -euxo pipefail
           HDR="$(head -n1 "$VTT_PATH" || true)"
           CUES="$(grep -c -- '-->' "$VTT_PATH" || true)"
-          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-1}" ]; then
+          if [ "${HDR:-}" != "WEBVTT" ] || [ "${CUES:-0}" -lt "${VTT_MIN_CUES:-3}" ]; then
             echo "Final VTT invalid; clearing"
             rm -f "$VTT_PATH" || true
             echo "VTT_PATH=" >> "$GITHUB_ENV"
@@ -778,30 +763,47 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          if [ -z "${MP3_PATH:-}" ] || [ ! -s "${MP3_PATH:-}" ]; then
-            MP3_PATH="${ARTDIR}/${BASE}.mp3"
-            if [ ! -s "$MP3_PATH" ]; then
-              echo "No base MP3 present; cannot build ads version"; exit 0
+          shopt -s nullglob
+
+          MP3="${MP3_PATH:-}"
+          if [ -z "${MP3}" ] || [ ! -s "${MP3}" ]; then
+            MP3="${ARTDIR}/${BASE}.mp3"
+            if [ ! -s "${MP3}" ]; then
+              echo "No base MP3 present; cannot build ads version"
+              exit 0
             fi
           fi
-          AD_COUNT=$(ls -1 "${ADS_DIR}"/ad_*.mp3 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${AD_COUNT:-0}" -eq 0 ]; then
+
+          ADS=( "${ADS_DIR}"/ad_*.mp3 )
+          AD_COUNT="${#ADS[@]}"
+          if [ "${AD_COUNT}" -eq 0 ]; then
             echo "No ads found (and/or Ads disabled) — skipping ads version."
             exit 0
           fi
-          MAP=""
-          INDX=0
-          for f in "${ADS_DIR}"/ad_*.mp3; do
-            [ -f "$f" ] || continue
-            INDX=$((INDX+1))
-            MAP="${MAP} -i \"$f\""
+
+          TMPDIR="$(mktemp -d)"
+          idx=0
+          for src in "${ADS[@]}" "${MP3}"; do
+            idx=$((idx+1))
+            ffmpeg -hide_banner -loglevel error -y -i "$src" -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k "${TMPDIR}/${idx}.mp3"
+            echo "file '${TMPDIR}/${idx}.mp3'" >> "${TMPDIR}/list.txt"
           done
-          INDX=$((INDX+1))
-          MAP="${MAP} -i \"${MP3_PATH}\""
-          # shellcheck disable=SC2086
-          eval ffmpeg -hide_banner -y ${MAP} -filter_complex "concat=n=${INDX}:v=0:a=1" -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}-ads.mp3"
+
+          if ! ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "${TMPDIR}/list.txt" -c copy "${ARTDIR}/${BASE}-ads.mp3"; then
+            echo "Stream-copy concat failed; retrying with filter concat + re-encode…"
+            inputs=()
+            for f in "${TMPDIR}"/*.mp3; do inputs+=( -i "$f" ); done
+            n="${#inputs[@]}"
+            ffmpeg -hide_banner -loglevel error -y "${inputs[@]}" -filter_complex "concat=n=${n}:v=0:a=1" -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}-ads.mp3"
+          fi
+
+          rm -rf "${TMPDIR}"
+
           if [ -s "${ARTDIR}/${BASE}-ads.mp3" ]; then
             echo "MP3_ADS_PATH=${ARTDIR}/${BASE}-ads.mp3" >> "$GITHUB_ENV"
+          else
+            echo "Ads MP3 not produced; skipping upload."
+            exit 0
           fi
 
       - name: Re-normalize Ads MP3 to -16 LUFS
@@ -866,12 +868,9 @@ jobs:
           PID:  ${{ github.event.inputs.post_id }}
           AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
+          TTL:  ${{ github.event.inputs.title }}
         run: |
           set -euo pipefail
-          # Title preference: crawler-derived space title, else user-supplied
-          TTL_IN="${{ github.event.inputs.title }}"
-          TTL="${SPACE_TITLE:-$TTL_IN}"
-
           AT_HTML=""
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then AT_HTML="$(cat "${ATTN_HTML}")"; fi
           LINKS_HTML=""
@@ -886,12 +885,13 @@ jobs:
             --arg lhtml "${LINKS_HTML}" \
             --arg aads  "${{ steps.upload_ads.outputs.audio_ads_proxy || steps.upload_ads.outputs.audio_ads_raw }}" \
             --arg sd    "${SPACE_DATE_ISO:-}" \
+            --arg st    "${SPACE_TITLE:-}" \
             --arg dj    "${DIARIZED_JSON:-}" \
             '{
               gcs_url: $gcs,
               mime:    $mime,
               post_id: ($pid|tonumber),
-              title:   $ttl
+              title:   (if ($ttl|length)>0 then $ttl else $st end)
             }
             + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
@@ -914,7 +914,7 @@ jobs:
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            -d "@${WORKDIR}/wp_register_body.json" | jq -r . || true
+            -d "@${WORKDIR}/wp_register_body.json" | jq -r .
 
       - name: Patch WP — attendees/links/vtt/transcript/ads (partial modes)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && ( env.MODE == 'attendees_only' || env.MODE == 'links_only' || env.MODE == 'vtt_only' || env.MODE == 'transcript_only' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3' ) }}
@@ -955,7 +955,7 @@ jobs:
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
-            -d "@${WORKDIR}/wp_patch_body.json" | jq -r . || true
+            -d "@${WORKDIR}/wp_patch_body.json" | jq -r .
 
       - name: Patch WP — delete ads (meta-only acknowledgement)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && env.MODE == 'delete_ads_version' }}
@@ -968,7 +968,7 @@ jobs:
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
             -d "$(jq -n --arg pid "${PID}" --arg status "complete" --argjson progress 100 '{post_id: ($pid|tonumber), status:$status, progress:$progress, message:"Ads version deleted on GCS (if present)."}')" \
-            | jq -r . || true
+            | jq -r .
 
       - name: Summary
         shell: bash
@@ -980,13 +980,13 @@ jobs:
             echo "- Space URL ${{ github.event.inputs.space_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
-            if [ -n "${SPACE_TITLE:-}" ]; then
-              echo "- Space Title ${SPACE_TITLE}"
-            fi
             if [ -n "${SPACE_DATE_ISO:-}" ]; then
               echo "- Space Date (ISO) ${SPACE_DATE_ISO}"
             else
               echo "- Space Date (ISO) (unknown)"
+            fi
+            if [ -n "${SPACE_TITLE:-}" ]; then
+              echo "- Space Title ${SPACE_TITLE}"
             fi
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
               echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
@@ -1036,49 +1036,3 @@ jobs:
             echo "- Radio     enhance=${RADIO_ENHANCE} mono=${MIX_MONO} HPF=${HPF}Hz LPF=${LPF}Hz comp=${COMP_THRESH}dB/${COMP_RATIO}x"
             echo "- Crawler   max_minutes=${CRAWLER_MAX_MIN}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # --- Always notify WP of terminal states (unlock stale locks) ---
-      - name: Notify WP — complete (unlock)
-        if: ${{ success() && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail-with-body -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
-                       --arg status "complete" \
-                       --arg msg "Workflow completed." \
-                       --arg run "${{ github.run_id }}" \
-                       --argjson progress 100 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')" || true
-
-      - name: Notify WP — failed (unlock)
-        if: ${{ failure() && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail-with-body -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
-                       --arg status "failed" \
-                       --arg msg "Workflow failed; unlocking." \
-                       --arg run "${{ github.run_id }}" \
-                       --argjson progress 100 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')" || true
-
-      - name: Notify WP — cancelled (unlock)
-        if: ${{ cancelled() && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail-with-body -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
-                       --arg status "cancelled" \
-                       --arg msg "Workflow cancelled; unlocking." \
-                       --arg run "${{ github.run_id }}" \
-                       --argjson progress 100 \
-                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')" || true
