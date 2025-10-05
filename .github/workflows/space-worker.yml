@@ -145,18 +145,6 @@ jobs:
           # VTT validation threshold
           echo "VTT_MIN_CUES=$(jq -r '.vtt_min_cues // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
 
-          # ---------- EFFECTIVE ADS GATE ----------
-          # Count non-blank lines in ads.list and set HAS_ADS/ENABLE_ADS accordingly
-          ads_count="$(grep -cve '^[[:space:]]*$' "$WORKDIR/ads.list" 2>/dev/null || true)"
-          if [ -z "$ads_count" ]; then ads_count=0; fi
-          if [ "$ed" = "true" ] && [ "$ads_count" -gt 0 ]; then
-            echo "HAS_ADS=true"  >> "$GITHUB_ENV"
-            echo "ENABLE_ADS=true" >> "$GITHUB_ENV"
-          else
-            echo "HAS_ADS=false" >> "$GITHUB_ENV"
-            echo "ENABLE_ADS=false" >> "$GITHUB_ENV"
-          fi
-
       - name: Notify WP — queued
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
@@ -300,7 +288,7 @@ jobs:
           CRAWLER_VTT="$(find "${ARTDIR}" -type f \( -iname '*.vtt' -o -iname '*.webvtt' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${CRAWLER_VTT:-}" ] && [ -s "${CRAWLER_VTT}" ]; then
             cp "${CRAWLER_VTT}" "${ARTDIR}/${BASE}.vtt"
-            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+            # do NOT set VTT_PATH here; we'll validate first in the next step
           else
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
             if [ -n "${CC_JSONL:-}" ]; then
@@ -438,13 +426,24 @@ jobs:
       # ===========================
       #   CAPTIONS / TRANSCRIPT
       # ===========================
-      - name: Prefer crawler captions if present
+      - name: Prefer crawler captions if present (only if valid)
         id: crawl_cc
         if: ${{ env.MODE != 'attendees_only' && env.ENABLE_VTT == 'true' }}
         shell: bash
         run: |
           set -euxo pipefail
-          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+          C="${ARTDIR}/${BASE}.vtt"
+          if [ -s "$C" ]; then
+            HDR="$(head -n1 "$C" || true)"
+            CUES="$(grep -c -- '-->' "$C" || true)"
+            MIN="${VTT_MIN_CUES:-3}"
+            if [ "${HDR:-}" = "WEBVTT" ] && [ "${CUES:-0}" -ge "${MIN}" ]; then
+              echo "VTT_PATH=${C}" >> "$GITHUB_ENV"
+            else
+              echo "Crawler VTT invalid or too few cues (${CUES:-0}); ignoring and clearing."
+              rm -f "$C" || true
+            fi
+          fi
 
       - name: Convert crawler JSONL captions to VTT
         if: ${{ env.MODE != 'attendees_only' && env.ENABLE_VTT == 'true' && env.VTT_PATH == '' }}
@@ -528,28 +527,24 @@ jobs:
             --data-binary @"${MP3_PATH}" \
             "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true&format=json" \
             -o "${DGJSON}" || true
-          if [ ! -s "${DGJSON}" ]; then
-            echo "No Deepgram JSON; cannot rebuild VTT"
-            exit 0
-          fi
-          # Build clean WEBVTT from utterances (speaker + start/end)
-          jq -r '
-            def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
-            def ms3(n): (1000 + (n%1000)|tostring)[1:4];
-            def ts(sec):
-              ( (sec/3600)|floor ) as $h |
-              ( ((sec%3600)/60)|floor ) as $m |
-              ( (sec%60)|floor ) as $s |
-              ( (sec*1000|round)%1000 ) as $ms |
-              ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
-            "WEBVTT", "",
-            ( .results.utterances // [] )[]
-            | (ts(.start) + " --> " + ts(.end)),
-              ("Speaker " + ((.speaker // 0 | tonumber) + 1 | tostring) + ": " + (.transcript // "")),
-              ""
-          ' "${DGJSON}" > "${ARTDIR}/${BASE}.vtt" || true
-          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+          if [ -s "${DGJSON}" ]; then
+            # Build clean WEBVTT from utterances (speaker + start/end)
+            jq -r '
+              def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
+              def ms3(n): (1000 + (n%1000)|tostring)[1:4];
+              def ts(sec):
+                ( (sec/3600)|floor ) as $h |
+                ( ((sec%3600)/60)|floor ) as $m |
+                ( (sec%60)|floor ) as $s |
+                ( (sec*1000|round)%1000 ) as $ms |
+                ($h|tostring) + ":" + two($m) + ":" + two($s) + "." + ms3($ms);
+              "WEBVTT", "",
+              ( .results.utterances // [] )[]
+              | (ts(.start) + " --> " + ts(.end)),
+                ("Speaker " + ((.speaker // 0 | tonumber) + 1 | tostring) + ": " + (.transcript // "")),
+                ""
+            ' "${DGJSON}" > "${ARTDIR}/${BASE}.vtt" || true
+            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           fi
 
       - name: Validate VTT (final)
@@ -614,7 +609,6 @@ jobs:
             -o "${DGJSON}" || true
           if [ -s "${DGJSON}" ]; then
             # Build diarized paragraphs with timestamps
-            DTXT="${ARTDIR}/${BASE}.diarized.txt}"
             DTXT="${ARTDIR}/${BASE}.diarized.txt"
             jq -r '
               def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
@@ -763,7 +757,7 @@ jobs:
       #   ADS VERSION
       # ===========================
       - name: Download ad MP3s (if any)
-        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') }}
+        if: ${{ env.ENABLE_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -775,9 +769,16 @@ jobs:
             curl -L "$u" -o "${WORKDIR}/ads/ad_${n}.mp3" || true
           done < "${ADS_LIST}"
           echo "ADS_DIR=${WORKDIR}/ads" >> "$GITHUB_ENV"
+          # robust count
+          AD_COUNT="$(find "${WORKDIR}/ads" -maxdepth 1 -type f -name 'ad_*.mp3' | wc -l | tr -d ' ')"
+          if [ "${AD_COUNT:-0}" -gt 0 ]; then
+            echo "ADS_AVAILABLE=1" >> "$GITHUB_ENV"
+          else
+            echo "ADS_AVAILABLE=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Build ads version MP3 (pre-roll ads + base)
-        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') && ( (env.MP3_PATH != '') || (env.MODE == '' && steps.upload_mp3.outcome == 'success') ) }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.ADS_AVAILABLE == '1' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') && ( (env.MP3_PATH != '') || (env.MODE == '' && steps.upload_mp3.outcome == 'success') ) }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -787,18 +788,22 @@ jobs:
               echo "No base MP3 present; cannot build ads version"; exit 0
             fi
           fi
-          AD_COUNT=$(ls -1 "${ADS_DIR}"/ad_*.mp3 2>/dev/null | wc -l | tr -d ' ')
+          # safer globbing / counting
+          shopt -s nullglob
+          files=( "${ADS_DIR}"/ad_*.mp3 )
+          AD_COUNT="${#files[@]}"
           if [ "${AD_COUNT:-0}" -eq 0 ]; then
-            echo "No ads found (and/or Ads disabled) — skipping ads version."
+            echo "No ads found — skipping ads version."
+            shopt -u nullglob
             exit 0
           fi
           MAP=""
           INDX=0
-          for f in "${ADS_DIR}"/ad_*.mp3; do
-            [ -f "$f" ] || continue
+          for f in "${files[@]}"; do
             INDX=$((INDX+1))
             MAP="${MAP} -i \"$f\""
           done
+          shopt -u nullglob
           INDX=$((INDX+1))
           MAP="${MAP} -i \"${MP3_PATH}\""
           # shellcheck disable=SC2086
@@ -808,7 +813,7 @@ jobs:
           fi
 
       - name: Re-normalize Ads MP3 to -16 LUFS
-        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && env.MP3_ADS_PATH != '' }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.MP3_ADS_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -826,7 +831,7 @@ jobs:
 
       - name: Upload Ads MP3 to GCS
         id: upload_ads
-        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && env.MP3_ADS_PATH != '' }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.MP3_ADS_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -969,6 +974,19 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
             -d "$(jq -n --arg pid "${PID}" --arg status "complete" --argjson progress 100 '{post_id: ($pid|tonumber), status:$status, progress:$progress, message:"Ads version deleted on GCS (if present)."}')" \
             | jq -r .
+
+      # ===========================
+      #   GUARD: FAIL IF NO AUDIO
+      # ===========================
+      - name: Guard — fail run if no base audio was produced (full mode)
+        if: ${{ env.MODE == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.upload_mp3.outputs.audio_proxy }}" ] && [ -z "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
+            echo "No base audio was uploaded in full mode — failing the job."
+            exit 1
+          fi
 
       - name: Summary
         shell: bash
