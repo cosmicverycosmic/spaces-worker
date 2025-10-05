@@ -145,6 +145,18 @@ jobs:
           # VTT validation threshold
           echo "VTT_MIN_CUES=$(jq -r '.vtt_min_cues // 3' "$WORKDIR/inputs.json" 2>/dev/null)" >> "$GITHUB_ENV"
 
+          # ---------- EFFECTIVE ADS GATE ----------
+          # Count non-blank lines in ads.list and set HAS_ADS/ENABLE_ADS accordingly
+          ads_count="$(grep -cve '^[[:space:]]*$' "$WORKDIR/ads.list" 2>/dev/null || true)"
+          if [ -z "$ads_count" ]; then ads_count=0; fi
+          if [ "$ed" = "true" ] && [ "$ads_count" -gt 0 ]; then
+            echo "HAS_ADS=true"  >> "$GITHUB_ENV"
+            echo "ENABLE_ADS=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_ADS=false" >> "$GITHUB_ENV"
+            echo "ENABLE_ADS=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Notify WP — queued
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
@@ -602,6 +614,7 @@ jobs:
             -o "${DGJSON}" || true
           if [ -s "${DGJSON}" ]; then
             # Build diarized paragraphs with timestamps
+            DTXT="${ARTDIR}/${BASE}.diarized.txt}"
             DTXT="${ARTDIR}/${BASE}.diarized.txt"
             jq -r '
               def two(n): if n<10 then "0"+(n|tostring) else (n|tostring) end;
@@ -750,7 +763,7 @@ jobs:
       #   ADS VERSION
       # ===========================
       - name: Download ad MP3s (if any)
-        if: ${{ env.ENABLE_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -764,7 +777,7 @@ jobs:
           echo "ADS_DIR=${WORKDIR}/ads" >> "$GITHUB_ENV"
 
       - name: Build ads version MP3 (pre-roll ads + base)
-        if: ${{ env.ENABLE_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') && ( (env.MP3_PATH != '') || (env.MODE == '' && steps.upload_mp3.outcome == 'success') ) }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && (env.MODE == '' || env.MODE == 'ads_only' || env.MODE == 'patch_all_from_mp3') && ( (env.MP3_PATH != '') || (env.MODE == '' && steps.upload_mp3.outcome == 'success') ) }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -795,7 +808,7 @@ jobs:
           fi
 
       - name: Re-normalize Ads MP3 to -16 LUFS
-        if: ${{ env.ENABLE_ADS == 'true' && env.MP3_ADS_PATH != '' }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && env.MP3_ADS_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -813,7 +826,7 @@ jobs:
 
       - name: Upload Ads MP3 to GCS
         id: upload_ads
-        if: ${{ env.ENABLE_ADS == 'true' && env.MP3_ADS_PATH != '' }}
+        if: ${{ env.ENABLE_ADS == 'true' && env.HAS_ADS == 'true' && env.MP3_ADS_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
