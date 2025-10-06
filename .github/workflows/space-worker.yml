@@ -34,17 +34,6 @@ on:
         type: choice
         options: ["true","false"]
         default: "true"
-      enable_ads:
-        description: "Build and upload ads-spliced MP3"
-        required: false
-        type: choice
-        options: ["false","true"]
-        default: "false"
-      space_id:
-        description: "Space ID (parsed from URL when blank)"
-        required: false
-        type: string
-        default: ""
       mode:
         description: "Limit processing to a specific area"
         required: false
@@ -56,8 +45,8 @@ on:
         required: false
         type: string
         default: ""
-      wp_marker:
-        description: "Internal correlation marker from WP (ignored by worker)"
+      inputs_json:
+        description: "Opaque payload from external dispatchers (e.g. {\"enable_ads\": true})"
         required: false
         type: string
         default: ""
@@ -118,6 +107,20 @@ jobs:
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Parse inputs_json overrides (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENABLE_ADS=false
+          if [ -n "${{ inputs.inputs_json }}" ]; then
+            printf '%s' '${{ inputs.inputs_json }}' > "${WORKDIR}/inputs.json"
+            if jq -e . "${WORKDIR}/inputs.json" >/dev/null 2>&1; then
+              FLAG="$(jq -r '(.enable_ads // .ads // false) | tostring' "${WORKDIR}/inputs.json")"
+              [ "$FLAG" = "true" ] && ENABLE_ADS=true
+            fi
+          fi
+          echo "ENABLE_ADS=${ENABLE_ADS}" >> "$GITHUB_ENV"
+
       - name: Validate config and prefixes
         id: cfg
         shell: bash
@@ -135,14 +138,10 @@ jobs:
         id: ids
         shell: bash
         env:
-          INP_SPACE_ID: ${{ inputs.space_id }}
-          URL:          ${{ inputs.space_url }}
+          URL: ${{ inputs.space_url }}
         run: |
           set -euxo pipefail
-          SID="${INP_SPACE_ID}"
-          if [ -z "$SID" ]; then
-            SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
-          fi
+          SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
           test -n "$SID" || { echo "Could not parse Space ID from URL"; exit 1; }
           echo "SPACE_ID=${SID}"  >> "$GITHUB_ENV"
           echo "space_id=${SID}"  >> "$GITHUB_OUTPUT"
@@ -201,7 +200,7 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          # AUDIO file (primary)
+          # AUDIO file
           AUDIO_FILE="$(grep -hEo '"/app/download[^"]+\.(m4a|mp3|mp4|aac|webm|ogg|wav|ts)"' "$LOG_STD" "$LOG_ERR" | tr -d '"' | sed "s|^/app/download|$ARTDIR|" | tail -n1 || true)"
           if [[ -z "${AUDIO_FILE:-}" || ! -f "$AUDIO_FILE" ]]; then
             AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
@@ -211,7 +210,7 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Extract Space metadata JSON (after the pipe)
+          # Space metadata JSON (after the pipe)
           RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
@@ -220,7 +219,7 @@ jobs:
             printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line.json" || true
           fi
 
-          # Derive space title/date and compute BASE/SLUG
+          # Derive title/date and compute BASE/SLUG
           SPACE_TITLE=""
           SPACE_EPOCH_MS=""
           if [ -s "${ARTDIR}/_as_line.json" ] && jq -e . "${ARTDIR}/_as_line.json" >/dev/null 2>&1; then
@@ -232,7 +231,6 @@ jobs:
           fi
           SPACE_DATE_ISO="$(date -u -d "@$((SPACE_EPOCH_MS/1000))" +"%Y-%m-%dT%H:%M:%SZ")"
           SPACE_DATE="$(printf '%s' "$SPACE_DATE_ISO" | cut -c1-10)" # YYYY-MM-DD
-          # Canonical naming: space-YYYY-MM-DD-<space_id>
           BASE="space-${SPACE_DATE}-${SID}"
           SLUG="${SPACE_DATE}-${SID}"
 
@@ -241,14 +239,12 @@ jobs:
           echo "BASE=$BASE"                                               >> "$GITHUB_ENV"
           echo "POST_SLUG=$SLUG"                                          >> "$GITHUB_ENV"
 
-          # Captions JSONL (crawler)
+          # Captions JSONL (crawler) -> save & try VTT
           CC_FILE="$(find "${ARTDIR}" -maxdepth 2 -type f \( -iname '*CC.jsonl' -o -iname '*captions*.jsonl' -o -iname '*caption*.jsonl' \) | head -n1 || true)"
           if [ -n "$CC_FILE" ]; then
-            # Normalize name and copy next to artifacts
             CC_NORM="${ARTDIR}/${BASE}_crawler_cc.jsonl"
             cp -f "$CC_FILE" "$CC_NORM" || true
             echo "CRAWLER_CC=$CC_NORM" >> "$GITHUB_ENV"
-            # Also convert to VTT (crawler-native) for primary VTT path
             docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc v "/app/download/$(basename "$CC_NORM")" > "${ARTDIR}/${BASE}.vtt" || true
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           fi
@@ -391,7 +387,6 @@ jobs:
           fi
           echo "CRAWLER_CC_URL=${CC_RAW}" >> "$GITHUB_ENV"
 
-          # Prepare debug snippets for WP
           HEAD_TXT="$(head -n 40 "${CRAWLER_CC}" || true)"
           TAIL_TXT="$(tail -n 40 "${CRAWLER_CC}" || true)"
           LINE_CT="$(wc -l < "${CRAWLER_CC}" | tr -d ' ' || echo 0)"
@@ -433,13 +428,12 @@ jobs:
 
       - name: Build ads-spliced MP3 (ONLY when enabled and ads exist)
         id: ads_build
-        if: ${{ inputs.enable_ads == 'true' && inputs.mode != 'attendees_only' && env.MP3_PATH != '' }}
+        if: ${{ env.ENABLE_ADS == 'true' && inputs.mode != 'attendees_only' && env.MP3_PATH != '' }}
         shell: bash
         env:
           ADS_DIR: ${{ env.WORKDIR }}/ads
         run: |
           set -euxo pipefail
-          # Expect ad_*.mp3 in $ADS_DIR; skip silently if none
           AD_COUNT=$(ls -1 "${ADS_DIR}"/ad_*.mp3 2>/dev/null | wc -l | tr -d ' ' || echo 0)
           if [ "${AD_COUNT:-0}" -eq 0 ]; then
             echo "No ads present — skipping ads version."
@@ -454,7 +448,6 @@ jobs:
           done
           INDX=$((INDX+1))
           MAP="$MAP -i \"${MP3_PATH}\""
-          # shellcheck disable=SC2086
           eval ffmpeg -hide_banner -y $MAP -filter_complex "concat=n=${INDX}:v=0:a=1" -ar 48000 -ac 2 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}-ads.mp3" || true
           if [ -s "${ARTDIR}/${BASE}-ads.mp3" ]; then
             echo "MP3_ADS_PATH=${ARTDIR}/${BASE}-ads.mp3" >> "$GITHUB_ENV"
@@ -482,9 +475,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SLUG="${POST_SLUG:-}"
           TTL="${SPACE_TITLE:-${{ inputs.title }}}"
-          # sanitize slug (lowercase, alnum and dashes)
+          [ -n "$TTL" ] || TTL="Space ${SPACE_ID:-unknown}"
+          SLUG="${POST_SLUG:-}"
+          [ -n "$SLUG" ] || SLUG="$(date -u +%F)-${SPACE_ID:-unknown}"
           SLUG="$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-|-$//g')"
           BODY="$(jq -n --arg title "$TTL" --arg slug "$SLUG" '{title:$title, slug:$slug}')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
@@ -492,7 +486,7 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/posts/${{ inputs.post_id }}" \
             -d "$BODY" | jq -r '.id, .slug' 1>/dev/null || true
 
-      - name: WordPress — patch assets (match WP plugin fields)
+      - name: WordPress — patch assets (fields that actually exist)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && inputs.post_id != '' }}
         shell: bash
         env:
@@ -514,7 +508,6 @@ jobs:
           AT_HTML=""
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && AT_HTML="$(cat "${ATTN_HTML}")"
 
-          # Prepare crawler artifacts debug object (safe size)
           CA_JSON="{}"
           if [ -n "${CRAWLER_DEBUG_JSON:-}" ] && [ -s "${CRAWLER_DEBUG_JSON:-}" ]; then
             CA_JSON="$(cat "${CRAWLER_DEBUG_JSON}")"
@@ -565,7 +558,6 @@ jobs:
             echo "- VTT URL  : ${GCS_VTT_URL:-none}"
             echo "- Ads URL  : ${GCS_ADS_URL:-none}"
             echo "- Captions JSONL: ${CRAWLER_CC_URL:-none}"
-            echo "- Attendees: $([ -n "${ATTN_HTML:-}" ] && echo present || echo none)"
             echo "- Mode     : ${{ inputs.mode }}"
-            echo "- Ads flag : ${{ inputs.enable_ads }}"
+            echo "- Ads flag : ${ENABLE_ADS:-false}"
           } >> "$GITHUB_STEP_SUMMARY"
