@@ -46,7 +46,7 @@ on:
         type: string
         default: ""
       inputs_json:
-        description: "Opaque payload from external dispatchers (e.g. {\"enable_ads\": true})"
+        description: "Opaque payload (e.g. {\"enable_ads\": true})"
         required: false
         type: string
         default: ""
@@ -107,21 +107,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Parse inputs_json overrides (optional)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ENABLE_ADS=false
-          if [ -n "${{ inputs.inputs_json }}" ]; then
-            printf '%s' '${{ inputs.inputs_json }}' > "${WORKDIR}/inputs.json"
-            if jq -e . "${WORKDIR}/inputs.json" >/dev/null 2>&1; then
-              FLAG="$(jq -r '(.enable_ads // .ads // false) | tostring' "${WORKDIR}/inputs.json")"
-              [ "$FLAG" = "true" ] && ENABLE_ADS=true
-            fi
-          fi
-          echo "ENABLE_ADS=${ENABLE_ADS}" >> "$GITHUB_ENV"
-
-      - name: Validate config and prefixes
+      - name: Validate config and prepare dirs
         id: cfg
         shell: bash
         run: |
@@ -134,7 +120,26 @@ jobs:
           echo "PREFIX=$PFX"                  >> "$GITHUB_ENV"
           echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
-      - name: Derive Space ID
+      - name: Parse inputs_json overrides (optional, after dirs exist)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENABLE_ADS=false
+          RAW="${{ inputs.inputs_json }}"
+          if [ -n "$RAW" ]; then
+            # auto-wrap if no leading {
+            if ! printf '%s' "$RAW" | grep -q '^[[:space:]]*{'; then
+              RAW="{$RAW}"
+            fi
+            printf '%s' "$RAW" > "${WORKDIR}/inputs.json"
+            if jq -e . "${WORKDIR}/inputs.json" >/dev/null 2>&1; then
+              FLAG="$(jq -r '(.enable_ads // .ads // false) | tostring' "${WORKDIR}/inputs.json")"
+              [ "$FLAG" = "true" ] && ENABLE_ADS=true
+            fi
+          fi
+          echo "ENABLE_ADS=${ENABLE_ADS}" >> "$GITHUB_ENV"
+
+      - name: Derive Space ID and provisional BASE/slug
         id: ids
         shell: bash
         env:
@@ -143,8 +148,12 @@ jobs:
           set -euxo pipefail
           SID="$(echo "$URL" | sed -nE 's#^.*/i/spaces/([^/?#]+).*#\1#p')"
           test -n "$SID" || { echo "Could not parse Space ID from URL"; exit 1; }
-          echo "SPACE_ID=${SID}"  >> "$GITHUB_ENV"
-          echo "space_id=${SID}"  >> "$GITHUB_OUTPUT"
+          echo "SPACE_ID=${SID}" >> "$GITHUB_ENV"
+          # Provisional BASE/slug (may be refined after crawler reveals true date)
+          D="$(date -u +%F)"
+          echo "BASE=space-${D}-${SID}" >> "$GITHUB_ENV"
+          echo "POST_SLUG=${D}-${SID}"  >> "$GITHUB_ENV"
+          echo "space_id=${SID}"        >> "$GITHUB_OUTPUT"
 
       - name: GCP auth
         shell: bash
@@ -161,9 +170,7 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
-          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then
-            AUTH=""
-          fi
+          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
@@ -200,7 +207,7 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          # AUDIO file
+          # AUDIO file (from logs or latest in out/)
           AUDIO_FILE="$(grep -hEo '"/app/download[^"]+\.(m4a|mp3|mp4|aac|webm|ogg|wav|ts)"' "$LOG_STD" "$LOG_ERR" | tr -d '"' | sed "s|^/app/download|$ARTDIR|" | tail -n1 || true)"
           if [[ -z "${AUDIO_FILE:-}" || ! -f "$AUDIO_FILE" ]]; then
             AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
@@ -212,28 +219,23 @@ jobs:
 
           # Space metadata JSON (after the pipe)
           RAW="$(grep -m1 -F 'getAudioSpaceById |' "$LOG_STD" || true)"
-          if [ -z "$RAW" ]; then
-            RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"
-          fi
+          if [ -z "$RAW" ]; then RAW="$(grep -m1 -F 'getAudioSpaceByRestId |' "$LOG_STD" || true)"; fi
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line.json" || true
           fi
 
-          # Derive title/date and compute BASE/SLUG
+          # Derive title/date and compute BASE/SLUG (overwrite provisional)
           SPACE_TITLE=""
           SPACE_EPOCH_MS=""
           if [ -s "${ARTDIR}/_as_line.json" ] && jq -e . "${ARTDIR}/_as_line.json" >/dev/null 2>&1; then
             SPACE_TITLE="$(jq -r '(.audioSpace // .).metadata.title // empty' "${ARTDIR}/_as_line.json")"
             SPACE_EPOCH_MS="$(jq -r '(.audioSpace // .).metadata.ended_at // (.audioSpace // .).metadata.started_at // empty' "${ARTDIR}/_as_line.json")"
           fi
-          if [ -z "${SPACE_EPOCH_MS:-}" ]; then
-            SPACE_EPOCH_MS="$(date +%s000)"
-          fi
+          if [ -z "${SPACE_EPOCH_MS:-}" ]; then SPACE_EPOCH_MS="$(date +%s000)"; fi
           SPACE_DATE_ISO="$(date -u -d "@$((SPACE_EPOCH_MS/1000))" +"%Y-%m-%dT%H:%M:%SZ")"
           SPACE_DATE="$(printf '%s' "$SPACE_DATE_ISO" | cut -c1-10)" # YYYY-MM-DD
           BASE="space-${SPACE_DATE}-${SID}"
           SLUG="${SPACE_DATE}-${SID}"
-
           [ -n "$SPACE_TITLE" ] && echo "SPACE_TITLE=$SPACE_TITLE"       >> "$GITHUB_ENV"
           echo "SPACE_DATE_ISO=$SPACE_DATE_ISO"                           >> "$GITHUB_ENV"
           echo "BASE=$BASE"                                               >> "$GITHUB_ENV"
@@ -369,9 +371,9 @@ jobs:
           if [ "${{ inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "GCS_AUDIO_URL=${RAW}"     >> "$GITHUB_ENV"
-          echo "audio_raw=${RAW}"         >> "$GITHUB_OUTPUT"
-          echo "audio_proxy=${PROXY}"     >> "$GITHUB_OUTPUT"
+          echo "GCS_AUDIO_URL=${RAW}" >> "$GITHUB_ENV"
+          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Upload crawler captions JSONL (debug)
         id: upload_cc
