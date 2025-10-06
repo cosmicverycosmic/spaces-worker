@@ -4,50 +4,50 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X/Twitter Space URL
+        description: "X/Twitter Space URL"
         required: false
         type: string
         default: ""
       post_id:
-        description: Existing WordPress post ID (optional)
+        description: "Existing WordPress post ID (optional)"
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title (optional)
+        description: "Fallback post title (optional)"
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default spaces/YYYY/MM)
+        description: "GCS prefix (default spaces/YYYY/MM)"
         required: false
         type: string
         default: ""
       make_public:
-        description: Make uploaded artifacts public
+        description: "Make uploaded artifacts public"
         required: false
         type: choice
         options: ["true","false"]
         default: "true"
       do_transcript:
-        description: Use Deepgram if crawler captions unavailable
+        description: "Use Deepgram if crawler captions unavailable"
         required: false
         type: choice
         options: ["true","false"]
         default: "true"
       mode:
-        description: Limit processing (''=full, transcript_only, attendees_only, vtt_only, links_only, ads_only, patch_all_from_mp3, delete_ads_version, watch)
+        description: "Limit processing (''=full, transcript_only, attendees_only, vtt_only, links_only, ads_only, patch_all_from_mp3, delete_ads_version, watch)"
         required: false
         type: choice
         options: ["","transcript_only","attendees_only","vtt_only","links_only","ads_only","patch_all_from_mp3","delete_ads_version","watch"]
         default: ""
       existing_mp3_url:
-        description: For partial modes; URL to existing base MP3
+        description: "For partial modes; URL to existing base MP3"
         required: false
         type: string
         default: ""
       inputs_json:
-        description: JSON: enable_* toggles, ads_urls, purple_tweet_url, audio_ads_url, watch_users, watch_duration_minutes, radio_enhance, mix_mono, highpass_hz, lowpass_hz, comp_thresh_db, comp_ratio, enable_diarization, crawler_max_minutes, vtt_min_cues
+        description: "JSON: enable_* toggles, ads_urls, purple_tweet_url, audio_ads_url, watch_users, watch_duration_minutes, radio_enhance, mix_mono, highpass_hz, lowpass_hz, comp_thresh_db, comp_ratio, enable_diarization, crawler_max_minutes, vtt_min_cues"
         required: false
         type: string
         default: ""
@@ -110,11 +110,11 @@ jobs:
           printf '%s' '${{ github.event.inputs.inputs_json }}' > "$WORKDIR/inputs.json" || true
 
           # Toggles (ads default OFF unless explicitly enabled)
-          jq -r '.enable_transcript // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo true | xargs -I{} echo "ENABLE_TRANSCRIPT={}" >> "$GITHUB_ENV"
-          jq -r '.enable_attendees  // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo true | xargs -I{} echo "ENABLE_ATTENDEES={}" >> "$GITHUB_ENV"
-          jq -r '.enable_vtt        // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo true | xargs -I{} echo "ENABLE_VTT={}" >> "$GITHUB_ENV"
-          jq -r '.enable_ads        // "false"' "$WORKDIR/inputs.json" 2>/dev/null || echo false | xargs -I{} echo "ENABLE_ADS={}" >> "$GITHUB_ENV"
-          jq -r '.enable_diarization // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo true | xargs -I{} echo "ENABLE_DIARIZATION={}" >> "$GITHUB_ENV"
+          ET=$(jq -r '.enable_transcript // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo "true");  echo "ENABLE_TRANSCRIPT=$ET" >> "$GITHUB_ENV"
+          EA=$(jq -r '.enable_attendees  // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo "true");  echo "ENABLE_ATTENDEES=$EA" >> "$GITHUB_ENV"
+          EV=$(jq -r '.enable_vtt        // "true"'  "$WORKDIR/inputs.json" 2>/dev/null || echo "true");  echo "ENABLE_VTT=$EV" >> "$GITHUB_ENV"
+          EADS=$(jq -r '.enable_ads      // "false"' "$WORKDIR/inputs.json" 2>/dev/null || echo "false"); echo "ENABLE_ADS=$EADS" >> "$GITHUB_ENV"
+          EDZ=$(jq -r '.enable_diarization // "true"' "$WORKDIR/inputs.json" 2>/dev/null || echo "true"); echo "ENABLE_DIARIZATION=$EDZ" >> "$GITHUB_ENV"
 
           echo "MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_ENV"
           echo "POST_ID=${{ github.event.inputs.post_id }}" >> "$GITHUB_ENV"
