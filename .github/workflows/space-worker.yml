@@ -510,11 +510,16 @@ jobs:
           AT_HTML=""
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && AT_HTML="$(cat "${ATTN_HTML}")"
 
+          # Build crawler artifacts JSON content safely (read file content; never pass a path)
           CA_JSON="{}"
           if [ -n "${CRAWLER_DEBUG_JSON:-}" ] && [ -s "${CRAWLER_DEBUG_JSON:-}" ]; then
             CA_JSON="$(cat "${CRAWLER_DEBUG_JSON}")"
           elif [ -n "${CRAWLER_CC_URL:-}" ]; then
             CA_JSON="$(jq -n --arg url "${CRAWLER_CC_URL}" '{captions_jsonl_url:$url}')"
+          fi
+          # Validate; if invalid, fall back to {}
+          if ! jq -e . >/dev/null 2>&1 <<<"${CA_JSON}"; then
+            CA_JSON="{}"
           fi
 
           BODY="$(jq -n \
@@ -525,7 +530,7 @@ jobs:
             --arg sd   "${SPACE_DATE_ISO:-}" \
             --arg ttl  "${SPACE_TITLE:-${{ inputs.title }}}" \
             --arg ath  "${AT_HTML}" \
-            --argjson ca ${CA_JSON} '
+            --argjson ca "${CA_JSON}" '
             {
               post_id: ($pid|tonumber),
               status: "complete",
