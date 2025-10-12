@@ -247,133 +247,138 @@ jobs:
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            cat > "${WORKDIR}/gen_vtt.py" << 'PYCODE'
-            import json, os, re
-            from datetime import datetime, timezone
+          cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
+          import json, os, re
+          from datetime import datetime, timezone
 
-            artdir = os.environ.get("ARTDIR")
-            base   = os.environ.get("BASE")
-            src    = os.environ.get("CC_JSONL") or ""
-            if not src:
-                raise SystemExit(0)
+          artdir = os.environ.get("ARTDIR")
+          base   = os.environ.get("BASE")
+          src    = os.environ.get("CC_JSONL") or ""
+          if not src:
+              raise SystemExit(0)
 
-            def parse_time_iso(s):
-                if not s:
-                    return None
-                s = s.strip()
-                if s.endswith('Z'):
-                    s = s[:-1] + '+00:00'
-                if re.search(r'[+-]\d{4}$', s):
-                    s = s[:-5] + s[-5:-2] + ':' + s[-2:]
-                try:
-                    dt = datetime.fromisoformat(s)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    return dt.timestamp()
-                except Exception:
-                    return None
+          def parse_time_iso(s):
+              if not s:
+                  return None
+              s = s.strip()
+              if s.endswith('Z'):
+                  s = s[:-1] + '+00:00'
+              if re.search(r'[+-]\d{4}$', s):
+                  s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+              try:
+                  dt = datetime.fromisoformat(s)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.timestamp()
+              except Exception:
+                  return None
 
-            def fmt_ts(t):
-                if t < 0: t = 0.0
-                h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-                return f"{h:02d}:{m:02d}:{s:06.3f}"
+          def fmt_ts(t):
+              if t < 0: t = 0.0
+              h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+              return f"{h:02d}:{m:02d}:{s:06.3f}"
 
-            def strip_emoji_for_vtt(s):
-                s = re.sub(r'[<>&]', '', s)
-                s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
-                s = s.strip()
-                return s or "Speaker"
+          def strip_emoji_for_vtt(s):
+              s = re.sub(r'[<>&]', '', s)  # avoid breaking WebVTT
+              # strip surrogate + PUA emoji that can break some players
+              s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
+              s = s.strip()
+              return s or "Speaker"
 
-            def html_escape(s):
-                return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+          def html_escape(s):
+              return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
-            utterances = []
-            with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        outer = json.loads(line)
-                    except Exception:
-                        continue
-                    payload_raw = outer.get("payload")
-                    if not payload_raw:
-                        continue
-                    try:
-                        payload = json.loads(payload_raw)
-                    except Exception:
-                        continue
-                    body_raw = payload.get("body")
-                    if not body_raw:
-                        continue
-                    try:
-                        inner = json.loads(body_raw)
-                    except Exception:
-                        continue
-                    if inner.get("type") != 45:
-                        continue
-                    text = (inner.get("body") or "").strip()
-                    if not text:
-                        continue
-                    if "final" in inner and not inner.get("final"):
-                        continue
-                    name = inner.get("displayName") or payload.get("sender",{}).get("display_name") \
-                           or inner.get("username") or inner.get("user_id") or "Speaker"
-                    ts = parse_time_iso(inner.get("programDateTime"))
-                    if ts is None:
-                        try:
-                            ts = int(inner.get("timestamp")) / 1000.0
-                        except Exception:
-                            ts = None
-                    if ts is None:
-                        continue
-                    utterances.append({"ts": ts, "name": name, "text": text})
+          utterances = []
+          with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      outer = json.loads(line)
+                  except Exception:
+                      continue
+                  payload_raw = outer.get("payload")
+                  if not payload_raw:
+                      continue
+                  try:
+                      payload = json.loads(payload_raw)
+                  except Exception:
+                      continue
+                  body_raw = payload.get("body")
+                  if not body_raw:
+                      continue
+                  try:
+                      inner = json.loads(body_raw)
+                  except Exception:
+                      continue
+                  # type 45 = caption/utterance messages
+                  if inner.get("type") != 45:
+                      continue
+                  text = (inner.get("body") or "").strip()
+                  if not text:
+                      continue
+                  if "final" in inner and not inner.get("final"):
+                      continue
+                  name = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
+                         or inner.get("username") or inner.get("user_id") or "Speaker"
+                  ts = parse_time_iso(inner.get("programDateTime"))
+                  if ts is None:
+                      try:
+                          ts = int(inner.get("timestamp")) / 1000.0
+                      except Exception:
+                          ts = None
+                  if ts is None:
+                      continue
+                  utterances.append({"ts": ts, "name": name, "text": text})
 
-            utterances.sort(key=lambda x: x["ts"])
-            if not utterances:
-                raise SystemExit(0)
+          utterances.sort(key=lambda x: x["ts"])
+          if not utterances:
+              raise SystemExit(0)
 
-            t0_abs = utterances[0]["ts"]
+          t0_abs = utterances[0]["ts"]
 
-            for i,u in enumerate(utterances):
-                u["start_rel"] = u["ts"] - t0_abs
-                if i+1 < len(utterances):
-                    nxt = utterances[i+1]["ts"] - t0_abs
-                    u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
-                else:
-                    words = max(1, len(u["text"].split()))
-                    dur = min(6.0, max(1.2, 0.35*words + 0.8))
-                    u["end_rel"] = u["start_rel"] + dur
+          for i, u in enumerate(utterances):
+              u["start_rel"] = u["ts"] - t0_abs
+              if i + 1 < len(utterances):
+                  nxt = utterances[i + 1]["ts"] - t0_abs
+                  u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
+              else:
+                  words = max(1, len(u["text"].split()))
+                  dur = min(6.0, max(1.2, 0.35 * words + 0.8))
+                  u["end_rel"] = u["start_rel"] + dur
 
-            vtt_path = os.path.join(artdir, f"{base}.vtt")
-            with open(vtt_path, "w", encoding="utf-8") as vf:
-                vf.write("WEBVTT\n\n")
-                for idx,u in enumerate(utterances, 1):
-                    vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
-                    vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
+          # WEBVTT with bold speaker names
+          vtt_path = os.path.join(artdir, f"{base}.vtt")
+          with open(vtt_path, "w", encoding="utf-8") as vf:
+              vf.write("WEBVTT\n\n")
+              for idx, u in enumerate(utterances, 1):
+                  vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
+                  vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
 
-            tr_path = os.path.join(artdir, f"{base}_transcript.html")
-            with open(tr_path, "w", encoding="utf-8") as tf:
-                tf.write('<div class="transcript">\n')
-                for u in utterances:
-                    tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
-                tf.write("</div>\n")
+          # HTML transcript with bold names
+          tr_path = os.path.join(artdir, f"{base}_transcript.html")
+          with open(tr_path, "w", encoding="utf-8") as tf:
+              tf.write('<div class="transcript">\n')
+              for u in utterances:
+                  tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
+              tf.write("</div>\n")
 
-            start_iso = datetime.utcfromtimestamp(t0_abs).replace(tzinfo=timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-            with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
-                sf.write(start_iso + "\n")
-            PYCODE
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
-            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-            fi
-            if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
-              echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
-            fi
-            if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-              echo "SPACE_STARTED_AT=$(cat "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')" >> "$GITHUB_ENV"
-            fi
+          # Earliest absolute timestamp → used later to set WP post date
+          start_iso = datetime.utcfromtimestamp(t0_abs).replace(tzinfo=timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
+              sf.write(start_iso + "\n")
+          PYCODE
+          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
+            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+            echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
+          fi
           fi
 
       - name: Notify WP — processing audio
