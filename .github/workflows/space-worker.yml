@@ -232,14 +232,151 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
 
-          CRAWLER_VTT="$(find "${ARTDIR}" -type f \( -iname '*.vtt' -o -iname '*.webvtt' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-          if [ -n "${CRAWLER_VTT:-}" ] && [ -s "${CRAWLER_VTT}" ]; then
-            cp "${CRAWLER_VTT}" "${ARTDIR}/${BASE}.vtt"
-            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-          else
-            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' \) -print | head -n1 || true)"
-            if [ -n "${CC_JSONL:-}" ]; then
-              docker run --rm -v "${ARTDIR}:/app/download" ghcr.io/hitomarukonpaku/twspace-crawler:latest cc e "/app/download${CC_JSONL#"${ARTDIR}"}" || true
+          # Keep any crawler attempt to expose captions for debugging.
+          CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
+          if [ -n "${CC_JSONL:-}" ]; then
+            echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build VTT & diarized transcript from crawler JSONL
+        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC_JSONL="${CRAWLER_CC:-}"
+          if [ -z "${CC_JSONL}" ]; then
+            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+          fi
+          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
+            python3 - << 'PYCODE'
+import json, os, re
+from datetime import datetime, timezone
+
+artdir = os.environ.get("ARTDIR")
+base   = os.environ.get("BASE")
+src    = os.environ.get("CC_JSONL") or ""
+if not src:
+    raise SystemExit(0)
+
+def parse_time_iso(s):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    if re.search(r'[+-]\d{4}$', s):
+        s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+def fmt_ts(t):
+    if t < 0: t = 0.0
+    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+def strip_emoji_for_vtt(s):
+    s = re.sub(r'[<>&]', '', s)
+    s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
+    s = s.strip()
+    return s or "Speaker"
+
+def html_escape(s):
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
+utterances = []
+with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            outer = json.loads(line)
+        except Exception:
+            continue
+        payload_raw = outer.get("payload")
+        if not payload_raw:
+            continue
+        try:
+            payload = json.loads(payload_raw)
+        except Exception:
+            continue
+        body_raw = payload.get("body")
+        if not body_raw:
+            continue
+        try:
+            inner = json.loads(body_raw)
+        except Exception:
+            continue
+        # Only speech events
+        if inner.get("type") != 45:
+            continue
+        text = (inner.get("body") or "").strip()
+        if not text:
+            continue
+        if "final" in inner and not inner.get("final"):
+            continue
+        name = inner.get("displayName") or payload.get("sender",{}).get("display_name") \
+               or inner.get("username") or inner.get("user_id") or "Speaker"
+        ts = parse_time_iso(inner.get("programDateTime"))
+        if ts is None:
+            try:
+                ts = int(inner.get("timestamp")) / 1000.0
+            except Exception:
+                ts = None
+        if ts is None:
+            continue
+        utterances.append({"ts": ts, "name": name, "text": text})
+
+utterances.sort(key=lambda x: x["ts"])
+if not utterances:
+    raise SystemExit(0)
+
+t0_abs = utterances[0]["ts"]
+
+for i,u in enumerate(utterances):
+    u["start_rel"] = u["ts"] - t0_abs
+    if i+1 < len(utterances):
+        nxt = utterances[i+1]["ts"] - t0_abs
+        u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
+    else:
+        words = max(1, len(u["text"].split()))
+        dur = min(6.0, max(1.2, 0.35*words + 0.8))
+        u["end_rel"] = u["start_rel"] + dur
+
+vtt_path = os.path.join(artdir, f"{base}.vtt")
+with open(vtt_path, "w", encoding="utf-8") as vf:
+    vf.write("WEBVTT\n\n")
+    for idx,u in enumerate(utterances, 1):
+        vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
+        vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
+
+tr_path = os.path.join(artdir, f"{base}_transcript.html")
+with open(tr_path, "w", encoding="utf-8") as tf:
+    tf.write('<div class="transcript">\n')
+    for u in utterances:
+        tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
+    tf.write("</div>\n")
+
+start_iso = datetime.utcfromtimestamp(t0_abs).replace(tzinfo=timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
+    sf.write(start_iso + "\n")
+
+print(vtt_path)
+print(tr_path)
+PYCODE
+            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
+              echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+              echo "SPACE_STARTED_AT=$(cat "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')" >> "$GITHUB_ENV"
             fi
           fi
 
@@ -289,19 +426,26 @@ jobs:
             -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
-      - name: Loudness normalize to MP3
+      - name: Enhance + loudness normalize to MP3 (radio tone)
         if: ${{ github.event.inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
+          # Unified pre-processing chain for "radio" sound:
+          PRE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,acompressor=threshold=-18dB:ratio=3:attack=6:release=250:makeup=6,dynaudnorm=p=1:m=7:s=12"
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
-          ffmpeg -hide_banner -y -i "$AUDIO_IN" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>"${WORKDIR}/pass1.log" || true
+          # Measure with the pre-chain applied so loudnorm statistics reflect final content
+          ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
             I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON"); LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
-            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" \
+              -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
+              -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
           else
-            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "loudnorm=I=-16:TP=-1.5:LRA=11" -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" \
+              -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
+              -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
           fi
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
@@ -421,6 +565,12 @@ jobs:
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
+          # Prepare transcript file (if created)
+          TR_FILE="${WORKDIR}/empty_transcript.txt"
+          : > "$TR_FILE"
+          if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
+            TR_FILE="${TRANSCRIPT_PATH}"
+          fi
 
           BODY="$(jq -n \
             --arg gcs   "${AUD}" \
@@ -429,6 +579,8 @@ jobs:
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
             --arg ath   "${AT_HTML}" \
+            --rawfile tr "${TR_FILE}" \
+            --arg started "${SPACE_STARTED_AT:-}" \
             '{
               gcs_url: $gcs,
               mime:    $mime,
@@ -437,12 +589,25 @@ jobs:
             }
             + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
+            + (if (($tr|gsub("\\s";"")|length) > 0) then {transcript: $tr, has_transcript:true} else {} end)
+            + (if ($started|length)>0 then {space_started_at:$started} else {} end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
             -d "$BODY" | jq -r .
+
+      - name: Set WP post date to Space start (optional)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && env.SPACE_STARTED_AT != '' && github.event.inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATE_GMT="$(date -u -d "${SPACE_STARTED_AT}" '+%Y-%m-%dT%H:%M:%S')"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/posts/${{ github.event.inputs.post_id }}" \
+            -d "$(jq -n --arg d "${DATE_GMT}" '{date_gmt:$d}')" | jq -r '.id // "ok"'
 
       - name: Patch WP — attendees only
         if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -476,6 +641,9 @@ jobs:
             echo "- Space URL ${{ github.event.inputs.space_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
+            if [ -n "${SPACE_STARTED_AT:-}" ]; then
+              echo "- Space start (UTC): ${SPACE_STARTED_AT}"
+            fi
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
               echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
             elif [ -n "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
@@ -485,6 +653,11 @@ jobs:
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
+            fi
+            if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
+              echo "- Transcript embedded to WP"
+            else
+              echo "- Transcript not generated"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees saved to WP (HTML)"
