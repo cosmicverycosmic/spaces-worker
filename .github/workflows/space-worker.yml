@@ -365,7 +365,7 @@ jobs:
               tf.write("</div>\n")
 
           # Earliest absolute timestamp → used later to set WP post date
-          start_iso = datetime.utcfromtimestamp(t0_abs).replace(tzinfo=timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
           with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
               sf.write(start_iso + "\n")
           PYCODE
@@ -560,41 +560,46 @@ jobs:
           TTL:  ${{ github.event.inputs.title }}
         run: |
           set -euo pipefail
-          AT_HTML=""
+
+          # Fallback files for rawfile ingestion
+          ATH_FILE="${WORKDIR}/empty_attendees.html"
+          : > "$ATH_FILE"
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            AT_HTML="$(cat "${ATTN_HTML}")"
+            ATH_FILE="${ATTN_HTML}"
           fi
+
           TR_FILE="${WORKDIR}/empty_transcript.txt"
           : > "$TR_FILE"
           if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
             TR_FILE="${TRANSCRIPT_PATH}"
           fi
 
-          BODY="$(jq -n \
+          REQ="${WORKDIR}/wp_register_body.json"
+          jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
             --arg pid   "${PID}" \
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
-            --arg ath   "${AT_HTML}" \
-            --rawfile tr "${TR_FILE}" \
+            --rawfile ath "${ATH_FILE}" \
+            --rawfile tr  "${TR_FILE}" \
             --arg started "${SPACE_STARTED_AT:-}" \
             '{
-              gcs_url: $gcs,
-              mime:    $mime,
-              post_id: ($pid|tonumber),
-              title:   $ttl
-            }
-            + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
-            + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
-            + (if (($tr|gsub("\\s";"")|length) > 0) then {transcript: $tr, has_transcript:true} else {} end)
-            + (if ($started|length)>0 then {space_started_at:$started} else {} end)
-          ')"
+               gcs_url: $gcs,
+               mime:    $mime,
+               post_id: ($pid|tonumber),
+               title:   $ttl
+             }
+             + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+             + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
+             + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
+             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
+            ' > "$REQ"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            -d "$BODY" | jq -r .
+            --data-binary @"$REQ" | jq -r .
 
       - name: Set WP post date to Space start (optional)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && env.SPACE_STARTED_AT != '' && github.event.inputs.post_id != '' }}
