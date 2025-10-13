@@ -493,17 +493,45 @@ jobs:
             -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
-      - name: Enhance + loudness normalize to MP3 (radio tone)
+      - name: Enhance + loudness normalize to MP3 
         if: ${{ github.event.inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          PRE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=12,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
+          # Base chain: cleanup -> presence EQ -> mild gate -> comp -> adaptive norm
+          PRE_BASE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,\
+      equalizer=f=250:t=q:w=1.2:g=-2.5,\
+      equalizer=f=3000:t=q:w=1.0:g=2.5,\
+      equalizer=f=8000:t=q:w=0.8:g=1.5,\
+      agate=threshold=0.015:ratio=2:attack=5:release=100,\
+      acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,\
+      dynaudnorm=p=1:m=7:s=12"
+      
+          # Add a moderate de-esser (0..1). If it fails on a runner, we fall back automatically.
+          PRE="${PRE_BASE}"
+          PRE_DESSER="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=0.6,\
+      equalizer=f=250:t=q:w=1.2:g=-2.5,\
+      equalizer=f=3000:t=q:w=1.0:g=2.5,\
+      equalizer=f=8000:t=q:w=0.8:g=1.5,\
+      agate=threshold=0.015:ratio=2:attack=5:release=100,\
+      acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,\
+      dynaudnorm=p=1:m=7:s=12"
+      
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
-          ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
+      
+          # First pass: measure loudness
+          if ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE_DESSER},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log"; then
+            PRE="${PRE_DESSER}"
+          else
+            echo "De-esser not supported or failed; continuing without it…"
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
+          fi
+      
+          # Extract JSON block
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+      
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-            I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
+            I=$(jq -r '.input_i // "-16"'   "$PASS1_JSON")
             TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
             LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
             TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
@@ -515,7 +543,9 @@ jobs:
               -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
               -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
           fi
+      
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
+
 
       - name: Upload MP3 to GCS
         id: upload_mp3
