@@ -109,7 +109,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          python3 -m pip install --no-cache-dir yt-dlp
+          # add snscrape + requests for replies/links scraping; keep yt-dlp
+          python3 -m pip install --no-cache-dir yt-dlp snscrape requests
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
@@ -237,148 +238,210 @@ jobs:
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
+      # Build an avatar map we can use in the transcript (handle/name -> profile_image_url)
+      - name: Extract participant avatar map
+        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          AVJSON="${ARTDIR}/avatars.json"
+          jq -r '
+            (.audioSpace // .) as $a
+            | (
+                [ $a.metadata?.creator_results?.result?.legacy? ] +
+                ( ($a.participants?.admins   // []) | map(.user_results?.result?.legacy?) ) +
+                ( ($a.participants?.speakers // []) | map(.user_results?.result?.legacy?) )
+              ) 
+            | map(select(. != null))
+            | map({handle:(.screen_name // ""), name:(.name // ""), avatar:(.profile_image_url_https // "")})
+            | map(select((.handle != "") or (.name != "")))
+            | unique_by(.handle)
+          ' "${ARTDIR}/_as_line_after_pipe.txt" > "$AVJSON" || true
+          if [ -s "$AVJSON" ]; then
+            echo "AVATAR_MAP=${AVJSON}" >> "$GITHUB_ENV"
+          fi
+
       - name: Build VTT & diarized transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'attendees_only' }}
         shell: bash
-        run: |2
+        run: |
           set -euxo pipefail
           CC_JSONL="${CRAWLER_CC:-}"
           if [ -z "${CC_JSONL}" ]; then
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-          cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
-          import json, os, re
-          from datetime import datetime, timezone
+            cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
+import json, os, re
+from datetime import datetime, timezone
 
-          artdir = os.environ.get("ARTDIR")
-          base   = os.environ.get("BASE")
-          src    = os.environ.get("CC_JSONL") or ""
-          if not src:
-              raise SystemExit(0)
+artdir = os.environ.get("ARTDIR")
+base   = os.environ.get("BASE")
+src    = os.environ.get("CC_JSONL") or ""
+if not src:
+    raise SystemExit(0)
 
-          def parse_time_iso(s):
-              if not s:
-                  return None
-              s = s.strip()
-              if s.endswith('Z'):
-                  s = s[:-1] + '+00:00'
-              if re.search(r'[+-]\d{4}$', s):
-                  s = s[:-5] + s[-5:-2] + ':' + s[-2:]
-              try:
-                  dt = datetime.fromisoformat(s)
-                  if dt.tzinfo is None:
-                      dt = dt.replace(tzinfo=timezone.utc)
-                  return dt.timestamp()
-              except Exception:
-                  return None
+def parse_time_iso(s):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    if re.search(r'[+-]\d{4}$', s):
+        s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
-          def fmt_ts(t):
-              if t < 0: t = 0.0
-              h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-              return f"{h:02d}:{m:02d}:{s:06.3f}"
+def fmt_ts(t):
+    if t < 0: t = 0.0
+    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
-          def strip_emoji_for_vtt(s):
-              s = re.sub(r'[<>&]', '', s)  # avoid breaking WebVTT
-              # strip surrogate + PUA emoji that can break some players
-              s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
-              s = s.strip()
-              return s or "Speaker"
+def strip_emoji_for_vtt(s):
+    s = re.sub(r'[<>&]', '', s)  # keep VTT safe
+    s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
+    s = s.strip()
+    return s or "Speaker"
 
-          def html_escape(s):
-              return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+def html_escape(s):
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
-          utterances = []
-          with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-              for line in f:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  try:
-                      outer = json.loads(line)
-                  except Exception:
-                      continue
-                  payload_raw = outer.get("payload")
-                  if not payload_raw:
-                      continue
-                  try:
-                      payload = json.loads(payload_raw)
-                  except Exception:
-                      continue
-                  body_raw = payload.get("body")
-                  if not body_raw:
-                      continue
-                  try:
-                      inner = json.loads(body_raw)
-                  except Exception:
-                      continue
-                  # type 45 = caption/utterance messages
-                  if inner.get("type") != 45:
-                      continue
-                  text = (inner.get("body") or "").strip()
-                  if not text:
-                      continue
-                  if "final" in inner and not inner.get("final"):
-                      continue
-                  name = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
-                         or inner.get("username") or inner.get("user_id") or "Speaker"
-                  ts = parse_time_iso(inner.get("programDateTime"))
-                  if ts is None:
-                      try:
-                          ts = int(inner.get("timestamp")) / 1000.0
-                      except Exception:
-                          ts = None
-                  if ts is None:
-                      continue
-                  utterances.append({"ts": ts, "name": name, "text": text})
+# load avatar map if present
+avatars_by_normname = {}
+avatars_by_handle   = {}
+avmap_path = os.path.join(artdir, "avatars.json")
+def norm(s):
+    if not s: return ""
+    s = ''.join(ch for ch in s if not (0x1F000 <= ord(ch) <= 0x1FAFF))
+    return s.strip().casefold()
 
-          utterances.sort(key=lambda x: x["ts"])
-          if not utterances:
-              raise SystemExit(0)
+def hi_res_avatar(url):
+    # upgrade *_normal.* to 400x400 if present
+    if not url: return url
+    return re.sub(r'_normal(\.[a-zA-Z0-9]+)$', r'_400x400\1', url)
 
-          t0_abs = utterances[0]["ts"]
+if os.path.isfile(avmap_path):
+    try:
+        data = json.load(open(avmap_path, "r", encoding="utf-8"))
+        for e in data:
+            h = (e.get("handle") or "").strip()
+            n = (e.get("name")   or "").strip()
+            a = hi_res_avatar(e.get("avatar") or "")
+            if h:
+                avatars_by_handle[h.lower()] = {"handle":h, "name":n, "avatar":a}
+            if n:
+                avatars_by_normname[norm(n)] = {"handle":h, "name":n, "avatar":a}
+    except Exception:
+        pass
 
-          for i, u in enumerate(utterances):
-              u["start_rel"] = u["ts"] - t0_abs
-              if i + 1 < len(utterances):
-                  nxt = utterances[i + 1]["ts"] - t0_abs
-                  u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
-              else:
-                  words = max(1, len(u["text"].split()))
-                  dur = min(6.0, max(1.2, 0.35 * words + 0.8))
-                  u["end_rel"] = u["start_rel"] + dur
+def lookup_speaker(name_guess):
+    key = norm(name_guess)
+    rec = avatars_by_normname.get(key)
+    if rec:
+        return rec
+    # fallback: nothing
+    return {"handle":"", "name":name_guess, "avatar":""}
 
-          # WEBVTT with bold speaker names
-          vtt_path = os.path.join(artdir, f"{base}.vtt")
-          with open(vtt_path, "w", encoding="utf-8") as vf:
-              vf.write("WEBVTT\n\n")
-              for idx, u in enumerate(utterances, 1):
-                  vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
-                  vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
+utterances = []
+with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            outer = json.loads(line)
+        except Exception:
+            continue
+        payload_raw = outer.get("payload")
+        if not payload_raw:
+            continue
+        try:
+            payload = json.loads(payload_raw)
+        except Exception:
+            continue
+        body_raw = payload.get("body")
+        if not body_raw:
+            continue
+        try:
+            inner = json.loads(body_raw)
+        except Exception:
+            continue
+        if inner.get("type") != 45:
+            continue
+        text = (inner.get("body") or "").strip()
+        if not text:
+            continue
+        if "final" in inner and not inner.get("final"):
+            continue
+        name = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
+               or inner.get("username") or inner.get("user_id") or "Speaker"
+        ts = parse_time_iso(inner.get("programDateTime"))
+        if ts is None:
+            try:
+                ts = int(inner.get("timestamp")) / 1000.0
+            except Exception:
+                ts = None
+        if ts is None:
+            continue
+        utterances.append({"ts": ts, "name": name, "text": text})
 
-          # HTML transcript with bold names
-          tr_path = os.path.join(artdir, f"{base}_transcript.html")
-          with open(tr_path, "w", encoding="utf-8") as tf:
-              tf.write('<div class="transcript">\n')
-              for u in utterances:
-                  tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
-              tf.write("</div>\n")
+utterances.sort(key=lambda x: x["ts"])
+if not utterances:
+    raise SystemExit(0)
 
-          # Earliest absolute timestamp → used later to set WP post date
-          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-          with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
-              sf.write(start_iso + "\n")
-          PYCODE
-          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
-          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
-            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-            echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
-          fi
+t0_abs = utterances[0]["ts"]
+
+for i, u in enumerate(utterances):
+    u["start_rel"] = u["ts"] - t0_abs
+    if i + 1 < len(utterances):
+        nxt = utterances[i + 1]["ts"] - t0_abs
+        u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
+    else:
+        words = max(1, len(u["text"].split()))
+        dur = min(6.0, max(1.2, 0.35 * words + 0.8))
+        u["end_rel"] = u["start_rel"] + dur
+
+# WEBVTT (no images in standard players)
+vtt_path = os.path.join(artdir, f"{base}.vtt")
+with open(vtt_path, "w", encoding="utf-8") as vf:
+    vf.write("WEBVTT\n\n")
+    for idx, u in enumerate(utterances, 1):
+        vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
+        vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
+
+# HTML transcript (with avatar + profile link)
+tr_path = os.path.join(artdir, f"{base}_transcript.html")
+with open(tr_path, "w", encoding="utf-8") as tf:
+    tf.write('<div class="transcript">\n')
+    for u in utterances:
+        info = lookup_speaker(u["name"])
+        handle = info.get("handle") or ""
+        avatar = info.get("avatar") or ""
+        profile = f"https://x.com/{handle}" if handle else "#"
+        avatar_html = f'<a class="speaker-avatar" href="{profile}" target="_blank" rel="noopener"><img alt="" class="avatar" src="{html_escape(avatar)}" style="width:28px;height:28px;border-radius:50%;vertical-align:middle;margin-right:6px"></a>' if avatar else ""
+        name_html = f'<a href="{profile}" target="_blank" rel="noopener"><strong>{html_escape(u["name"])}</strong></a>' if handle else f"<strong>{html_escape(u['name'])}</strong>"
+        tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> {avatar_html}{name_html}: {html_escape(u['text'])}</p>\n")
+    tf.write("</div>\n")
+
+start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
+    sf.write(start_iso + "\n")
+PYCODE
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
+              echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
+            fi
+            if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+              echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
+            fi
           fi
 
       - name: Notify WP — processing audio
@@ -502,6 +565,269 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
+      # ---------- Identify host handle and purple-pill tweet ----------
+      - name: Identify host handle and purple-pill tweet
+        id: purple
+        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          AS="${ARTDIR}/_as_line.json"
+          HANDLE="$(jq -r '.audioSpace.metadata.creator_results.result.legacy.screen_name // .metadata.creator_results.result.legacy.screen_name // empty' "$AS" 2>/dev/null || true)"
+          if [ -z "${HANDLE:-}" ]; then
+            HANDLE="$(jq -r '.audioSpace.username // empty' "$AS" 2>/dev/null || true)"
+            [ -z "${HANDLE:-}" ] && HANDLE="${{ github.event.inputs.watch_users }}" && HANDLE="${HANDLE%%,*}"
+          fi
+          echo "CREATOR_HANDLE=${HANDLE}" >> "$GITHUB_ENV"
+
+          python3 - <<'PY'
+import os, sys, json, shlex, subprocess
+handle = os.environ.get("CREATOR_HANDLE","").strip()
+sid    = os.environ.get("SPACE_ID","").strip()
+work   = os.environ.get("WORKDIR",".")
+tweet_url = ""
+if handle and sid:
+    q = f'from:{handle} url:"/i/spaces/{sid}"'
+    cmd = f"snscrape --jsonl twitter-search {shlex.quote(q)}"
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if p.stdout.strip():
+        try:
+            j = json.loads(p.stdout.splitlines()[0])
+            tweet_url = j.get("url","")
+        except Exception:
+            pass
+with open(os.path.join(work, "tweet.list"), "w", encoding="utf-8") as f:
+    if tweet_url: f.write(tweet_url + "\n")
+print(tweet_url)
+PY
+          TWEET_URL="$(cat "${WORKDIR}/tweet.list" 2>/dev/null || true)"
+          echo "TWEET_URL=${TWEET_URL}" >> "$GITHUB_ENV"
+
+      # ---------- Scrape replies & build HTML cards + grouped links ----------
+      - name: Build replies HTML + shared links (snscrape)
+        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          [ -z "${TWEET_URL:-}" ] && exit 0
+          cat <<'PYCODE' > "${WORKDIR}/build_replies.py"
+import os, re, json, html, subprocess, shlex, requests
+from urllib.parse import urlparse
+from datetime import datetime
+
+artdir = os.environ.get("ARTDIR",".")
+base   = os.environ.get("BASE","space")
+tweet  = os.environ.get("TWEET_URL","").strip()
+if not tweet:
+    raise SystemExit(0)
+
+m = re.search(r"/status/(\\d+)", tweet)
+if not m:
+    raise SystemExit(0)
+tid = m.group(1)
+
+def run(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+def expand(u):
+    try:
+        r = requests.get(u, allow_redirects=True, timeout=10)
+        return r.url
+    except Exception:
+        return u
+
+# conversation
+cmd = f"snscrape --jsonl twitter-search {shlex.quote('conversation_id:'+tid)}"
+p = run(cmd)
+lines = [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
+if not lines:
+    raise SystemExit(0)
+
+nodes, children = {}, {}
+for j in lines:
+    id_  = str(j.get("id"))
+    pid  = str(j.get("inReplyToTweetId")) if j.get("inReplyToTweetId") is not None else None
+    nodes[id_] = j
+    if pid:
+        children.setdefault(pid, []).append(id_)
+
+def dfs(root):
+    stack=[(root,0)]
+    order=[]
+    while stack:
+        nid,lvl=stack.pop()
+        order.append((nid,lvl))
+        for ch in reversed(children.get(nid,[])):
+            stack.append((ch,lvl+1))
+    return order
+
+order = dfs(tid)
+
+def user_info(j):
+    u = j.get("user") or {}
+    return {
+        "name": u.get("displayname") or "",
+        "handle": u.get("username") or "",
+        "avatar": u.get("profileImageUrl") or ""
+    }
+
+def tweet_time(j):
+    dt = j.get("date")
+    # snscrape gives ISO string; leave as is for <time datetime="">
+    return dt
+
+def media_blocks(j):
+    out=[]
+    for m in (j.get("media") or []):
+        t = m.get("_type","").lower()
+        if "photo" in t:
+            url = m.get("fullUrl") or m.get("url") or m.get("previewUrl")
+            if url: out.append(f'<img class="reply-media" src="{html.escape(url)}" alt="">')
+        elif "video" in t or "gif" in t:
+            best=""
+            for v in sorted((m.get("variants") or []), key=lambda x: x.get("bitrate") or 0, reverse=True):
+                url=v.get("url") or ""
+                if url.endswith(".mp4"):
+                    best=url; break
+            if best:
+                out.append(f'<video class="reply-media" controls preload="none" src="{html.escape(best)}"></video>')
+    return out
+
+def link_cards_from_text(txt):
+    urls = set(re.findall(r'https?://\\S+', txt or ""))
+    cards=[]
+    for u in urls:
+        eu = expand(u)
+        cards.append((u,eu))
+    return cards
+
+# collect shared links grouped by domain
+links_by_domain = {}
+
+def add_shared(url):
+    pr = urlparse(url)
+    if not pr.netloc: return
+    host = pr.netloc.lower()
+    if "twitter.com" in host or "x.com" in host: return
+    links_by_domain.setdefault(host, set()).add(url)
+
+# Build HTML with collapsible replies
+html_parts = ["""
+<style>
+.ss3k-replies { font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+.ss3k-reply-card { border:1px solid #e2e8f0; border-radius:12px; padding:12px; margin:10px 0; background:#fff; box-shadow:0 1px 1px rgba(0,0,0,.03); }
+.ss3k-reply-head { display:flex; align-items:center; gap:8px; }
+.ss3k-reply-head img.avatar { width:28px;height:28px;border-radius:50%; }
+.ss3k-reply-meta { color:#64748b; font-size:12px; margin-top:4px; }
+.ss3k-reply-content { margin-top:8px; white-space:pre-wrap; word-break:break-word; }
+.ss3k-link-cards { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
+.ss3k-link-card { border:1px solid #cbd5e1; padding:4px 8px; border-radius:8px; background:#f8fafc; font-size:12px; }
+.ss3k-children { margin-left:16px; display:none; }
+.ss3k-toggle { margin-top:6px; font-size:12px; color:#2563eb; background:none; border:none; padding:0; cursor:pointer; }
+.reply-media { max-width:100%; border-radius:10px; margin-top:8px; }
+</style>
+<script>
+function ss3kToggleReplies(id,btn){
+  const el=document.getElementById(id);
+  if(!el) return;
+  const s=el.style.display;
+  el.style.display = (s==='none'||!s)?'block':'none';
+  if(btn && btn.dataset.label){
+    btn.textContent = (el.style.display==='block')?btn.dataset.hide:btn.dataset.label;
+  }
+}
+</script>
+<div class="ss3k-replies">
+""".strip()]
+
+for nid, lvl in order[1:]:  # skip root tweet
+    j = nodes.get(nid,{})
+    ui = user_info(j)
+    name = html.escape(ui["name"])
+    handle = ui["handle"]
+    avatar = ui["avatar"] or (f"https://unavatar.io/x/{handle}" if handle else "")
+    profile = f"https://x.com/{handle}" if handle else "#"
+    url = j.get("url") or f"https://x.com/{handle}/status/{nid}"
+    dt = tweet_time(j) or ""
+    dt_label = dt.replace("T"," ").replace("+00:00"," UTC")
+    content = j.get("renderedContent") or j.get("content") or ""
+    safe = html.escape(content)
+
+    # linkify text & collect links
+    cards = link_cards_from_text(content)
+    for orig,exp in cards:
+        safe = safe.replace(html.escape(orig), f'<a href="{orig}" target="_blank" rel="noopener">{html.escape(exp)}</a>')
+        add_shared(exp)
+
+    # also collect outlinks from snscrape
+    for ol in (j.get("outlinks") or []):
+        add_shared(ol)
+
+    # media
+    mblocks = media_blocks(j)
+
+    child_ids = children.get(nid, [])
+    toggle_id = f"children-{nid}"
+    toggle_btn = f'<button class="ss3k-toggle" data-label="Show {len(child_ids)} repl{"y" if len(child_ids)==1 else "ies"}" data-hide="Hide replies" onclick="ss3kToggleReplies(\'{toggle_id}\', this)">Show {len(child_ids)} repl{"y" if len(child_ids)==1 else "ies"}</button>' if child_ids else ""
+
+    html_parts.append(f'''
+<div class="ss3k-reply-card" data-level="{lvl}">
+  <div class="ss3k-reply-head">
+    <a href="{profile}" target="_blank" rel="noopener"><img class="avatar" src="{html.escape(avatar)}" alt=""></a>
+    <div>
+      <div><a href="{profile}" target="_blank" rel="noopener"><strong>{name}</strong></a> <span style="color:#64748b">@{html.escape(handle)}</span></div>
+      <div class="ss3k-reply-meta"><a href="{url}" target="_blank" rel="noopener"><time datetime="{html.escape(dt)}">{html.escape(dt_label)}</time></a></div>
+    </div>
+  </div>
+  <div class="ss3k-reply-content">{safe}</div>
+  {''.join(mblocks)}
+  <div class="ss3k-link-cards">{
+    ''.join([f'<a class="ss3k-link-card" href="{html.escape(exp)}" target="_blank" rel="noopener">{html.escape(urlparse(exp).netloc or exp)}</a>' for (_o,exp) in cards])
+  }</div>
+  {toggle_btn}
+  <div class="ss3k-children" id="{toggle_id}"></div>
+</div>
+''')
+
+html_parts.append("</div>")  # close ss3k-replies
+
+# Now, fill child containers in-place by simple replacement (fast render)
+# Build a mapping from nid -> HTML of its children (flat, as each child owns its own nested container).
+children_html = {}
+for pid, kids in children.items():
+    parts=[]
+    for kid in kids:
+        # the card for kid is already in top-level html_parts; we won't duplicate.
+        # The collapsible container for a parent will be filled with a minimal anchor pointing to the kid's card.
+        parts.append(f'<div><a href="#{kid}" onclick="document.querySelector(`[data-level]`).scrollIntoView();return false;"></a></div>')
+    children_html[pid] = "\n".join(parts)
+
+replies_html = "\n".join(html_parts)
+
+# Shared links grouped by domain
+grouped = []
+for host in sorted(links_by_domain.keys()):
+    grouped.append(f"<h4>{html.escape(host)}</h4>")
+    grouped.append("<ul>")
+    for u in sorted(links_by_domain[host]):
+        grouped.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener">{html.escape(u)}</a></li>')
+    grouped.append("</ul>")
+shared_html = "\n".join(grouped)
+
+with open(os.path.join(artdir, f"{base}_replies.html"), "w", encoding="utf-8") as f:
+    f.write(replies_html)
+
+with open(os.path.join(artdir, f"{base}_shared_links.html"), "w", encoding="utf-8") as f:
+    f.write(shared_html)
+PYCODE
+          ARTDIR="${ARTDIR}" BASE="${BASE}" TWEET_URL="${TWEET_URL}" python3 "${WORKDIR}/build_replies.py" || true
+          if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
+            echo "REPLIES_HTML_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_shared_links.html" ]; then
+            echo "LINKS_HTML_PATH=${ARTDIR}/${BASE}_shared_links.html" >> "$GITHUB_ENV"
+          fi
+
       - name: Build attendees JSON & HTML (from crawler)
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
@@ -561,18 +887,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fallback files for rawfile ingestion
-          ATH_FILE="${WORKDIR}/empty_attendees.html"
-          : > "$ATH_FILE"
-          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            ATH_FILE="${ATTN_HTML}"
-          fi
+          # rawfile inputs to keep curl arg size small
+          ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
+          [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
 
-          TR_FILE="${WORKDIR}/empty_transcript.txt"
-          : > "$TR_FILE"
-          if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
-            TR_FILE="${TRANSCRIPT_PATH}"
-          fi
+          TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
+          [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ] && TR_FILE="${TRANSCRIPT_PATH}"
+
+          REP_FILE="${WORKDIR}/empty_replies.html"; : > "$REP_FILE"
+          [ -n "${REPLIES_HTML_PATH:-}" ] && [ -s "${REPLIES_HTML_PATH}" ] && REP_FILE="${REPLIES_HTML_PATH}"
+
+          SHARED_FILE="${WORKDIR}/empty_links.html"; : > "$SHARED_FILE"
+          [ -n "${LINKS_HTML_PATH:-}" ] && [ -s "${LINKS_HTML_PATH}" ] && SHARED_FILE="${LINKS_HTML_PATH}"
 
           REQ="${WORKDIR}/wp_register_body.json"
           jq -n \
@@ -581,8 +907,10 @@ jobs:
             --arg pid   "${PID}" \
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
-            --rawfile ath "${ATH_FILE}" \
-            --rawfile tr  "${TR_FILE}" \
+            --rawfile ath    "${ATH_FILE}" \
+            --rawfile tr     "${TR_FILE}" \
+            --rawfile rep    "${REP_FILE}" \
+            --rawfile shared "${SHARED_FILE}" \
             --arg started "${SPACE_STARTED_AT:-}" \
             '{
                gcs_url: $gcs,
@@ -593,6 +921,8 @@ jobs:
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
+             + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
+             + (if ($shared|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$shared} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
 
@@ -658,9 +988,15 @@ jobs:
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
-              echo "- Transcript embedded to WP"
+              echo "- Transcript embedded to WP (with avatars)"
             else
               echo "- Transcript not generated"
+            fi
+            if [ -n "${REPLIES_HTML_PATH:-}" ] && [ -s "${REPLIES_HTML_PATH}" ]; then
+              echo "- Replies scraped and embedded (ss3k_replies_html)"
+            fi
+            if [ -n "${LINKS_HTML_PATH:-}" ] && [ -s "${LINKS_HTML_PATH}" ]; then
+              echo "- Shared links grouped and embedded (ss3k_shared_links_html)"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees saved to WP (HTML)"
