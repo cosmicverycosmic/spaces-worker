@@ -108,10 +108,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
+          # yt-dlp (fallback) + replies dependencies
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
+          # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
+          # container pull auth (for GHCR)
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -201,12 +204,14 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
+          # Most-recent audio file
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
+          # Extract a compact JSON payload from logs for metadata
           RAW="$( (grep -hE 'getAudioSpaceBy(Id|RestId)\s*\|' "$LOG_STD" "$LOG_ERR" | tail -n1) || true )"
           if [ -n "$RAW" ]; then
             JSON_PART="$(printf '%s' "$RAW" | sed -e 's/^[^{]*//')"
@@ -216,6 +221,7 @@ jobs:
             fi
           fi
 
+          # Captions JSONL from crawler
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
@@ -262,7 +268,7 @@ jobs:
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            # Write Python file using a heredoc that the shell will recognize (delimiter starts at column 1 in the script file)
+            # Write Python file with a heredoc inside this run block (YAML-safe)
             cat > "${WORKDIR}/gen_vtt.py" <<'PYCODE'
 import json, os, re, html
 from datetime import datetime, timezone
@@ -437,6 +443,7 @@ PYCODE
             CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+            # Only set SPACE_STARTED_AT from transcript if crawler start was NOT available
             if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
               echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
             fi
@@ -493,6 +500,7 @@ PYCODE
         shell: bash
         run: |
           set -euxo pipefail
+          # Presence EQ + gentle gate + compression + adaptive norm; de-esser with valid range and auto-fallback
           PRE_BASE='highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,equalizer=f=250:t=q:w=1.2:g=-2.5,equalizer=f=3000:t=q:w=1.0:g=2.5,equalizer=f=8000:t=q:w=0.8:g=1.5,agate=threshold=0.015:ratio=2:attack=5:release=100,acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,dynaudnorm=p=1:m=7:s=12'
           PRE_DESS='highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=0.6,equalizer=f=250:t=q:w=1.2:g=-2.5,equalizer=f=3000:t=q:w=1.0:g=2.5,equalizer=f=8000:t=q:w=0.8:g=1.5,agate=threshold=0.015:ratio=2:attack=5:release=100,acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,dynaudnorm=p=1:m=7:s=12'
           PRE="$PRE_BASE"
@@ -505,7 +513,8 @@ PYCODE
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           fi
 
-          awk '/^{/{f=1} f{print} /}/{f=0}/' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+          # Extract JSON from loudnorm pass1 log
+          awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
 
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
             I=$(jq -r '.input_i // "-16"'   "$PASS1_JSON")
