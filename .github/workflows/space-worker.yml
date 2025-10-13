@@ -59,12 +59,10 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # twspace-crawler auth (cookie and/or bearer)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Optional: Twitter API v1.1 for one-shot replies scrape
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -108,13 +106,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # yt-dlp (fallback) + replies dependencies
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
-          # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # container pull auth (for GHCR)
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -163,16 +158,13 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
-
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
-
           OK=0; REASON="no_creds"
           [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
           [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
-
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
@@ -214,10 +206,17 @@ jobs:
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           fi
+
           if [ -n "$RAW" ]; then
-            printf '%s\n' "$RAW" | awk -F'\| ' '{print $NF}' > "${ARTDIR}/_as_line.json" || true
+            printf '%s\n' "$RAW" \
+              | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+              | sed -E 's/.*\{/{/' \
+              | sed -E 's/[[:space:]]+$//' > "${ARTDIR}/_as_line.json" || true
+            # validate JSON; if invalid, clear file so jq is never called later
+            if ! jq -e . "${ARTDIR}/_as_line.json" >/dev/null 2>&1; then
+              : > "${ARTDIR}/_as_line.json"
+            fi
           fi
-          [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
@@ -225,7 +224,6 @@ jobs:
           fi
 
       - name: Extract Space title & start (title = post title; start = post date)
-        if: ${{ steps.crawl.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -233,13 +231,18 @@ jobs:
           TTL=""
           START_RAW=""
 
-          if [ -s "$J" ]; then
-            TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
-            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J")"
+          if [ -s "$J" ] && jq -e . "$J" >/dev/null 2>&1; then
+            TTL="$( jq -r 'try ((.audioSpace // .).metadata.title) catch empty' "$J" 2>/dev/null || echo '' )"
+            START_RAW="$( jq -r 'try ((.audioSpace // .).metadata.started_at // (.audioSpace // .).metadata.startedAt // (.audioSpace // .).metadata.scheduled_start // (.audioSpace // .).metadata.created_at) catch empty' "$J" 2>/dev/null || echo '' )"
           fi
 
-          [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
-          [ -z "$TTL" ] && TTL="${BASE}"
+          # safe fallbacks
+          if [ -z "$TTL" ]; then
+            TTL="${{ github.event.inputs.title }}"
+          fi
+          if [ -z "$TTL" ]; then
+            TTL="${BASE}"
+          fi
           echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
           echo "TTL_FINAL=${TTL}"   >> "$GITHUB_ENV"
 
@@ -432,7 +435,7 @@ jobs:
               tf.write('</div>\\n')
               tf.write(js)
 
-          start_iso = datetime.fromtimestamp(utt[0]["ts"], timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          start_iso = datetime.fromtimestamp(groups[0]["start_rel"] + (utt[0]["ts"]), timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
           with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
               sf.write(start_iso + "\n")
           PYCODE
@@ -570,14 +573,19 @@ jobs:
 
       - name: Build attendees JSON & HTML (from crawler)
         id: attendees
-        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
+        if: ${{ steps.crawl.outcome == 'success' && (hashFiles('out/_as_line.json') != '' ) }}
         shell: bash
         env:
-          CAND: ${{ steps.crawl.outputs.as_line }}
+          CAND: ${{ env.ARTDIR }}/_as_line.json
         run: |
           set -euxo pipefail
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
+
+          if [ ! -s "$CAND" ] || ! jq -e . "$CAND" >/dev/null 2>&1; then
+            echo "No valid audioSpace JSON; skipping attendees build."
+            exit 0
+          fi
 
           jq -r '
             def mkp:
@@ -595,7 +603,7 @@ jobs:
                 cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
                 speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
               }
-          ' "${CAND}" > "$OUT_JSON" || true
+          ' "$CAND" > "$OUT_JSON" || true
 
           if [ -s "$OUT_JSON" ]; then
             jq -r '
@@ -635,8 +643,9 @@ jobs:
           if os.path.exists(as_json):
               try:
                   data = json.load(open(as_json, "r", encoding="utf-8", errors="ignore"))
-                  a = (data.get("audioSpace") or {})
-                  creator = a.get("username") or a.get("creator_results",{}).get("result",{}).get("legacy",{}).get("screen_name")
+                  a = (data.get("audioSpace") or data)
+                  cr = a.get("metadata",{}).get("creator_results",{}).get("result",{}).get("legacy",{})
+                  creator = cr.get("screen_name")
               except Exception:
                   pass
 
@@ -708,24 +717,19 @@ jobs:
                   href=u.expanded_url or u.url
                   if not href or href in seen: continue
                   seen.add(href)
-                  host=tldextract.extract(href).registered_domain or href
+                  import tldextract as _td
+                  host=_td.extract(href).registered_domain or href
                   chips.append('<a class="ss3k-link-card" href="'+esc(href)+'" target="_blank" rel="noopener">'+esc(host)+'</a>')
               return ('\n        <div class="ss3k-link-cards">' + "\n          " + "\n          ".join(chips) + "\n        </div>") if chips else ""
 
-          def media_block(t):
-              media = getattr(t, "media", None) or []
-              parts=[]
-              for m in media:
-                  if getattr(m, "type", None) == "photo" and getattr(m, "media_url_https", None):
-                      parts.append('<img class="reply-media" src="'+esc(m.media_url_https)+'" alt="">')
-              return ("\n        " + "\n        ".join(parts)) if parts else ""
-
+          from collections import defaultdict
           domain_links = defaultdict(list)
           def collect(t):
               for u in (t.urls or []):
                   href=u.expanded_url or u.url
                   if not href: continue
-                  host=tldextract.extract(href).registered_domain or href
+                  import tldextract as _td
+                  host=_td.extract(href).registered_domain or href
                   if href not in domain_links[host]: domain_links[host].append(href)
           for t in [root]+all_replies: collect(t)
 
@@ -742,16 +746,8 @@ jobs:
               for u in (t.urls or []):
                   if u.expanded_url and u.url: txt=txt.replace(u.url, u.expanded_url)
               content=esc(txt)
-              links=link_chips(t); media=media_block(t)
-              child=""
-              if n["children"]:
-                  cid="children-"+str(t.id)
-                  btn="Show "+str(len(n["children"]))+" repl"+("y" if len(n["children"])==1 else "ies")
-                  child = (
-                    '\n      <button class="ss3k-toggle" data-label="'+esc(btn)+'" data-hide="Hide replies" onclick="ss3kToggleReplies(\''+cid+'\', this)">'+esc(btn)+'</button>\n'
-                    '      <div class="ss3k-children" id="'+cid+'">\n'
-                    + "\n".join(render(c, level+1) for c in n["children"]) + "\n      </div>"
-                  )
+              links=link_chips(t)
+              media=""
               html_div = []
               html_div.append('      <div class="ss3k-reply-card" id="'+str(t.id)+'" data-level="'+str(level)+'">')
               html_div.append('        <div class="ss3k-reply-head">')
@@ -768,7 +764,15 @@ jobs:
               html_div.append('            </div>')
               html_div.append('          </div>')
               html_div.append('        </div>')
-              html_div.append('        <div class="ss3k-reply-content">'+content+'</div>'+media+links+child)
+              html_div.append('        <div class="ss3k-reply-content">'+content+'</div>'+media+links)
+              if n["children"]:
+                  cid="children-"+str(t.id)
+                  btn="Show "+str(len(n["children"]))+" repl"+("y" if len(n["children"])==1 else "ies")
+                  html_div.append('      <button class="ss3k-toggle" data-label="'+esc(btn)+'" data-hide="Hide replies" onclick="ss3kToggleReplies(\''+cid+'\', this)">'+esc(btn)+'</button>')
+                  html_div.append('      <div class="ss3k-children" id="'+cid+'">')
+                  for c in n["children"]:
+                      html_div.append(render(c, level+1))
+                  html_div.append('      </div>')
               html_div.append('      </div>')
               return "\n".join(html_div)
 
