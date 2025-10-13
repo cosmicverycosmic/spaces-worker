@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ""
+      purple_tweet_url:
+        description: Optional “Purple Pill” Tweet URL
+        required: false
+        type: string
+        default: ""
       post_id:
         description: Existing WordPress post ID optional
         required: false
@@ -635,7 +640,6 @@ jobs:
           import os, json, html
           from collections import defaultdict
           import tldextract, twitter
-          from datetime import datetime, timezone
 
           out_dir = os.environ["ARTDIR"]
           base    = os.environ["BASE"]
@@ -647,6 +651,7 @@ jobs:
               try:
                   data = json.load(open(as_json, "r", encoding="utf-8", errors="ignore"))
                   a = (data.get("audioSpace") or {})
+                  # prefer username field, fallback to legacy
                   creator = a.get("username") or a.get("creator_results",{}).get("result",{}).get("legacy",{}).get("screen_name")
               except Exception:
                   pass
@@ -671,9 +676,9 @@ jobs:
                   res.extend(batch); max_id = min(t.id for t in batch) - 1
               return res
 
-          terms = ["i/spaces/" + space_id, "https://twitter.com/i/spaces/" + space_id]
+          terms = [f"i/spaces/{space_id}", f"https://twitter.com/i/spaces/{space_id}"]
           candidates = do_search(terms[0])
-          if creator: candidates += do_search('from:' + creator + ' "' + terms[0] + '"')
+          if creator: candidates += do_search(f'from:{creator} "{terms[0]}"')
 
           def has_space_link(t):
               txt = (getattr(t, "full_text", None) or t.text or "")
@@ -694,7 +699,7 @@ jobs:
               root = sorted(cands, key=lambda x: x.created_at_in_seconds or 0)[0]
 
           # get replies via search
-          q = "to:" + root.user.screen_name + " since_id:" + str(root.id)
+          q = f"to:{root.user.screen_name} since_id:{root.id}"
           all_replies=[]; max_id=None
           for _ in range(25):
               batch = api.GetSearch(term=q, count=100, include_entities=True, max_id=max_id, result_type='recent')
@@ -712,7 +717,7 @@ jobs:
 
           def esc(s): return html.escape(s or "", True)
           def avatar(user):
-              return (user.profile_image_url_https or user.profile_image_url or "https://unavatar.io/x/" + esc(user.screen_name)) if user else ""
+              return (user.profile_image_url_https or user.profile_image_url or f"https://unavatar.io/x/{esc(user.screen_name)}") if user else ""
 
           def link_chips(t):
               chips=[]; seen=set()
@@ -721,7 +726,7 @@ jobs:
                   if not href or href in seen: continue
                   seen.add(href)
                   host=tldextract.extract(href).registered_domain or href
-                  chips.append('<a class="ss3k-link-card" href="' + esc(href) + '" target="_blank" rel="noopener">' + esc(host) + '</a>')
+                  chips.append(f'<a class="ss3k-link-card" href="{esc(href)}" target="_blank" rel="noopener">{esc(host)}</a>')
               return ('\n        <div class="ss3k-link-cards">' + "\n          " + "\n          ".join(chips) + "\n        </div>") if chips else ""
 
           def media_block(t):
@@ -729,7 +734,7 @@ jobs:
               parts=[]
               for m in media:
                   if getattr(m, "type", None) == "photo" and getattr(m, "media_url_https", None):
-                      parts.append('<img class="reply-media" src="' + esc(m.media_url_https) + '" alt="">')
+                      parts.append(f'<img class="reply-media" src="{esc(m.media_url_https)}" alt="">')
               return ("\n        " + "\n        ".join(parts)) if parts else ""
 
           # links grouped
@@ -745,8 +750,9 @@ jobs:
           def render(n, level=1):
               t=n["tweet"]; sn=t.user.screen_name if t.user else "user"
               name=t.user.name if t.user else sn
-              prof="https://x.com/" + esc(sn); tw="https://x.com/" + esc(sn) + "/status/" + str(t.id)
+              prof=f"https://x.com/{esc(sn)}"; tw=f"https://x.com/{esc(sn)}/status/{t.id}"
               dt=t.created_at_in_seconds or 0
+              from datetime import datetime, timezone
               iso=datetime.fromtimestamp(dt, tz=timezone.utc).isoformat(timespec="seconds")
               av=avatar(t.user)
               # expand t.co
@@ -757,32 +763,30 @@ jobs:
               links=link_chips(t); media=media_block(t)
               child=""
               if n["children"]:
-                  cid="children-" + str(t.id); btn="Show " + str(len(n["children"])) + (" reply" if len(n["children"])==1 else " replies")
+                  cid=f"children-{t.id}"; btn=f"Show {len(n['children'])} repl" + ("y" if len(n["children"])==1 else "ies")
                   child = (
-                    '\n      <button class="ss3k-toggle" data-label="' + esc(btn) + '" data-hide="Hide replies" onclick="ss3kToggleReplies(\'' + cid + '\', this)">' + esc(btn) + '</button>\n'
-                    '      <div class="ss3k-children" id="' + cid + '">\n'
+                    f'\n      <button class="ss3k-toggle" data-label="{esc(btn)}" data-hide="Hide replies" onclick="ss3kToggleReplies(\'{cid}\', this)">{esc(btn)}</button>\n'
+                    f'      <div class="ss3k-children" id="{cid}">\n'
                     + "\n".join(render(c, level+1) for c in n["children"]) + "\n      </div>"
                   )
-
-              parts=[]
-              parts.append('      <div class="ss3k-reply-card" id="' + str(t.id) + '" data-level="' + str(level) + '">')
-              parts.append('        <div class="ss3k-reply-head">')
-              parts.append('          <a href="' + prof + '" target="_blank" rel="noopener">')
-              parts.append('            <img class="avatar" src="' + esc(av) + '" alt="">')
-              parts.append('          </a>')
-              parts.append('          <div>')
-              parts.append('            <div>')
-              parts.append('              <a href="' + prof + '" target="_blank" rel="noopener"><strong>' + esc(name) + '</strong></a>')
-              parts.append('              <span style="color:#64748b">@' + esc(sn) + '</span>')
-              parts.append('            </div>')
-              parts.append('            <div class="ss3k-reply-meta">')
-              parts.append('              <a href="' + tw + '" target="_blank" rel="noopener"><time datetime="' + iso + '">' + iso.replace("T"," ") + ' UTC</time></a>')
-              parts.append('            </div>')
-              parts.append('          </div>')
-              parts.append('        </div>')
-              parts.append('        <div class="ss3k-reply-content">' + content + '</div>' + media + links + child)
-              parts.append('      </div>')
-              return "\n".join(parts).rstrip()
+              return f'''
+      <div class="ss3k-reply-card" id="{t.id}" data-level="{level}">
+        <div class="ss3k-reply-head">
+          <a href="{prof}" target="_blank" rel="noopener">
+            <img class="avatar" src="{esc(av)}" alt="">
+          </a>
+          <div>
+            <div>
+              <a href="{prof}" target="_blank" rel="noopener"><strong>{esc(name)}</strong></a>
+              <span style="color:#64748b">@{esc(sn)}</span>
+            </div>
+            <div class="ss3k-reply-meta">
+              <a href="{tw}" target="_blank" rel="noopener"><time datetime="{iso}">{iso.replace('T',' ')} UTC</time></a>
+            </div>
+          </div>
+        </div>
+        <div class="ss3k-reply-content">{content}</div>{media}{links}{child}
+      </div>'''.rstrip()
 
           html_top = '''<style>
           .ss3k-replies{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
@@ -811,8 +815,8 @@ jobs:
 
           parts=[]
           for dom in sorted(domain_links):
-              links="\n".join('  <li><a href="' + html.escape(u, True) + '" target="_blank" rel="noopener">' + html.escape(u, True) + '</a></li>' for u in domain_links[dom])
-              parts.append("<h4>" + html.escape(dom, True) + "</h4>\n<ul>\n" + links + "\n</ul>")
+              links="\n".join(f'  <li><a href="{html.escape(u, True)}" target="_blank" rel="noopener">{html.escape(u, True)}</a></li>' for u in domain_links[dom])
+              parts.append(f"<h4>{html.escape(dom, True)}</h4>\n<ul>\n{links}\n</ul>")
           links_html="\n\n".join(parts)
 
           open(os.path.join(out_dir, f"{base}_replies.html"), "w", encoding="utf-8").write(replies_html)
@@ -920,6 +924,7 @@ jobs:
           {
             echo "### Space Worker Summary"
             echo "- Space URL ${{ github.event.inputs.space_url }}"
+            echo "- Purple Pill ${{ github.event.inputs.purple_tweet_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
             if [ -n "${SPACE_TITLE:-}" ]; then
