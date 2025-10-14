@@ -4,22 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X or Twitter Space URL
+        description: X / Twitter Space URL (optional if running transcript_only with MP3)
         required: false
         type: string
         default: ""
       post_id:
-        description: Existing WordPress post ID optional
+        description: Existing WordPress Post ID (to update)
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title optional
+        description: Fallback post title (used if crawler lacks title)
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix default spaces YYYY/MM
+        description: GCS prefix (default: spaces/YYYY/MM)
         required: false
         type: string
         default: ""
@@ -27,22 +27,22 @@ on:
         description: Make uploaded artifacts public
         required: false
         type: choice
-        options: ["true","false"]
+        options: ["true", "false"]
         default: "true"
       do_transcript:
-        description: Generate transcript with Deepgram if crawler captions unavailable
+        description: Generate transcript if crawler captions unavailable (Deepgram)
         required: false
         type: choice
-        options: ["true","false"]
+        options: ["true", "false"]
         default: "true"
       mode:
-        description: Limit processing to a specific area ('' = full)
+        description: Limit processing ('' = full, 'transcript_only', 'attendees_only')
         required: false
         type: choice
         options: ["", "transcript_only", "attendees_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only provide URL to existing MP3
+        description: For transcript_only, provide URL to existing MP3
         required: false
         type: string
         default: ""
@@ -52,6 +52,7 @@ permissions:
   packages: read
 
 env:
+  # Core secrets/vars
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
@@ -108,13 +109,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # yt-dlp (fallback) + replies dependencies
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
-          # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # container pull auth (for GHCR)
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -211,7 +209,7 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Extract a compact JSON payload from logs for metadata
+          # Extract minimal JSON from crawler logs
           RAW="$( (grep -hE 'getAudioSpaceBy(Id|RestId)\s*\|' "$LOG_STD" "$LOG_ERR" | tail -n1) || true )"
           if [ -n "$RAW" ]; then
             JSON_PART="$(printf '%s' "$RAW" | sed -e 's/^[^{]*//')"
@@ -235,12 +233,10 @@ jobs:
           J="${ARTDIR}/_as_line.json"
           TTL=""
           START_RAW=""
-
           if [ -s "$J" ] && jq -e . "$J" >/dev/null 2>&1; then
             TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J" || echo '')"
             START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J" || echo '')"
           fi
-
           [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
           [ -z "$TTL" ] && TTL="${BASE}"
           echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
@@ -268,8 +264,7 @@ jobs:
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            # Write Python file with a heredoc inside this run block (YAML-safe)
-            cat > "${WORKDIR}/gen_vtt.py" <<'PYCODE'
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 - <<'PYCODE'
 import json, os, re, html
 from datetime import datetime, timezone
 
@@ -440,10 +435,9 @@ start_iso = datetime.fromtimestamp(utt[0]["ts"], timezone.utc).isoformat(timespe
 with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
     sf.write(start_iso + "\n")
 PYCODE
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+            # Export paths
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-            # Only set SPACE_STARTED_AT from transcript if crawler start was NOT available
             if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
               echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
             fi
@@ -500,7 +494,7 @@ PYCODE
         shell: bash
         run: |
           set -euxo pipefail
-          # Presence EQ + gentle gate + compression + adaptive norm; de-esser with valid range and auto-fallback
+          # Presence EQ + gentle gate + compression + adaptive norm; de-esser if available
           PRE_BASE='highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,equalizer=f=250:t=q:w=1.2:g=-2.5,equalizer=f=3000:t=q:w=1.0:g=2.5,equalizer=f=8000:t=q:w=0.8:g=1.5,agate=threshold=0.015:ratio=2:attack=5:release=100,acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,dynaudnorm=p=1:m=7:s=12'
           PRE_DESS='highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=0.6,equalizer=f=250:t=q:w=1.2:g=-2.5,equalizer=f=3000:t=q:w=1.0:g=2.5,equalizer=f=8000:t=q:w=0.8:g=1.5,agate=threshold=0.015:ratio=2:attack=5:release=100,acompressor=threshold=-20dB:ratio=3:attack=8:release=220:makeup=5,dynaudnorm=p=1:m=7:s=12'
           PRE="$PRE_BASE"
@@ -513,13 +507,12 @@ PYCODE
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           fi
 
-          # Extract JSON from loudnorm pass1 log
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
 
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-            I=$(jq -r '.input_i // "-16"'   "$PASS1_JSON")
-            TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
-            LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
+            I=$(jq -r '.input_i // "-16"'      "$PASS1_JSON")
+            TP=$(jq -r '.input_tp // "-1.5"'    "$PASS1_JSON")
+            LRA=$(jq -r '.input_lra // "11"'    "$PASS1_JSON")
             TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
             ffmpeg -hide_banner -y -i "$AUDIO_IN" \
               -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
@@ -638,7 +631,7 @@ PYCODE
         shell: bash
         run: |
           set -euxo pipefail
-          cat > "${WORKDIR}/replies.py" <<'PY'
+          ARTDIR="${ARTDIR}" BASE="${BASE}" SPACE_ID="${SPACE_ID}" python3 - <<'PY'
 import os, json, html
 from collections import defaultdict
 import tldextract, twitter
@@ -737,15 +730,6 @@ def media_block(t):
             parts.append(f'<img class="reply-media" src="{esc(m.media_url_https)}" alt="">')
     return ("\n        " + "\n        ".join(parts)) if parts else ""
 
-domain_links = defaultdict(list)
-def collect(t):
-    for u in (t.urls or []):
-        href=u.expanded_url or u.url
-        if not href: continue
-        host=tldextract.extract(href).registered_domain or href
-        if href not in domain_links[host]: domain_links[host].append(href)
-for t in [root]+all_replies: collect(t)
-
 def render(n, level=1):
     t=n["tweet"]; sn=t.user.screen_name if t.user else "user"
     name=t.user.name if t.user else sn
@@ -809,18 +793,26 @@ function ss3kToggleReplies(id,btn){
 <div class="ss3k-replies">'''
 html_bottom = "\n</div>\n"
 
+# Collect domain links (optional)
+domain_links = defaultdict(list)
+def collect(t):
+    for u in (t.urls or []):
+        href=u.expanded_url or u.url
+        if not href: continue
+        host=tldextract.extract(href).registered_domain or href
+        if href not in domain_links[host]: domain_links[host].append(href)
+for t in [root]+all_replies: collect(t)
+
 replies_html = html_top + "\n" + render(node[root.id]) + "\n" + html_bottom
+open(os.path.join(out_dir, f"{base}_replies.html"), "w", encoding="utf-8").write(replies_html)
 
 parts=[]
 for dom in sorted(domain_links):
     links="\n".join(f'  <li><a href="{html.escape(u, True)}" target="_blank" rel="noopener">{html.escape(u, True)}</a></li>' for u in domain_links[dom])
     parts.append(f"<h4>{html.escape(dom, True)}</h4>\n<ul>\n{links}\n</ul>")
 links_html="\n\n".join(parts)
-
-open(os.path.join(out_dir, f"{base}_replies.html"), "w", encoding="utf-8").write(replies_html)
 open(os.path.join(out_dir, f"{base}_links.html"), "w", encoding="utf-8").write(links_html)
 PY
-          python3 "${WORKDIR}/replies.py"
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
 
@@ -870,7 +862,7 @@ PY
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {links_html:$lnk} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
 
