@@ -9,17 +9,17 @@ on:
         type: string
         default: ""
       post_id:
-        description: Existing WordPress post ID (optional)
+        description: Existing WordPress post ID
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title (optional)
+        description: Fallback post title 
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default: spaces/YYYY/MM)
+        description: GCS prefix 
         required: false
         type: string
         default: ""
@@ -47,12 +47,12 @@ on:
         type: string
         default: ""
       purple_tweet_url:
-        description: Seed tweet URL used to harvest replies/shared links (optional)
+        description: Seed tweet URL used to harvest replies/shared links 
         required: false
         type: string
         default: ""
       aggressive_denoise:
-        description: Use RNNoise (arnndn) denoiser (can sound “processed”)
+        description: Use RNNoise 
         required: false
         type: choice
         options: ["false","true"]
