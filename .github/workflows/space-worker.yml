@@ -62,6 +62,11 @@ on:
           - "false"
           - "true"
         default: "false"
+      purple_tweet_url:
+        description: Purple pill tweet URL optional
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -344,7 +349,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Natural radio tone chain
           PRE="highpass=f=70,lowpass=f=11500"
           if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
             PRE="${PRE},arnndn=m=${RNNOISE_MODEL}"
@@ -469,6 +473,8 @@ jobs:
 
       - name: Scrape replies and shared links
         shell: bash
+        env:
+          PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euo pipefail
           set +e
@@ -526,7 +532,7 @@ jobs:
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
@@ -567,7 +573,7 @@ jobs:
             --arg lnk "${LNK}" \
             '{post_id: ($pid|tonumber), status:"complete", progress:100}
              + (if ($rep|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|length)>0 then {shared_links_html:$lnk} else {} end)
           ')"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
@@ -583,23 +589,32 @@ jobs:
             echo "### Space Worker Summary"
             echo "- Mode      ${{ github.event.inputs.mode }}"
             echo "- Space URL ${{ github.event.inputs.space_url }}"
+            echo "- Purple URL ${{ github.event.inputs.purple_tweet_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
             if [ -n "${SPACE_TITLE:-}" ]; then
-              echo "- Space title: ${SPACE_TITLE}"
+              echo "- Space title ${SPACE_TITLE}"
             fi
             if [ -n "${SPACE_STARTED_AT:-}" ]; then
-              echo "- Space start UTC: ${SPACE_STARTED_AT}"
+              echo "- Space start UTC ${SPACE_STARTED_AT}"
             fi
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
-              echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
+              echo "- Audio ${{
+                steps.upload_mp3.outputs.audio_proxy
+              }}"
             elif [ -n "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
-              echo "- Audio     ${{ steps.upload_mp3.outputs.audio_raw }}"
+              echo "- Audio ${{
+                steps.upload_mp3.outputs.audio_raw
+              }}"
             fi
             if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
-              echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
+              echo "- VTT ${{
+                steps.upload_vtt.outputs.vtt_proxy
+              }}"
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
-              echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
+              echo "- VTT ${{
+                steps.upload_vtt.outputs.vtt_raw
+              }}"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
               echo "- Transcript embedded"
