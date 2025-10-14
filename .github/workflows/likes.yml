@@ -1,0 +1,47 @@
+name: Get User Likes
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "X username (without @)"
+        required: true
+
+jobs:
+  fetch-likes:
+    runs-on: ubuntu-latest
+    env:
+      BEARER: ${{ secrets.X_BEARER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq & curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Verify token presence
+        run: |
+          if [ -z "$BEARER" ]; then
+            echo "❌ Missing X_BEARER secret"
+            exit 1
+          fi
+
+      - name: Lookup user ID
+        id: lookup
+        run: |
+          USERNAME="${{ github.event.inputs.username }}"
+          echo "Looking up @$USERNAME ..."
+          RESP=$(curl -s -H "Authorization: Bearer $BEARER" \
+            "https://api.x.com/2/users/by/username/${USERNAME}")
+          echo "$RESP"
+          USER_ID=$(echo "$RESP" | jq -r '.data.id')
+          echo "user_id=$USER_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Get last 5 liked tweets
+        run: |
+          USER_ID="${{ steps.lookup.outputs.user_id }}"
+          echo "Fetching last 5 likes for $USER_ID ..."
+          curl -s -H "Authorization: Bearer $BEARER" \
+            "https://api.x.com/2/users/${USER_ID}/liked_tweets?max_results=5" \
+            | jq '.data'
