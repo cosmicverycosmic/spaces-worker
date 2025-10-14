@@ -4,22 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: X / Twitter Space URL (optional if running transcript_only with MP3)
+        description: X / Twitter Space URL if running transcript_only with MP3)
         required: false
         type: string
         default: ""
       post_id:
-        description: Existing WordPress Post ID (to update)
+        description: Existing WordPress Post ID 
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title (used if crawler lacks title)
+        description: Fallback post title 
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default: spaces/YYYY/MM)
+        description: GCS prefix 
         required: false
         type: string
         default: ""
@@ -30,13 +30,13 @@ on:
         options: ["true", "false"]
         default: "true"
       do_transcript:
-        description: Generate transcript if crawler captions unavailable (Deepgram)
+        description: Generate transcript if crawler captions unavailable 
         required: false
         type: choice
         options: ["true", "false"]
         default: "true"
       mode:
-        description: Limit processing ('' = full, 'transcript_only', 'attendees_only')
+        description: Limit processing 
         required: false
         type: choice
         options: ["", "transcript_only", "attendees_only"]
