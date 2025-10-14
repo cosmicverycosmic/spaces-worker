@@ -27,27 +27,19 @@ on:
         description: Make uploaded artifacts public
         required: false
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true","false"]
         default: "true"
       do_transcript:
-        description: Generate transcript when crawler captions are not available
+        description: Generate transcript when captions are not available
         required: false
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true","false"]
         default: "true"
       mode:
         description: Limit processing
         required: false
         type: choice
-        options:
-          - ""
-          - "transcript_only"
-          - "attendees_only"
-          - "replies_only"
+        options: ["","transcript_only","attendees_only","replies_only"]
         default: ""
       existing_mp3_url:
         description: For transcript only provide URL to existing MP3
@@ -55,18 +47,22 @@ on:
         type: string
         default: ""
       aggressive_denoise:
-        description: Use RNNoise arnndn denoiser may sound processed
+        description: Use RNNoise arnndn denoiser
         required: false
         type: choice
-        options:
-          - "false"
-          - "true"
+        options: ["false","true"]
         default: "false"
       purple_tweet_url:
         description: Purple pill tweet URL optional
         required: false
         type: string
         default: ""
+      audio_profile:
+        description: Audio profile for encode
+        required: false
+        type: choice
+        options: ["transparent","radio","aggressive"]
+        default: "transparent"
 
 permissions:
   contents: read
@@ -80,12 +76,10 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # twspace crawler auth
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Twitter API v1.1 for replies and shared links
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -142,7 +136,7 @@ jobs:
           set -euxo pipefail
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
-          mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
+          mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs" ".github/workflows/scripts"
           PFX="$(echo "${{ github.event.inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
           if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
           echo "PREFIX=$PFX"                  >> "$GITHUB_ENV"
@@ -236,68 +230,6 @@ jobs:
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
-      - name: Extract Space title and start
-        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          J="${ARTDIR}/_as_line.json"
-          TTL=""
-          START_RAW=""
-          if [ -s "$J" ]; then
-            TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
-            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J")"
-          fi
-          [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
-          [ -z "$TTL" ] && TTL="${BASE}"
-          echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
-          echo "TTL_FINAL=${TTL}"   >> "$GITHUB_ENV"
-          DATE_GMT=""
-          if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
-            if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
-              SEC=$((START_RAW/1000))
-              DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ')"
-            else
-              DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-            fi
-          fi
-          [ -z "$DATE_GMT" ] && DATE_GMT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
-
-      - name: Build VTT and transcript from crawler JSONL
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
-        shell: bash
-        env:
-          CC_JSONL: ${{ env.CRAWLER_CC }}
-        run: |
-          set -euxo pipefail
-          CC_JSONL="${CC_JSONL:-}"
-          if [ -z "${CC_JSONL}" ]; then
-            CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-          fi
-          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 ".github/workflows/scripts/gen_vtt.py"
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-            if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-              echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
-            fi
-          fi
-
-      - name: Notify WP processing audio
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
-            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
-                         --arg status "processing" \
-                         --arg msg "Processing audio" \
-                         --arg run "${{ github.run_id }}" --argjson progress 10 \
-                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
-
       - name: Fallback download via yt dlp
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
         shell: bash
@@ -319,7 +251,20 @@ jobs:
           curl -L "${{ github.event.inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
           echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
-      - name: Trim head and tail silence
+      - name: Detect lead silence seconds
+        id: detect
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LOG="${WORKDIR}/silence.log"
+          ffmpeg -hide_banner -i "$INPUT_FILE" -af "silencedetect=noise=-45dB:d=1" -f null - 2> "$LOG" || true
+          LEAD="$(awk '/silence_end/ {print $5; exit}' "$LOG" || true)"
+          case "$LEAD" in ''|*[^0-9.]* ) LEAD="0.0" ;; esac
+          echo "TRIM_LEAD=${LEAD}" >> "$GITHUB_ENV"
+          echo "lead=${LEAD}"       >> "$GITHUB_OUTPUT"
+
+      - name: Trim head and tail
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
@@ -327,50 +272,81 @@ jobs:
           TRIM_WAV="${WORKDIR}/trim_${{ github.run_id }}.wav"
           ffmpeg -hide_banner -y -i "$INPUT_FILE" \
             -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
-            -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
+            -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
-      - name: Download RNNoise model optional
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' && github.event.inputs.aggressive_denoise == 'true' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          M="${WORKDIR}/rnnoise.rnnn"
-          curl -fsSL -o "$M" https://raw.githubusercontent.com/GregorR/rnnoise-models/master/heavyrnnoise.rnnn || true
-          if [ -s "$M" ]; then
-            echo "USE_ARNNDN=1" >> "$GITHUB_ENV"
-            echo "RNNOISE_MODEL=$M" >> "$GITHUB_ENV"
-          else
-            echo "USE_ARNNDN=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Enhance and normalize to MP3
+      - name: Probe audio format
+        id: probe
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          PRE="highpass=f=70,lowpass=f=11500"
-          if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
-            PRE="${PRE},arnndn=m=${RNNOISE_MODEL}"
-          fi
-          PRE="${PRE},afftdn=nr=6:nf=-25,deesser=i=0.18,acompressor=threshold=-18dB:ratio=2.5:attack=8:release=200:makeup=3"
-          PASS1_JSON="${WORKDIR}/loudnorm1.json"
-          ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
-          awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
-          if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-            I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
-            TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
-            LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
-            TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
-            ffmpeg -hide_banner -y -i "$AUDIO_IN" \
-              -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
-              -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+          J="$(ffprobe -v error -select_streams a:0 -show_entries stream=channels,sample_rate -of json "$AUDIO_IN")"
+          CH=$(echo "$J" | jq -r '.streams[0].channels // 1')
+          SR=$(echo "$J" | jq -r '.streams[0].sample_rate // "48000"')
+          echo "SRC_CH=${CH}" >> "$GITHUB_ENV"
+          echo "SRC_SR=${SR}" >> "$GITHUB_ENV"
+
+      - name: Encode MP3 with selected profile
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
+        shell: bash
+        env:
+          PROF: ${{ github.event.inputs.audio_profile }}
+        run: |
+          set -euxo pipefail
+          OUT="${ARTDIR}/${BASE}.mp3"
+          CH="${SRC_CH:-1}"
+          SR="${SRC_SR:-48000}"
+
+          if [ "${PROF}" = "transparent" ]; then
+            # No denoise, no EQ, no compressor. Keep channels and sample rate. High quality VBR.
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -map a:0 -c:a libmp3lame -q:a 0 -ar "$SR" -ac "$CH" "$OUT"
+
+          elif [ "${PROF}" = "radio" ]; then
+            # Gentle clean up for broadcast tone
+            PRE="highpass=f=60,lowpass=f=14000,afftdn=nr=4:nf=-28,deesser=i=0.12,acompressor=threshold=-18dB:ratio=2:attack=12:release=220:makeup=2"
+            PASS1_JSON="${WORKDIR}/loudnorm1.json"
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
+            awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+            if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
+              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
+              TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
+              LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
+              TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+              ffmpeg -hide_banner -y -i "$AUDIO_IN" \
+                -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
+                -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
+            else
+              ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
+                -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
+            fi
+
           else
-            ffmpeg -hide_banner -y -i "$AUDIO_IN" \
-              -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
-              -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
+            # aggressive
+            PRE="highpass=f=70,lowpass=f=11500,afftdn=nr=8:nf=-25,deesser=i=0.2,acompressor=threshold=-18dB:ratio=2.8:attack=8:release=200:makeup=3"
+            if [ "${{ github.event.inputs.aggressive_denoise }}" = "true" ]; then
+              M="${WORKDIR}/rnnoise.rnnn"
+              curl -fsSL -o "$M" https://raw.githubusercontent.com/GregorR/rnnoise-models/master/heavyrnnoise.rnnn || true
+              if [ -s "$M" ]; then PRE="arnndn=m=${M},${PRE}"; fi
+            fi
+            PASS1_JSON="${WORKDIR}/loudnorm1.json"
+            ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
+            awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+            if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
+              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
+              TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
+              LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
+              TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+              ffmpeg -hide_banner -y -i "$AUDIO_IN" \
+                -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
+                -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
+            else
+              ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
+                -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
+            fi
           fi
-          echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
+
+          echo "MP3_PATH=${OUT}" >> "$GITHUB_ENV"
 
       - name: Upload MP3 to GCS
         id: upload_mp3
@@ -388,15 +364,149 @@ jobs:
           echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Prefer crawler captions
-        id: crawl_cc
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
+      - name: Write helper scripts
         shell: bash
+        env:
+          PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euo pipefail
-          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+          mkdir -p ".github/workflows/scripts"
 
-      - name: VTT via Deepgram
+          cat > ".github/workflows/scripts/gen_vtt.py" << 'PY'
+          import os, sys, json, html
+          ARTDIR = os.environ.get("ARTDIR","."); BASE=os.environ.get("BASE","space")
+          CC=os.environ.get("CC_JSONL") or ""; SHIFT=float(os.environ.get("SHIFT_SECS","0") or "0")
+          vtt_path=os.path.join(ARTDIR,f"{BASE}.vtt"); tr_path=os.path.join(ARTDIR,f"{BASE}_transcript.html")
+          def load_jsonl(p):
+              out=[]; 
+              with open(p,'r',encoding='utf-8',errors='ignore') as f:
+                  for line in f:
+                      line=line.strip()
+                      if line:
+                          try: out.append(json.loads(line))
+                          except: pass
+              return out
+          def pick(o,*ks):
+              for k in ks:
+                  if k in o and o[k] is not None: return o[k]
+              return None
+          def fmt(s): 
+              h=int(s//3600); m=int((s%3600)//60); sec=s-h*3600-m*60
+              return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.',',')
+          if not CC or not os.path.exists(CC):
+              open(vtt_path,'w').write("WEBVTT\n\n"); open(tr_path,'w').write(""); sys.exit(0)
+          raw=load_jsonl(CC); cues=[]
+          for it in raw:
+              st=pick(it,'start','offset','startSec','startMs','ts','time'); en=pick(it,'end','endSec','endMs')
+              tx=(pick(it,'text','caption','content','payloadText') or "").strip()
+              sp=(pick(it,'speaker','from','user','name','speaker_name','speakerName') or "")
+              hd=(pick(it,'username','handle','screen_name') or "")
+              try: st=float(st); 
+              except: st=0.0
+              if st>86400: st/=1000.0
+              if en:
+                  try: en=float(en)
+                  except: en=None
+                  if en and en>86400: en/=1000.0
+              if not en: en=st+max(1.2,len(tx)/14.0)
+              st=max(0.0,st-SHIFT); en=max(st+0.01,en-SHIFT)
+              cues.append({'start':st,'end':en,'text':tx,'speaker':sp,'handle':hd})
+          cues.sort(key=lambda c:c['start'])
+          with open(vtt_path,'w',encoding='utf-8') as v:
+              v.write("WEBVTT\n\n")
+              for c in cues:
+                  v.write(f"{fmt(c['start'])} --> {fmt(c['end'])}\n")
+                  line = c['text']
+                  if c['speaker']:
+                      line=f"<v {html.escape(c['speaker'])}> {line}"
+                  v.write(line+"\n\n")
+          out=[]
+          for c in cues:
+              name = c['speaker'] or (("@"+c['handle']) if c['handle'] else "Speaker")
+              avatar = f"https://unavatar.io/twitter/{c['handle']}" if c['handle'] else ""
+              out.append(
+                f'<div class="ss3k-line" data-start="{c["start"]:.3f}" data-end="{c["end"]:.3f}" data-avatar="{html.escape(avatar)}">'
+                f'<span class="ss3k-avatar" aria-hidden="true"></span>'
+                f'<span class="ss3k-name">{html.escape(name)}</span>'
+                f'<span class="ss3k-text">{html.escape(c["text"])}</span>'
+                f'</div>'
+              )
+          open(tr_path,'w',encoding='utf-8').write("\n".join(out))
+          PY
+
+          cat > ".github/workflows/scripts/replies.py" << 'PY'
+          import os, re, sys, html, tldextract
+          import twitter
+          from collections import defaultdict
+          ARTDIR=os.environ.get("ARTDIR","."); BASE=os.environ.get("BASE","space")
+          PURPLE=os.environ.get("PURPLE_TWEET_URL","").strip()
+          repl=os.path.join(ARTDIR,f"{BASE}_replies.html"); links=os.path.join(ARTDIR,f"{BASE}_links.html")
+          def empty():
+              open(repl,"w").write(""); open(links,"w").write("")
+          if not PURPLE: empty(); sys.exit(0)
+          m=re.search(r"/([^/]+)/status/(\\d+)",PURPLE)
+          if not m: empty(); sys.exit(0)
+          screen_name, tid = m.group(1), int(m.group(2))
+          ck=os.environ.get("TW_API_CONSUMER_KEY",""); cs=os.environ.get("TW_API_CONSUMER_SECRET","")
+          at=os.environ.get("TW_API_ACCESS_TOKEN",""); ats=os.environ.get("TW_API_ACCESS_TOKEN_SECRET","")
+          if not all([ck,cs,at,ats]): empty(); sys.exit(0)
+          api=twitter.Api(consumer_key=ck, consumer_secret=cs, access_token_key=at, access_token_secret=ats, tweet_mode="extended", sleep_on_rate_limit=True)
+          try:
+              root=api.GetStatus(status_id=tid, include_my_retweet=False)
+          except Exception:
+              empty(); sys.exit(0)
+          results=[]
+          try:
+              rs=api.GetSearch(term=f"to:{screen_name}", since_id=tid, count=100, result_type="recent", include_entities=True)
+              for t in rs:
+                  if getattr(t,'in_reply_to_status_id',None)==tid:
+                      results.append(t)
+          except Exception:
+              pass
+          def esc(x): return html.escape(x or "")
+          blocks=[]
+          for t in results:
+              u=t.user
+              name=f"{u.name} (@{u.screen_name})" if u and u.screen_name else "User"
+              avatar=getattr(u,'profile_image_url_https', '') or ""
+              text=esc(getattr(t,'full_text',None) or getattr(t,'text',None) or "")
+              blocks.append(f'<div class="ss3k-reply"><img class="ss3k-ravatar" src="{esc(avatar)}" alt=""><div class="ss3k-rcontent"><div class="ss3k-rname">{esc(name)}</div><div class="ss3k-rtext">{text}</div></div></div>')
+          open(repl,"w").write("\n".join(blocks))
+          doms=defaultdict(set)
+          def add_urls(status):
+              for u in getattr(status,"urls",[]) or []:
+                  u2=getattr(u,"expanded_url",None) or getattr(u,"url",None)
+                  if u2: 
+                      ext=tldextract.extract(u2); dom=".".join([p for p in [ext.domain,ext.suffix] if p]); doms[dom].add(u2)
+          try: add_urls(root)
+          except: pass
+          for t in results:
+              try: add_urls(t)
+              except: pass
+          lines=[]
+          for dom in sorted(doms):
+              lines.append(f"<h4>{esc(dom)}</h4>"); lines.append("<ul>")
+              for u in sorted(doms[dom]): e=esc(u); lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
+              lines.append("</ul>")
+          open(links,"w").write("\n".join(lines))
+          PY
+
+      - name: Build VTT and transcript after trim
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
+        shell: bash
+        env:
+          CC_JSONL: ${{ env.CRAWLER_CC }}
+          SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
+        run: |
+          set -euxo pipefail
+          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
+              python3 ".github/workflows/scripts/gen_vtt.py"
+            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+          fi
+
+      - name: VTT via Deepgram fallback
         id: deepgram
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
@@ -481,9 +591,6 @@ jobs:
           python3 ".github/workflows/scripts/replies.py"
           rc=$?
           set -e
-          if [ $rc -ne 0 ]; then
-            echo "::warning title=Replies scrape failed::python exited with code $rc"
-          fi
           if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
             echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
           fi
@@ -521,7 +628,6 @@ jobs:
             --rawfile tr  "${TR_FILE}" \
             --rawfile rep "${REP_FILE}" \
             --rawfile lnk "${LNK_FILE}" \
-            --arg started "${SPACE_STARTED_AT:-}" \
             '{
                gcs_url: $gcs,
                mime:    $mime,
@@ -533,7 +639,6 @@ jobs:
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
              + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
-             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
@@ -546,19 +651,12 @@ jobs:
         run: |
           set -euo pipefail
           AT_HTML=""
-          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            AT_HTML="$(cat "${ATTN_HTML}")"
-          fi
-          BODY="$(jq -n \
-            --arg pid "${{ github.event.inputs.post_id }}" \
-            --arg ath "${AT_HTML}" \
+          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then AT_HTML="$(cat "${ATTN_HTML}")"; fi
+          BODY="$(jq -n --arg pid "${{ github.event.inputs.post_id }}" --arg ath "${AT_HTML}" \
             '{post_id: ($pid|tonumber), status:"complete", progress:100}
-             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
-          ')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
-            -d "$BODY" | jq -r .
+             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)')"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
 
       - name: Patch WP replies only
         if: ${{ github.event.inputs.mode == 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
@@ -567,18 +665,12 @@ jobs:
           set -euo pipefail
           REP="$( [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && cat "${REPLIES_PATH}" || echo "" )"
           LNK="$( [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && cat "${LINKS_PATH}" || echo "" )"
-          BODY="$(jq -n \
-            --arg pid "${{ github.event.inputs.post_id }}" \
-            --arg rep "${REP}" \
-            --arg lnk "${LNK}" \
+          BODY="$(jq -n --arg pid "${{ github.event.inputs.post_id }}" --arg rep "${REP}" --arg lnk "${LNK}" \
             '{post_id: ($pid|tonumber), status:"complete", progress:100}
              + (if ($rep|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|length)>0 then {shared_links_html:$lnk} else {} end)
-          ')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
-            -d "$BODY" | jq -r .
+             + (if ($lnk|length)>0 then {shared_links_html:$lnk} else {} end)')"
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
 
       - name: Summary
         shell: bash
@@ -587,53 +679,19 @@ jobs:
         run: |
           {
             echo "### Space Worker Summary"
-            echo "- Mode      ${{ github.event.inputs.mode }}"
+            echo "- Mode ${{ github.event.inputs.mode }}"
             echo "- Space URL ${{ github.event.inputs.space_url }}"
             echo "- Purple URL ${{ github.event.inputs.purple_tweet_url }}"
-            echo "- Space ID  ${SID}"
-            echo "- Post ID   ${{ github.event.inputs.post_id }}"
-            if [ -n "${SPACE_TITLE:-}" ]; then
-              echo "- Space title ${SPACE_TITLE}"
-            fi
-            if [ -n "${SPACE_STARTED_AT:-}" ]; then
-              echo "- Space start UTC ${SPACE_STARTED_AT}"
-            fi
+            echo "- Space ID ${SID}"
+            echo "- Post ID ${{ github.event.inputs.post_id }}"
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
-              echo "- Audio ${{
-                steps.upload_mp3.outputs.audio_proxy
-              }}"
+              echo "- Audio ${{ steps.upload_mp3.outputs.audio_proxy }}"
             elif [ -n "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
-              echo "- Audio ${{
-                steps.upload_mp3.outputs.audio_raw
-              }}"
+              echo "- Audio ${{ steps.upload_mp3.outputs.audio_raw }}"
             fi
             if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
-              echo "- VTT ${{
-                steps.upload_vtt.outputs.vtt_proxy
-              }}"
+              echo "- VTT ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
-              echo "- VTT ${{
-                steps.upload_vtt.outputs.vtt_raw
-              }}"
-            fi
-            if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
-              echo "- Transcript embedded"
-            else
-              echo "- Transcript not generated"
-            fi
-            if [ -n "${REPLIES_PATH:-}" ]; then
-              echo "- Replies HTML generated"
-            else
-              echo "- Replies not generated"
-            fi
-            if [ -n "${LINKS_PATH:-}" ]; then
-              echo "- Shared links HTML generated"
-            else
-              echo "- Shared links not generated"
-            fi
-            if [ "${ATTENDEES_OK:-0}" = "1" ]; then
-              echo "- Attendees saved to WP"
-            else
-              echo "- Attendees not extracted"
+              echo "- VTT ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
