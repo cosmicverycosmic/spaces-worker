@@ -9,17 +9,17 @@ on:
         type: string
         default: ""
       post_id:
-        description: Existing WordPress post ID optional
+        description: Existing WordPress post ID (optional)
         required: false
         type: string
         default: ""
       title:
-        description: Fallback post title optional
+        description: Fallback post title (optional)
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix default spaces YYYY/MM
+        description: GCS prefix (default: spaces/YYYY/MM)
         required: false
         type: string
         default: ""
@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: ""
+      purple_tweet_url:
+        description: Seed tweet URL used to harvest replies/shared links (optional)
+        required: false
+        type: string
+        default: ""
       aggressive_denoise:
         description: Use RNNoise (arnndn) denoiser (can sound “processed”)
         required: false
@@ -58,19 +63,25 @@ permissions:
   packages: read
 
 env:
+  # GCS
   GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
   GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
+  MEDIA_CDN_BASE:   ${{ secrets.MEDIA_CDN_BASE   || vars.MEDIA_CDN_BASE }} # e.g. https://media.example.com (optional)
+
+  # WordPress
   WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
+
+  # Deepgram
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # twspace-crawler auth (cookie and/or bearer)
+  # twspace-crawler (cookie and/or bearer)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Twitter API v1.1 (for replies & shared links)
+  # Twitter API v1.1 (for replies & shared links) — optional
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -343,7 +354,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Softer chain to avoid "hollow/echoey":
           # HPF/LPF -> (optional RNNoise) -> mild spectral denoise -> light de-ess -> gentle comp -> EBU R128 loudnorm (2-pass) -> mono MP3
           PRE="highpass=f=70,lowpass=f=11500"
           if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
@@ -370,7 +380,7 @@ jobs:
           fi
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
-      - name: Upload MP3 to GCS
+      - name: Upload MP3 to GCS (with metadata & optional CDN URL)
         id: upload_mp3
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
         shell: bash
@@ -378,8 +388,12 @@ jobs:
           set -euxo pipefail
           DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
           RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
-          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
+          PROXY=""
+          if [ -n "${MEDIA_CDN_BASE:-}" ]; then
+            PROXY="${MEDIA_CDN_BASE%/}/${PREFIX}/${BASE}.mp3"
+          fi
           gsutil -m cp "${MP3_PATH}" "$DEST"
+          gsutil setmeta -h "Cache-Control:public, max-age=31536000, immutable" -h "Content-Type:audio/mpeg" "$DEST" || true
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
@@ -395,7 +409,7 @@ jobs:
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
       - name: VTT via Deepgram (fallback)
-        id: deepgram
+        id: deepgram_vtt
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
         run: |
@@ -404,11 +418,53 @@ jobs:
             -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
             -H "Content-Type: audio/mpeg" \
             --data-binary @"${MP3_PATH}" \
-            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true&format=vtt" \
             -o "${ARTDIR}/${BASE}.vtt" || true
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
-      - name: Upload VTT to GCS
+      - name: Transcript HTML via Deepgram diarized JSON (fallback)
+        id: deepgram_html
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.TRANSCRIPT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          JSON_OUT="${WORKDIR}/dg.json"
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${MP3_PATH}" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true" \
+            -o "$JSON_OUT" || true
+
+          if jq -e . "$JSON_OUT" >/dev/null 2>&1; then
+            python3 - "$JSON_OUT" "${ARTDIR}/${BASE}_transcript.html" << 'PY'
+import json, sys, html
+src, out = sys.argv[1], sys.argv[2]
+j = json.load(open(src, 'r', encoding='utf-8'))
+utts = (j.get('results',{}) or {}).get('utterances') or []
+def fmt_time(t):
+    t=float(t or 0)
+    m=int(t//60); s=t-60*m
+    return f"{m:02d}:{int(s):02d}"
+parts=[]
+for u in utts:
+    s=u.get('start',0); e=u.get('end',0)
+    txt=u.get('transcript','').strip()
+    sp=u.get('speaker', None)
+    if not txt: continue
+    label = f"Speaker {sp}" if sp is not None else "Speaker"
+    parts.append(
+        f'<div class="ss3k-seg" data-start="{s:.3f}" data-end="{e:.3f}">'
+        f'<div class="ss3k-meta"><strong>{html.escape(label)}</strong><span>· {fmt_time(s)}</span></div>'
+        f'<div class="ss3k-body"><div class="txt">{html.escape(txt)}</div></div>'
+        f'</div>'
+    )
+open(out,'w',encoding='utf-8').write("\n".join(parts))
+PY
+            [ -s "${ARTDIR}/${BASE}_transcript.html"] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+          fi
+
+      - name: Upload VTT to GCS (with metadata & optional CDN URL)
         id: upload_vtt
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' }}
         shell: bash
@@ -416,8 +472,12 @@ jobs:
           set -euxo pipefail
           DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
           RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
-          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.vtt"
+          PROXY=""
+          if [ -n "${MEDIA_CDN_BASE:-}" ]; then
+            PROXY="${MEDIA_CDN_BASE%/}/${PREFIX}/${BASE}.vtt"
+          fi
           gsutil -m cp "${VTT_PATH}" "$DEST"
+          gsutil setmeta -h "Cache-Control:public, max-age=31536000, immutable" -h "Content-Type:text/vtt; charset=utf-8" "$DEST" || true
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
@@ -474,9 +534,11 @@ jobs:
 
       - name: Scrape Space tweet replies & shared links (best-effort; always try)
         shell: bash
+        env:
+          PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euo pipefail
-          # Always run; the Python script will no-op if credentials are missing.
+          # Always run; replies.py will no-op gracefully if credentials or seed URL are missing.
           set +e
           python3 ".github/workflows/scripts/replies.py"
           rc=$?
@@ -486,14 +548,24 @@ jobs:
           fi
           if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
             echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
-          else
-            echo "::warning title=Replies HTML missing::Proceeding without replies"
           fi
           if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
             echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
-          else
-            echo "::warning title=Links HTML missing::Proceeding without shared links"
           fi
+
+      - name: Notify WP — assets ready (pre-register)
+        if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
+                         --arg status "assembling" \
+                         --arg msg "Assembling transcript/replies/links" \
+                         --arg run "${{ github.run_id }}" --argjson progress 80 \
+                         '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Register assets in WP (finalize)
         if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
@@ -541,7 +613,7 @@ jobs:
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
 
@@ -586,7 +658,7 @@ jobs:
             --arg lnk "${LNK}" \
             '{post_id: ($pid|tonumber), status:"complete", progress:100}
              + (if ($rep|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|length)>0 then {shared_links_html:$lnk} else {} end)
           ')"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
