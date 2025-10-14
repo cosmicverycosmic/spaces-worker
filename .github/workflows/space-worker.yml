@@ -29,12 +29,6 @@ on:
         type: choice
         options: ["true","false"]
         default: "true"
-      do_transcript:
-        description: Generate transcript when captions are not available
-        required: false
-        type: choice
-        options: ["true","false"]
-        default: "true"
       mode:
         description: Limit processing
         required: false
@@ -75,6 +69,9 @@ env:
   WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
+
+  # toggle for Deepgram fallback (moved from inputs)
+  DO_TRANSCRIPT:    ${{ vars.DO_TRANSCRIPT || 'true' }}
 
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
@@ -177,7 +174,8 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
-          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
+          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""
+          fi
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
@@ -329,7 +327,7 @@ jobs:
             PASS1_JSON="${WORKDIR}/loudnorm1.json"
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
             awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
-            if jq -e . "$PASS1_JSON" >/dev/null 2^&1; then
+            if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
               I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
               TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
               LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
@@ -500,7 +498,7 @@ jobs:
 
           USE_GEC = os.environ.get("TRANSCRIPT_GEC", "true").lower() in ("1","true","yes","on")
           GEC_MODEL = os.environ.get("TRANSCRIPT_GEC_MODEL", "prithivida/grammar_error_correcter_v1")
-          GEC_MAX_LINES = int(os.environ.get("TRANSCRIPT_GEC_MAX_LINES", "10"))
+          GEC_MAX_LINES = int(os.environ.get("TRANSCRIPT_GEC_MAX_LINES", "0"))  # 0 means unlimited
           GEC_BATCH_SIZE = int(os.environ.get("TRANSCRIPT_GEC_BATCH", "4"))
           GEC_SELECT = os.environ.get("TRANSCRIPT_GEC_SELECT", "auto")
 
@@ -631,14 +629,17 @@ jobs:
               return longness + no_punct + mostly_lower + many_commas
 
           indices = list(range(len(cleaned)))
-          if GEC_SELECT == "first":
-              candidate_idxs = indices[:GEC_MAX_LINES]
-          else:
-              if GEC_SELECT == "longest":
-                  scored = sorted(indices, key=lambda i: len(cleaned[i]), reverse=True)
+          if GEC_MAX_LINES and GEC_MAX_LINES > 0:
+              if GEC_SELECT == "first":
+                  candidate_idxs = indices[:GEC_MAX_LINES]
               else:
-                  scored = sorted(indices, key=lambda i: quality_score(cleaned[i]), reverse=True)
-              candidate_idxs = scored[:max(0, min(GEC_MAX_LINES, len(scored)))]
+                  if GEC_SELECT == "longest":
+                      scored = sorted(indices, key=lambda i: len(cleaned[i]), reverse=True)
+                  else:
+                      scored = sorted(indices, key=lambda i: quality_score(cleaned[i]), reverse=True)
+                  candidate_idxs = scored[:max(0, min(GEC_MAX_LINES, len(scored)))]
+          else:
+              candidate_idxs = indices  # unlimited
 
           def apply_gec(lines: List[str]) -> List[str]:
               try:
@@ -655,8 +656,8 @@ jobs:
               except Exception:
                   return lines
 
-              out = []
-              buf = []
+              out: List[str] = []
+              buf: List[str] = []
               url_buckets: List[List[str]] = []
 
               def protect_urls_for_model(line: str):
@@ -741,7 +742,7 @@ jobs:
         shell: bash
         env:
           TRANSCRIPT_GEC: "true"
-          TRANSCRIPT_GEC_MAX_LINES: "10"
+          TRANSCRIPT_GEC_MAX_LINES: "0"       # 0 = unlimited
           TRANSCRIPT_GEC_MODEL: "prithivida/grammar_error_correcter_v1"
           TRANSCRIPT_GEC_SELECT: "auto"
         run: |
@@ -750,7 +751,7 @@ jobs:
 
       - name: VTT via Deepgram fallback
         id: deepgram
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && env.DO_TRANSCRIPT == 'true' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
