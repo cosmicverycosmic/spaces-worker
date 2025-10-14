@@ -204,12 +204,14 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
+          # Most-recent audio file
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
+          # Compact metadata JSON line
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -219,6 +221,7 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
+          # Captions JSONL from crawler
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
@@ -262,12 +265,12 @@ jobs:
           CC_JSONL: ${{ env.CRAWLER_CC }}
         run: |
           set -euxo pipefail
-          if [ -z "${CC_JSONL:-}" ]; then
+          CC_JSONL="${CC_JSONL:-}"
+          if [ -z "${CC_JSONL}" ]; then
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" \
-              python3 ".github/workflows/scripts/gen_vtt.py"
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
             if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
@@ -321,17 +324,17 @@ jobs:
             -ar 48000 -ac 2 -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
-      - name: (Optional) Fetch RNNoise model
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+      - name: (Optional) Download RNNoise model for arnndn
+        if: ${{ github.event.inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          RN="${WORKDIR}/rnnoise.rnnn"
-          # Known good public model (Gregorr RNNoise repo)
-          curl -fsSL -o "$RN" "https://raw.githubusercontent.com/GregorR/rnnoise-models/master/somnolent-hogwash-2018-09-01/sh.rnnn" || true
-          if [ -s "$RN" ]; then
+          # Try to fetch a common .rnnn model; fall back to disabled if download fails.
+          M="${WORKDIR}/rnnoise.rnnn"
+          curl -fsSL -o "$M" https://raw.githubusercontent.com/GregorR/rnnoise-models/master/heavyrnnoise.rnnn || true
+          if [ -s "$M" ]; then
             echo "USE_ARNNDN=1" >> "$GITHUB_ENV"
-            echo "RNNOISE_MODEL=$RN" >> "$GITHUB_ENV"
+            echo "RNNOISE_MODEL=$M" >> "$GITHUB_ENV"
           else
             echo "USE_ARNNDN=0" >> "$GITHUB_ENV"
           fi
@@ -346,7 +349,7 @@ jobs:
           if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
             PRE="${PRE},arnndn=m=${RNNOISE_MODEL}"
           fi
-          PRE="${PRE},afftdn=nr=12:nf=-28,deesser=i=12,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
+          PRE="${PRE},afftdn=nr=12:nf=-28,deesser=i=0.3,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
 
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
           # Analysis pass to get measured params (reduces pumping/clipping)
@@ -475,10 +478,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ARTDIR="${ARTDIR}" BASE="${BASE}" SPACE_ID="${SPACE_ID}" \
-            python3 ".github/workflows/scripts/replies.py"
+          python3 ".github/workflows/scripts/replies.py"
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}_links.html" ]   && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html"     >> "$GITHUB_ENV" || true
+          [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
 
       - name: Register assets in WP (finalize)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
@@ -526,7 +528,7 @@ jobs:
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
 
