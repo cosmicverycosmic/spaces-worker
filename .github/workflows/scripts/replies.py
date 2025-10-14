@@ -1,13 +1,15 @@
 # .github/workflows/scripts/replies.py
-import os, re, sys, json, html
+import os, re, json, html, time
 from collections import defaultdict
+from datetime import datetime, timezone
 
-# Optional deps that are already in the workflow:
+# Optional deps (gracefully degrade if missing)
 try:
     import tldextract
 except Exception:
     tldextract = None
 
+# ---- Config / env ----
 ARTDIR = os.environ.get("ARTDIR",".")
 BASE   = os.environ.get("BASE","space")
 PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
@@ -15,257 +17,510 @@ PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
 REPLIES_OUT = os.path.join(ARTDIR, f"{BASE}_replies.html")
 LINKS_OUT   = os.path.join(ARTDIR, f"{BASE}_links.html")
 
+LINK_LABEL_AI         = (os.environ.get("LINK_LABEL_AI","keybert") or "keybert").lower()  # keybert | off
+LINK_LABEL_MODEL      = os.environ.get("LINK_LABEL_MODEL","sentence-transformers/all-MiniLM-L6-v2")
+
+FETCH_TITLES          = (os.environ.get("LINK_LABEL_FETCH_TITLES","true") or "true").lower() in ("1","true","yes","on")
+FETCH_TITLES_LIMIT    = int(os.environ.get("LINK_LABEL_FETCH_LIMIT","10") or "10")
+FETCH_TIMEOUT_SEC     = int(os.environ.get("LINK_LABEL_TIMEOUT_SEC","4") or "4")
+
+KEYBERT_TOPN          = int(os.environ.get("KEYBERT_TOPN","8") or "8")
+KEYBERT_NGRAM_MIN     = int(os.environ.get("KEYBERT_NGRAM_MIN","1") or "1")
+KEYBERT_NGRAM_MAX     = int(os.environ.get("KEYBERT_NGRAM_MAX","3") or "3")
+KEYBERT_USE_MMR       = (os.environ.get("KEYBERT_USE_MMR","true") or "true").lower() in ("1","true","yes","on")
+KEYBERT_DIVERSITY     = float(os.environ.get("KEYBERT_DIVERSITY","0.6") or "0.6")
+
+def esc(x:str)->str: return html.escape(x or "")
+
 def write_empty():
     open(REPLIES_OUT,"w",encoding="utf-8").write("")
     open(LINKS_OUT,"w",encoding="utf-8").write("")
 
-def esc(x): return html.escape(x or "")
+def parse_created_at(s):
+    # Example: "Tue Oct 01 14:23:37 +0000 2025"
+    try:  return datetime.strptime(s, "%a %b %d %H:%M:%S %z %Y").timestamp()
+    except Exception: return 0.0
 
-def add_link(links_by_domain, url):
-    if not url: return
-    dom = url
-    if tldextract:
-        ext = tldextract.extract(url)
-        dom = ".".join([p for p in [ext.domain, ext.suffix] if p])
-    links_by_domain[dom].add(url)
+def fmt_utc(ts):
+    try:  return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception: return ""
 
-def render_replies(replies):
-    parts = []
-    for r in replies:
-        name = r.get("name") or "User"
-        handle = r.get("handle")
-        display = f"{name} (@{handle})" if handle else name
-        avatar = r.get("avatar") or ""
-        text = r.get("text") or ""
+def smart_words(text): return [w for w in re.findall(r"[A-Za-z0-9]+", text or "") if w]
 
-        parts.append(
-            f'<div class="ss3k-reply">'
-            f'  <img class="ss3k-ravatar" src="{esc(avatar)}" alt="">'
-            f'  <div class="ss3k-rcontent">'
-            f'    <div class="ss3k-rname">{esc(display)}</div>'
-            f'    <div class="ss3k-rtext">{text}</div>'
-            f'  </div>'
-            f'</div>'
-        )
-    return "\n".join(parts)
+STOPWORDS = {
+    "the","and","for","to","of","in","on","with","a","an","is","are","be","this","that","from","by","at","as","into",
+    "your","our","their","about","or","it","its","you","we","they","them","his","her","him","than","then","over","out"
+}
 
-def render_links(links_by_domain):
-    out = []
-    for dom in sorted(links_by_domain.keys()):
-        out.append(f"<h4>{esc(dom)}</h4>")
-        out.append("<ul>")
-        for u in sorted(links_by_domain[dom]):
-            e = esc(u)
-            out.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
-        out.append("</ul>")
-    return "\n".join(out)
+def compress_to_2_3_words(text):
+    if not text: return "Link"
+    seg = re.split(r"\s+[-–—|:]\s+", text.strip(), maxsplit=1)[0]
+    tokens = smart_words(seg)
+    kept=[]
+    for w in tokens:
+        if len(kept)>=3: break
+        lw=w.lower()
+        if lw in STOPWORDS and len(tokens)>3: continue
+        kept.append(w if w.isupper() else w.capitalize())
+    if not kept:
+        kept = [tokens[0].capitalize()] if tokens else ["Link"]
+    return " ".join(kept[:3])
 
-def expand_text_with_entities(text, entities):
-    """Replace t.co URLs with expanded_url, linkify; preserve original if missing."""
-    text = text or ""
-    if not entities: 
-        return esc(text)
-    urls = entities.get("urls") or []
-    out = text
-    # Replace longer first to avoid overlaps
-    urls_sorted = sorted(urls, key=lambda u: len(u.get("url","")), reverse=True)
-    for u in urls_sorted:
-        short = u.get("url") or ""
-        expanded = u.get("expanded_url") or u.get("unwound_url") or short
-        if short and short in out:
-            out = out.replace(short, expanded)
-    # Minimal linkify for any remaining http(s)://… strings
-    out = re.sub(r'(https?://\S+)', r'<a href="\1" target="_blank" rel="noopener">\1</a>', out)
+def slug_to_words(u):
+    m = re.match(r"https?://[^/]+/(.+)", u or "")
+    if not m: return []
+    slug = m.group(1).strip("/").split("/")[-1]
+    slug = re.sub(r"\.[A-Za-z0-9]{1,6}$","",slug)
+    slug = slug.replace("_","-")
+    parts=[p for p in slug.split("-") if p]
+    out=[]
+    for p in parts:
+        out.extend(re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", p))
     return out
 
-# ---------- Path A: Twitter API v1.1 if keys provided ----------
-def try_v1(screen_name, tid_int):
-    ck  = os.environ.get("TW_API_CONSUMER_KEY","")
-    cs  = os.environ.get("TW_API_CONSUMER_SECRET","")
-    at  = os.environ.get("TW_API_ACCESS_TOKEN","")
-    ats = os.environ.get("TW_API_ACCESS_TOKEN_SECRET","")
-    if not all([ck,cs,at,ats]):
-        return None
+def derive_from_context(text):
+    if not text: return None
+    tags = re.findall(r"#([A-Za-z0-9_]+)", text)
+    if tags:
+        tag = re.sub(r"([A-Za-z])(\d)", r"\1 \2", tags[0])
+        tag = re.sub(r"(\d)([A-Za-z])", r"\1 \2", tag)
+        return compress_to_2_3_words(tag)
+    up = re.findall(r"\b([A-Z][A-Z0-9]+(?:\s+[A-Z][A-Z0-9]+){1,3})\b", text)
+    if up: return compress_to_2_3_words(up[0])
+    toks = [t for t in re.findall(r"[A-Za-z][A-Za-z0-9']+", text) if t.lower() not in STOPWORDS]
+    toks.sort(key=lambda w:(-w[0].isupper(), -len(w)))
+    if toks: return compress_to_2_3_words(" ".join(toks[:3]))
+    return None
 
+def label_from_domain(domain):
+    if not domain: return "Link"
+    d=domain.lower()
+    if "youtube.com" in d or "youtu.be" in d: return "YouTube Video"
+    if "substack.com" in d: return "Substack Post"
+    if "x.com" in d or "twitter.com" in d: return "Tweet"
+    if "pubmed." in d: return "PubMed Study"
+    if "who.int" in d: return "WHO Page"
+    if "github.com" in d: return "GitHub Repo"
+    if "medium.com" in d: return "Medium Post"
+    if d.endswith(".gov"): return "Gov Page"
+    return (d.split(".")[-2].capitalize()+" Page") if "." in d else d.capitalize()
+
+def http_get(url, timeout=FETCH_TIMEOUT_SEC, max_bytes=32768):
+    import urllib.request
     try:
-        import twitter
+        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data=r.read(max_bytes)
+            charset="utf-8"
+            ct=r.headers.get("Content-Type","")
+            m=re.search(r"charset=([\w\-]+)", ct or "", re.I)
+            if m: charset=m.group(1)
+            try: return data.decode(charset,"ignore")
+            except Exception: return data.decode("utf-8","ignore")
     except Exception:
         return None
 
+def extract_title(html_text):
+    if not html_text: return None
+    m=re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I|re.S)
+    if not m: return None
+    t=re.sub(r"\s+"," ", html.unescape(m.group(1))).strip()
+    return t or None
+
+# ---------- Optional KeyBERT ----------
+_keybert = None
+def kb_label(corpus_text):
+    global _keybert
+    if LINK_LABEL_AI != "keybert":
+        return None
     try:
-        api = twitter.Api(
-            consumer_key=ck, consumer_secret=cs,
-            access_token_key=at, access_token_secret=ats,
-            tweet_mode="extended", sleep_on_rate_limit=True
+        if _keybert is None:
+            from keybert import KeyBERT
+            from sentence_transformers import SentenceTransformer
+            # Load the ST model first so HF caches it; then give the model to KeyBERT
+            st_model = SentenceTransformer(LINK_LABEL_MODEL)
+            _keybert = KeyBERT(model=st_model)
+        kws = _keybert.extract_keywords(
+            corpus_text,
+            keyphrase_ngram_range=(KEYBERT_NGRAM_MIN, KEYBERT_NGRAM_MAX),
+            stop_words="english",
+            use_mmr=KEYBERT_USE_MMR,
+            diversity=KEYBERT_DIVERSITY,
+            top_n=KEYBERT_TOPN
         )
-        root = api.GetStatus(status_id=tid_int, include_my_retweet=False)
+        # kws is list of (phrase, score); pick best and compress to 2–3 words
+        if not kws: return None
+        best = sorted(kws, key=lambda x: x[1], reverse=True)[0][0]
+        return compress_to_2_3_words(best)
     except Exception:
         return None
 
-    replies = []
-    links_by_domain = defaultdict(set)
+# ---------- Link index with labeling ----------
+class LinkIndex:
+    def __init__(self):
+        self.data = defaultdict(dict)   # domain -> url -> info
+        self.urls_seen=set()
+        self.all_urls=[]
 
-    # include links from root tweet
-    try:
-        for u in (getattr(root, "urls", None) or []):
-            add_link(links_by_domain, getattr(u, "expanded_url", None) or getattr(u, "url", None))
-    except Exception:
-        pass
+    def _domain_of(self, url):
+        if tldextract:
+            try:
+                ext=tldextract.extract(url)
+                return ".".join([p for p in (ext.domain, ext.suffix) if p]).lower()
+            except Exception:
+                pass
+        m=re.match(r"https?://([^/]+)/?", url or "")
+        return (m.group(1).lower() if m else (url or ""))
 
-    # search replies to root
-    try:
-        rs = api.GetSearch(term=f"to:{screen_name}", since_id=tid_int, count=100, result_type="recent", include_entities=True)
-        for t in rs:
-            if getattr(t, "in_reply_to_status_id", None) == tid_int:
-                txt = getattr(t, "full_text", None) or getattr(t, "text", "") or ""
-                # linkify using entities if possible
-                ent = getattr(t, "urls", None)
-                if ent:
-                    # python-twitter gives a list of objects; map to dicts with .expanded_url / .url.
-                    for u in ent:
-                        add_link(links_by_domain, getattr(u, "expanded_url", None) or getattr(u, "url", None))
-                # fallback plain linkify
-                txt_html = re.sub(r'(https?://\S+)', r'<a href="\1" target="_blank" rel="noopener">\1</a>', esc(txt))
-                u = getattr(t, "user", None)
-                replies.append({
-                    "name": getattr(u, "name", "User") if u else "User",
-                    "handle": getattr(u, "screen_name", None) if u else None,
-                    "avatar": (getattr(u, "profile_image_url_https", "") if u else ""),
-                    "text": txt_html
-                })
-    except Exception:
-        pass
+    def add(self, url, context=None):
+        if not url: return
+        dom=self._domain_of(url)
+        if url not in self.data[dom]:
+            self.data[dom][url]={"url":url, "contexts":set(), "label":None, "domain":dom, "title":None}
+            if url not in self.urls_seen:
+                self.urls_seen.add(url); self.all_urls.append(url)
+        if context:
+            ctx = re.sub(r"\s+"," ", context).strip()
+            if ctx: self.data[dom][url]["contexts"].add(ctx[:240])
 
-    return {"replies": replies, "links": links_by_domain}
+    def finalize_labels(self):
+        # 1) (Optional) fetch titles for a subset
+        fetched=0
+        if FETCH_TITLES and FETCH_TITLES_LIMIT>0:
+            for url in self.all_urls:
+                if fetched>=FETCH_TITLES_LIMIT: break
+                html_text=http_get(url, timeout=FETCH_TIMEOUT_SEC)
+                title=extract_title(html_text)
+                if title:
+                    dom=self._domain_of(url)
+                    self.data[dom][url]["title"]=title
+                    fetched+=1
+        # 2) Resolve label for each URL
+        for dom, bucket in self.data.items():
+            for url, info in bucket.items():
+                label=None
+                # Try KeyBERT on combined signal (title + top context)
+                if LINK_LABEL_AI=="keybert":
+                    corpus = " ".join(
+                        [info.get("title") or ""] + list(info["contexts"])[:1]
+                    ).strip()
+                    if corpus:
+                        label = kb_label(corpus)
+                # Title fallback
+                if not label and info.get("title"):
+                    label = compress_to_2_3_words(info["title"])
+                # Context fallback
+                if not label and info["contexts"]:
+                    label = derive_from_context(next(iter(info["contexts"])))
+                # Slug fallback
+                if not label:
+                    words = slug_to_words(url)
+                    if words: label = compress_to_2_3_words(" ".join(words[:4]))
+                # Domain last
+                if not label: label = label_from_domain(dom)
+                # Normalize strictly to <=3 words
+                label = compress_to_2_3_words(label)
+                info["label"]=label
 
-# ---------- Path B: Web conversation API with cookie/bearer ----------
+    def render_grouped_html(self):
+        out=[]
+        out.append('''<style>
+.ss3k-links h4{font:600 14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:12px 0 6px}
+.ss3k-links ul{margin:0 0 16px; padding-left:18px}
+.ss3k-links li{margin:6px 0}
+.ss3k-linkmeta{color:#64748b; font:12px system-ui; margin-left:6px}
+</style>''')
+        out.append('<div class="ss3k-links">')
+        for dom in sorted(self.data.keys()):
+            out.append(f"<h4>{esc(dom)}</h4>")
+            out.append("<ul>")
+            items=[self.data[dom][u] for u in self.all_urls if u in self.data[dom]]
+            for info in items:
+                url = info["url"]; label=info.get("label") or label_from_domain(dom)
+                out.append(
+                    f'<li><a href="{esc(url)}" target="_blank" rel="noopener">{esc(label)}</a>'
+                    f'<span class="ss3k-linkmeta">— {esc(dom)}</span></li>'
+                )
+            out.append("</ul>")
+        out.append("</div>")
+        return "\n".join(out)
+
+# ---------- Low-level HTTP JSON helpers (X) ----------
 def http_json(url, method="GET", headers=None, data=None, timeout=30):
     import urllib.request
-    req = urllib.request.Request(url=url, method=method)
+    req=urllib.request.Request(url=url, method=method)
     if headers:
-        for k, v in headers.items():
-            req.add_header(k, v)
-    body = data.encode("utf-8") if isinstance(data, str) else data
+        for k,v in headers.items(): req.add_header(k,v)
+    body = data.encode("utf-8") if isinstance(data,str) else data
     try:
         with urllib.request.urlopen(req, data=body, timeout=timeout) as r:
-            txt = r.read().decode("utf-8", "ignore")
+            txt=r.read().decode("utf-8","ignore")
             return json.loads(txt)
     except Exception:
         return None
 
 def get_guest_token(bearer):
     if not bearer: return None
-    headers = {
-        "authorization": bearer,
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0"
-    }
-    d = http_json("https://api.twitter.com/1.1/guest/activate.json", method="POST", headers=headers, data="{}")
+    headers={"authorization":bearer,"content-type":"application/json","user-agent":"Mozilla/5.0"}
+    d=http_json("https://api.twitter.com/1.1/guest/activate.json", method="POST", headers=headers, data="{}")
     return (d or {}).get("guest_token")
 
-def try_web_conversation(tid_str):
+def find_bottom_cursor(obj):
+    if isinstance(obj, dict):
+        if obj.get("cursorType")=="Bottom" and "value" in obj: return obj["value"]
+        for v in obj.values():
+            c=find_bottom_cursor(v)
+            if c: return c
+    elif isinstance(obj, list):
+        for it in obj:
+            c=find_bottom_cursor(it)
+            if c: return c
+    return None
+
+# ---------- Fetch conversation via search/adaptive (cookie/bearer) ----------
+def fetch_conversation_adaptive(root_id_str, screen_name_hint=None, max_pages=60, page_sleep=0.6):
     bearer = (os.environ.get("TWITTER_AUTHORIZATION","") or "").strip()
     at     = (os.environ.get("TWITTER_AUTH_TOKEN","") or "").strip()
     ct0    = (os.environ.get("TWITTER_CSRF_TOKEN","") or "").strip()
+    if not (at and ct0) and not bearer: return None, None
 
-    if not (bearer or (at and ct0)):
-        return None
-
-    headers = {
-        "user-agent": "Mozilla/5.0",
-        "accept": "application/json, text/plain, */*",
+    headers={
+        "user-agent":"Mozilla/5.0",
+        "accept":"application/json, text/plain, */*",
+        "pragma":"no-cache","cache-control":"no-cache",
+        "referer": f"https://x.com/{screen_name_hint}/status/{root_id_str}" if screen_name_hint else "https://x.com/"
     }
-
-    # Prefer cookie+csrf if present (more reliable)
     if at and ct0:
-        headers.update({
-            "authorization": bearer or "Bearer",
-            "x-csrf-token": ct0,
-            "cookie": f"auth_token={at}; ct0={ct0}",
-        })
-    elif bearer:
-        gt = get_guest_token(bearer)
-        if not gt: 
-            return None
-        headers.update({
-            "authorization": bearer,
-            "x-guest-token": gt,
-        })
+        if bearer and not bearer.startswith("Bearer "): bearer=""
+        headers.update({"authorization": bearer or "Bearer","x-csrf-token": ct0,"cookie": f"auth_token={at}; ct0={ct0}"})
+    else:
+        if not bearer: return None, None
+        gt=get_guest_token(bearer)
+        if not gt: return None, None
+        headers.update({"authorization": bearer,"x-guest-token": gt})
 
-    # v2 timeline conversation (legacy JSON shape with globalObjects)
-    url = f"https://api.twitter.com/2/timeline/conversation/{tid_str}.json?tweet_mode=extended&include_ext_alt_text=true"
-    data = http_json(url, headers=headers)
-    if not data:
-        return None
+    base="https://twitter.com/i/api/2/search/adaptive.json"
+    q=f"conversation_id:{root_id_str}"
 
-    tweets = (data.get("globalObjects", {}) or {}).get("tweets", {}) or {}
-    users  = (data.get("globalObjects", {}) or {}).get("users", {}) or {}
-    if not tweets:
-        return None
+    tweets, users, cursor, pages = {}, {}, None, 0
+    while pages < max_pages:
+        params={
+            "q": q, "count": 100, "tweet_search_mode":"live","query_source":"typed_query","tweet_mode":"extended",
+            "pc":"ContextualServices","spelling_corrections":"1",
+            "include_quote_count":"true","include_reply_count":"true",
+            "ext":"mediaStats,highlightedLabel,hashtags,antispam_media_platform,voiceInfo,superFollowMetadata,unmentionInfo,editControl,emoji_reaction"
+        }
+        if cursor: params["cursor"]=cursor
+        url = base + "?" + "&".join(f"{k}={json.dumps(v)[1:-1]}" for k,v in params.items())
+        data=http_json(url, headers=headers)
+        if not data: break
+        g=(data.get("globalObjects") or {})
+        tw=g.get("tweets") or {}
+        us=g.get("users") or {}
+        if tw: tweets.update(tw)
+        if us: users.update(us)
+        nxt=find_bottom_cursor(data.get("timeline") or data)
+        pages+=1
+        if not nxt or nxt==cursor: break
+        cursor=nxt
+        time.sleep(page_sleep)
+    return tweets or None, users or None
 
-    replies = []
-    links_by_domain = defaultdict(set)
+# ---------- Build threaded tree ----------
+def build_thread_tree(root_id, tweets):
+    children=defaultdict(list)
+    meta={}
+    for tid, t in (tweets or {}).items():
+        if str(t.get("conversation_id_str") or t.get("conversation_id") or "") != str(root_id): continue
+        parent=t.get("in_reply_to_status_id_str")
+        if not parent: continue
+        created=parse_created_at(t.get("created_at",""))
+        meta[tid]={"created_ts":created}
+        children[str(parent)].append(tid)
+    for pid in list(children.keys()):
+        children[pid].sort(key=lambda x: meta.get(x,{}).get("created_ts",0.0))
+    roots = children.get(str(root_id), [])
+    # Sort top-level by time too (already sorted in loop above)
+    return roots, children, meta
 
-    # collect replies to root
-    for tw in tweets.values():
-        if tw.get("in_reply_to_status_id_str") == tid_str:
-            uid = tw.get("user_id_str")
-            u = users.get(uid, {}) if uid else {}
-            name   = u.get("name") or "User"
-            handle = u.get("screen_name")
-            avatar = u.get("profile_image_url_https") or u.get("profile_image_url") or ""
-            text   = tw.get("full_text") or tw.get("text") or ""
+# ---------- Text/link helpers ----------
+def expand_text_with_entities(text, entities):
+    text = text or ""
+    esc_text = esc(text)
+    if entities:
+        urls = entities.get("urls") or []
+        urls_sorted = sorted(urls, key=lambda u: len(u.get("url","")), reverse=True)
+        for u in urls_sorted:
+            short = u.get("url") or ""
+            expanded = u.get("expanded_url") or u.get("unwound_url") or short
+            if not short: continue
+            esc_text = esc_text.replace(esc(short), f'<a href="{esc(expanded)}" target="_blank" rel="noopener">{esc(expanded)}</a>')
+    esc_text = re.sub(r'(https?://\S+)', r'<a href="\1" target="_blank" rel="noopener">\1</a>', esc_text)
+    return esc_text
 
-            ent = tw.get("entities") or {}
-            txt_html = expand_text_with_entities(text, ent)
+def extract_urls_from_text(text): return re.findall(r'(https?://\S+)', text or "")
 
-            # stash link targets
-            for uu in (ent.get("urls") or []):
-                add_link(links_by_domain, uu.get("expanded_url") or uu.get("unwound_url") or uu.get("url"))
+# ---------- Rendering ----------
+CSS = '''
+<style>
+.ss3k-threads{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+.ss3k-controls{margin:8px 0 12px}
+.ss3k-controls button{font:12px system-ui;padding:6px 10px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}
+.ss3k-reply{display:flex;gap:10px;padding:10px;border:1px solid #e5e7eb;border-radius:12px;margin:8px 0;background:#fff}
+.ss3k-ravatar{width:32px;height:32px;border-radius:50%;background:#e5e7eb;flex:0 0 32px}
+.ss3k-rcontent{flex:1 1 auto}
+.ss3k-rmeta{font-size:12px;color:#64748b;margin-bottom:4px}
+.ss3k-rmeta a{color:#334155;text-decoration:none}
+.ss3k-rname{font-weight:600;color:#0f172a}
+.ss3k-rtext{white-space:pre-wrap;word-break:break-word;margin-top:4px}
+.ss3k-children{margin-left:42px;border-left:2px solid #e5e7eb;padding-left:10px}
+.ss3k-toggle{font:12px system-ui;color:#0ea5e9;cursor:pointer;margin:4px 0 0 42px}
+.ss3k-hidden{display:none}
+</style>
+'''.strip()
 
-            replies.append({
-                "name": name,
-                "handle": handle,
-                "avatar": avatar,
-                "text": txt_html
-            })
+JS = r'''
+<script>
+(function(){
+  function toggle(el, show){
+    if(show===true){ el.classList.remove('ss3k-hidden'); }
+    else if(show===false){ el.classList.add('ss3k-hidden'); }
+    else { el.classList.toggle('ss3k-hidden'); }
+  }
+  function expandAll(root){ root.querySelectorAll('.ss3k-children').forEach(c=>c.classList.remove('ss3k-hidden')); }
+  function collapseAll(root){ root.querySelectorAll('.ss3k-children').forEach(c=>c.classList.add('ss3k-hidden')); }
+  function bind(){
+    var root=document.querySelector('.ss3k-threads'); if(!root) return;
+    root.querySelectorAll('[data-toggle-for]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        var id=btn.getAttribute('data-toggle-for');
+        var box=document.getElementById(id); if(!box) return;
+        toggle(box);
+        var collapsed=box.classList.contains('ss3k-hidden');
+        btn.textContent = collapsed ? btn.getAttribute('data-collapsed-label') : btn.getAttribute('data-expanded-label');
+      });
+    });
+    var exp=root.querySelector('[data-ss3k-expand-all]');
+    var col=root.querySelector('[data-ss3k-collapse-all]');
+    if(exp) exp.addEventListener('click', ()=>expandAll(root));
+    if(col) col.addEventListener('click', ()=>collapseAll(root));
+  }
+  if(document.readyState!=='loading') bind(); else document.addEventListener('DOMContentLoaded', bind);
+})();
+</script>
+'''.strip()
 
-    # include root tweet links
-    root = tweets.get(tid_str)
-    if root:
-        ent = root.get("entities") or {}
-        for uu in (ent.get("urls") or []):
-            add_link(links_by_domain, uu.get("expanded_url") or uu.get("unwound_url") or uu.get("url"))
+def render_node_html(tid, tweets, users, children_map, linkdex, collapsed_by_default=True):
+    t = tweets.get(tid) or {}
+    uid = str(t.get("user_id_str") or t.get("user_id") or "")
+    u   = (users or {}).get(uid, {}) if uid else {}
+    name   = u.get("name") or "User"
+    handle = u.get("screen_name") or ""
+    avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
+    created = parse_created_at(t.get("created_at",""))
+    time_str = fmt_utc(created)
 
-    return {"replies": replies, "links": links_by_domain}
+    text_raw = t.get("full_text") or t.get("text") or ""
+    ent = t.get("entities") or {}
+    text_html = expand_text_with_entities(text_raw, ent)
 
+    # index links
+    seen=set()
+    for uu in (ent.get("urls") or []):
+        expanded = uu.get("expanded_url") or uu.get("unwound_url") or uu.get("url")
+        if expanded and expanded not in seen:
+            seen.add(expanded); linkdex.add(expanded, context=text_raw)
+    for raw in extract_urls_from_text(text_raw):
+        if raw not in seen:
+            seen.add(raw); linkdex.add(raw, context=text_raw)
+
+    tweet_id = t.get("id_str") or str(t.get("id") or tid)
+    profile_url = f"https://x.com/{handle}" if handle else None
+    tweet_url   = f"https://x.com/{handle}/status/{tweet_id}" if handle else f"https://x.com/i/status/{tweet_id}"
+
+    kids = children_map.get(str(tweet_id), [])
+    has_kids = len(kids) > 0
+    box_id = f"ss3k-children-{tweet_id}"
+
+    parts=[]
+    parts.append('<div class="ss3k-reply">')
+    if profile_url:
+        parts.append(f'  <a href="{esc(profile_url)}" target="_blank" rel="noopener"><img class="ss3k-ravatar" src="{esc(avatar)}" alt=""></a>')
+    else:
+        parts.append(f'  <img class="ss3k-ravatar" src="{esc(avatar)}" alt="">')
+    parts.append('  <div class="ss3k-rcontent">')
+    meta=[]
+    if profile_url:
+        meta.append(f'<span class="ss3k-rname"><a href="{esc(profile_url)}" target="_blank" rel="noopener">{esc(name)}</a></span>')
+    else:
+        meta.append(f'<span class="ss3k-rname">{esc(name)}</span>')
+    if handle: meta.append(f' <span>@{esc(handle)}</span>')
+    if tweet_url: meta.append(f' · <a href="{esc(tweet_url)}" target="_blank" rel="noopener">{esc(time_str)}</a>')
+    parts.append(f'    <div class="ss3k-rmeta">{"".join(meta)}</div>')
+    parts.append(f'    <div class="ss3k-rtext">{text_html}</div>')
+    parts.append('  </div>')
+    parts.append('</div>')
+
+    if has_kids:
+        collapsed = " ss3k-hidden" if collapsed_by_default else ""
+        collapsed_label = f"Show {len(kids)} repl{'y' if len(kids)==1 else 'ies'}"
+        expanded_label  = f"Hide repl{'y' if len(kids)==1 else 'ies'}"
+        parts.append(
+            f'<div class="ss3k-toggle" role="button" tabindex="0" '
+            f'data-toggle-for="{box_id}" data-collapsed-label="{esc(collapsed_label)}" '
+            f'data-expanded-label="{esc(expanded_label)}">{esc(collapsed_label) if collapsed_by_default else esc(expanded_label)}</div>'
+        )
+        parts.append(f'<div class="ss3k-children{collapsed}" id="{box_id}">')
+        for child_id in kids:
+            parts.append(render_node_html(child_id, tweets, users, children_map, linkdex, collapsed_by_default=True))
+        parts.append('</div>')
+
+    return "\n".join(parts)
+
+def render_thread_html(roots, tweets, users, children_map, linkdex):
+    out=[CSS, '<div class="ss3k-threads">']
+    out.append('<div class="ss3k-controls"><button type="button" data-ss3k-expand-all>Expand all</button> '
+               '<button type="button" data-ss3k-collapse-all>Collapse all</button></div>')
+    for rid in roots:
+        out.append(render_node_html(rid, tweets, users, children_map, linkdex, collapsed_by_default=True))
+    out.append('</div>')
+    out.append(JS)
+    return "\n".join(out)
+
+# ---------- main ----------
 def main():
-    if not PURPLE:
-        write_empty(); return
+    if not PURPLE: write_empty(); return
+    m=re.search(r"/([^/]+)/status/(\d+)", PURPLE)
+    if not m: write_empty(); return
+    screen_name=m.group(1)
+    tid_str    =m.group(2)
 
-    m = re.search(r"/([^/]+)/status/(\d+)", PURPLE)
-    if not m:
-        write_empty(); return
+    tweets, users = fetch_conversation_adaptive(tid_str, screen_name_hint=screen_name)
+    if not tweets: write_empty(); return
 
-    screen_name = m.group(1)
-    tid_str     = m.group(2)
-    tid_int     = int(tid_str)
+    roots, children_map, _meta = build_thread_tree(tid_str, tweets)
 
-    # Try v1 first, fallback to web timeline
-    payload = try_v1(screen_name, tid_int)
-    if payload is None:
-        payload = try_web_conversation(tid_str)
+    # Build link index from ALL tweets (root + replies + nested)
+    linkdex=LinkIndex()
+    for t in (tweets or {}).values():
+        text_raw=(t.get("full_text") or t.get("text") or "")
+        ent=(t.get("entities") or {})
+        seen=set()
+        for uu in (ent.get("urls") or []):
+            expanded=uu.get("expanded_url") or uu.get("unwound_url") or uu.get("url")
+            if expanded and expanded not in seen:
+                seen.add(expanded); linkdex.add(expanded, context=text_raw)
+        for raw in extract_urls_from_text(text_raw):
+            if raw not in seen:
+                seen.add(raw); linkdex.add(raw, context=text_raw)
 
-    if payload is None:
-        # no creds / no data
-        write_empty()
-        return
+    linkdex.finalize_labels()
 
-    replies = payload.get("replies") or []
-    links_by_domain = payload.get("links") or defaultdict(set)
+    html_out  = render_thread_html(roots, tweets, users or {}, children_map, linkdex)
+    links_out = linkdex.render_grouped_html()
 
-    open(REPLIES_OUT, "w", encoding="utf-8").write(render_replies(replies))
-    open(LINKS_OUT, "w", encoding="utf-8").write(render_links(links_by_domain))
+    open(REPLIES_OUT,"w",encoding="utf-8").write(html_out)
+    open(LINKS_OUT,"w",encoding="utf-8").write(links_out)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
