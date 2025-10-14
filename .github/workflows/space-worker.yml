@@ -27,13 +27,13 @@ on:
         description: Make uploaded artifacts public
         required: false
         type: choice
-        options: ["true", "false"]
+        options: ["true","false"]
         default: "true"
       do_transcript:
         description: Generate transcript with Deepgram if crawler captions unavailable
         required: false
         type: choice
-        options: ["true", "false"]
+        options: ["true","false"]
         default: "true"
       mode:
         description: Limit processing to a specific area ('' = full)
@@ -108,6 +108,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
+          # yt-dlp (fallback) + replies dependencies
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
           # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
@@ -203,12 +204,14 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
+          # Most-recent audio file
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
+          # Capture a compact JSON line from logs for metadata parsing
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -218,6 +221,7 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
+          # Captions JSONL from crawler
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
@@ -234,14 +238,17 @@ jobs:
 
           if [ -s "$J" ]; then
             TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
+            # Prefer explicit started_at (ms epoch) or startedAt (ISO)
             START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J")"
           fi
 
+          # Title fallback chain: Space title -> manual input -> BASE
           [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
           [ -z "$TTL" ] && TTL="${BASE}"
           echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
           echo "TTL_FINAL=${TTL}"   >> "$GITHUB_ENV"
 
+          # Convert start time to UTC ISO (Z). If ms epoch, divide; if ISO, parse; else fallback to now.
           DATE_GMT=""
           if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
             if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
@@ -257,14 +264,19 @@ jobs:
       - name: Build VTT & syncable grouped transcript (from crawler JSONL)
         if: ${{ github.event.inputs.mode != 'attendees_only' }}
         shell: bash
+        env:
+          ARTDIR: ${{ env.ARTDIR }}
+          BASE: ${{ env.BASE }}
+          CC_JSONL: ${{ env.CRAWLER_CC }}
         run: |
           set -euxo pipefail
-          CC_JSONL="${CRAWLER_CC:-}"
-          if [ -z "${CC_JSONL}" ]; then
+          if [ -z "${CC_JSONL:-}" ]; then
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+            [ -n "${CC_JSONL:-}" ] && echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV" || true
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            ARTDIR="${ARTDIR}" BASE="${BASE}" CC_JSONL="${CC_JSONL}" python3 scripts/gen_vtt.py
+            ARTDIR="${ARTDIR}" BASE="${BASE}" CC_JSONL="${CC_JSONL}" \
+              python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
             if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
@@ -307,6 +319,22 @@ jobs:
           curl -L "${{ github.event.inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
           echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
+      - name: Detect arnndn support & fetch RNNoise model (optional)
+        if: ${{ github.event.inputs.mode != 'attendees_only' && env.INPUT_FILE != '' }}
+        id: rnnoise
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ffmpeg -hide_banner -filters | grep -q ' arnndn '; then
+            # Small, general-purpose RNNoise model
+            curl -Ls "https://raw.githubusercontent.com/GregorR/rnnoise-models/master/conjoined-burgers-2018-08-28/cb.rnnn" \
+              -o "${WORKDIR}/rnnoise.rnnn" || true
+            if [ -s "${WORKDIR}/rnnoise.rnnn" ]; then
+              echo "USE_ARNNDN=1" >> "$GITHUB_ENV"
+              echo "RNNOISE_MODEL=${WORKDIR}/rnnoise.rnnn" >> "$GITHUB_ENV"
+            fi
+          fi
+
       - name: Trim head and tail silence
         if: ${{ github.event.inputs.mode != 'attendees_only' && env.INPUT_FILE != '' }}
         shell: bash
@@ -323,10 +351,18 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          PRE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=12,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
+          # Build adaptive pre-chain: HPF/LPF -> (optional RNNoise) -> spectral denoise -> de-ess -> light compress -> adaptive norm
+          PRE="highpass=f=80,lowpass=f=12000"
+          if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
+            PRE="${PRE},arnndn=m=${RNNOISE_MODEL}:n=1"
+          fi
+          PRE="${PRE},afftdn=nr=12:nf=-28,deesser=i=12,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
+
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
+          # Analysis pass to get measured params (reduces pumping/clipping)
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
+
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
             I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
             TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
@@ -427,7 +463,7 @@ jobs:
 
           if [ -s "$OUT_JSON" ]; then
             jq -r '
-              def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def li: "  <li><a href=\"" + (.url//"#") + "\" target=\"_blank\" rel=\"noopener\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
                 if (items|length) > 0
                 then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
@@ -447,9 +483,17 @@ jobs:
       - name: Scrape Space tweet replies (one-shot, optional)
         if: ${{ env.TW_API_CONSUMER_KEY != '' && env.TW_API_CONSUMER_SECRET != '' && env.TW_API_ACCESS_TOKEN != '' && env.TW_API_ACCESS_TOKEN_SECRET != '' }}
         shell: bash
+        env:
+          ARTDIR: ${{ env.ARTDIR }}
+          BASE: ${{ env.BASE }}
+          SPACE_ID: ${{ env.SPACE_ID }}
+          TW_API_CONSUMER_KEY: ${{ env.TW_API_CONSUMER_KEY }}
+          TW_API_CONSUMER_SECRET: ${{ env.TW_API_CONSUMER_SECRET }}
+          TW_API_ACCESS_TOKEN: ${{ env.TW_API_ACCESS_TOKEN }}
+          TW_API_ACCESS_TOKEN_SECRET: ${{ env.TW_API_ACCESS_TOKEN_SECRET }}
         run: |
           set -euxo pipefail
-          python3 scripts/replies.py
+          python3 ".github/workflows/scripts/gen_replies.py" || true
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
 
@@ -462,9 +506,11 @@ jobs:
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
+          # Title = Space title; fallback already computed
           TTL="${TTL_FINAL:-${{ github.event.inputs.title }}}"
           [ -z "$TTL" ] && TTL="${BASE}"
 
+          # Rawfiles (avoid argv length limits)
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
 
@@ -585,4 +631,5 @@ jobs:
             fi
             echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
             echo "- Mode      ${{ github.event.inputs.mode }}"
+            echo "- Audio chain: HPF/LPF $( [ "${USE_ARNNDN:-0}" = "1" ] && echo "+ RNNoise" || echo "(no arnndn)" ), afftdn, deesser, comp, dynaudnorm, 2-pass loudnorm"
           } >> "$GITHUB_STEP_SUMMARY"
