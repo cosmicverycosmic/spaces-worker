@@ -9,12 +9,17 @@ on:
         type: string
         default: ""
       post_id:
-        description: Existing WordPress post ID (optional)
+        description: Existing WordPress post ID optional
+        required: false
+        type: string
+        default: ""
+      title:
+        description: Fallback post title optional
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default spaces/YYYY/MM)
+        description: GCS prefix default spaces YYYY MM
         required: false
         type: string
         default: ""
@@ -37,27 +42,27 @@ on:
         options: ["","transcript_only","attendees_only","replies_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only, provide URL to existing MP3
+        description: For transcript only provide URL to existing MP3
         required: false
         type: string
         default: ""
-      purple_tweet_url:
-        description: Purple pill tweet URL (optional)
-        required: false
-        type: string
-        default: ""
-      audio_profile:
-        description: Audio profile for encode
-        required: false
-        type: choice
-        options: ["transparent","radio","aggressive"]
-        default: "transparent"
       aggressive_denoise:
-        description: Use RNNoise arnndn denoiser (with aggressive profile)
+        description: Use RNNoise arnndn denoiser
         required: false
         type: choice
         options: ["false","true"]
         default: "false"
+      purple_tweet_url:
+        description: Purple pill tweet URL optional
+        required: false
+        type: string
+        default: ""
+      audio_profile:
+        description: Audio profile for encode (default 'radio')
+        required: false
+        type: choice
+        options: ["transparent","radio","aggressive"]
+        default: "radio"  # default to radio for clean, even loudness
 
 permissions:
   contents: read
@@ -206,6 +211,7 @@ jobs:
             --id "${SID}" --force > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
           RC=$?
           set -e
+          echo "crawler_exit=${RC}"
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
@@ -224,7 +230,7 @@ jobs:
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
-      - name: Fallback download via yt-dlp
+      - name: Fallback download via yt dlp
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
@@ -258,15 +264,16 @@ jobs:
           echo "TRIM_LEAD=${LEAD}" >> "$GITHUB_ENV"
           echo "lead=${LEAD}"       >> "$GITHUB_OUTPUT"
 
-      - name: Trim head and tail
+      - name: Trim head and tail (RF64-safe)
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
           TRIM_WAV="${WORKDIR}/trim_${{ github.run_id }}.wav"
+          # RF64 prevents >4GB WAV header corruption on long Spaces
           ffmpeg -hide_banner -y -i "$INPUT_FILE" \
             -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
-            -c:a pcm_s16le "$TRIM_WAV"
+            -rf64 always -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
       - name: Probe audio format
@@ -285,7 +292,7 @@ jobs:
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
         shell: bash
         env:
-          PROF: ${{ github.event.inputs.audio_profile }}
+          PROF: ${{ github.event.inputs.audio_profile != '' && github.event.inputs.audio_profile || 'radio' }}
         run: |
           set -euxo pipefail
           OUT="${ARTDIR}/${BASE}.mp3"
@@ -293,27 +300,32 @@ jobs:
           SR="${SRC_SR:-48000}"
 
           if [ "${PROF}" = "transparent" ]; then
+            # Keep original character; no denoise/EQ/comp; high-quality VBR.
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -map a:0 -c:a libmp3lame -q:a 0 -ar "$SR" -ac "$CH" "$OUT"
 
           elif [ "${PROF}" = "radio" ]; then
+            # Clean, even loudness without hollowness.
             PRE="highpass=f=60,lowpass=f=14000,afftdn=nr=4:nf=-28,deesser=i=0.12,acompressor=threshold=-18dB:ratio=2:attack=12:release=220:makeup=2"
             PASS1_JSON="${WORKDIR}/loudnorm1.json"
+            # Pass 1 measure (EBU R128)
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
             awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
             if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
-              TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
-              LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
-              TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+              I=$(jq -r '.input_i     // "-16"'  "$PASS1_JSON")
+              TP=$(jq -r '.input_tp    // "-1.5"' "$PASS1_JSON")
+              LRA=$(jq -r '.input_lra  // "11"'   "$PASS1_JSON")
+              TH=$(jq -r '.input_thresh// "-26"'  "$PASS1_JSON")
               ffmpeg -hide_banner -y -i "$AUDIO_IN" \
                 -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
                 -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
             else
-              ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
+              ffmpeg -hide_banner -y -i "$AUDIO_IN" \
+                -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11" \
                 -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
             fi
 
           else
+            # aggressive (optional heavy denoise + stronger comp, still two-pass loudnorm)
             PRE="highpass=f=70,lowpass=f=11500,afftdn=nr=8:nf=-25,deesser=i=0.2,acompressor=threshold=-18dB:ratio=2.8:attack=8:release=200:makeup=3"
             if [ "${{ github.event.inputs.aggressive_denoise }}" = "true" ]; then
               M="${WORKDIR}/rnnoise.rnnn"
@@ -324,10 +336,10 @@ jobs:
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
             awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
             if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
-              TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
-              LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
-              TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+              I=$(jq -r '.input_i     // "-16"'  "$PASS1_JSON")
+              TP=$(jq -r '.input_tp    // "-1.5"' "$PASS1_JSON")
+              LRA=$(jq -r '.input_lra  // "11"'   "$PASS1_JSON")
+              TH=$(jq -r '.input_thresh// "-26"'  "$PASS1_JSON")
               ffmpeg -hide_banner -y -i "$AUDIO_IN" \
                 -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
                 -c:a libmp3lame -q:a 2 -ar "$SR" -ac "$CH" "$OUT"
@@ -363,7 +375,7 @@ jobs:
           set -euo pipefail
           mkdir -p ".github/workflows/scripts"
 
-          # ---- Improved gen_vtt.py (keeps VTT valid; safe timing; grouped transcript HTML) ----
+          # ---------- gen_vtt.py (timing-safe, autoscroll transcript) ----------
           cat > ".github/workflows/scripts/gen_vtt.py" << 'PY'
           #!/usr/bin/env python3
           import json, os, re, html, sys
@@ -372,167 +384,201 @@ jobs:
           artdir = os.environ.get("ARTDIR") or ""
           base   = os.environ.get("BASE") or ""
           src    = os.environ.get("CC_JSONL") or ""
+          shift  = float(os.environ.get("SHIFT_SECS") or "0")
 
           if not (artdir and base and src and os.path.isfile(src)):
-              sys.exit(0)  # nothing to do
+              os.makedirs(artdir, exist_ok=True)
+              open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\\n\\n")
+              open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
+              sys.exit(0)
 
           def parse_time_iso(s):
               if not s: return None
-              s = s.strip()
+              s=s.strip()
               try:
-                  if s.endswith('Z'): s = s[:-1] + '+00:00'
-                  if re.search(r'[+-]\d{4}$', s):
-                      s = s[:-5] + s[-5:-2] + ':' + s[-2:]
-                  dt = datetime.fromisoformat(s)
-                  if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                  if s.endswith('Z'): s=s[:-1]+'+00:00'
+                  if re.search(r'[+-]\\d{4}$', s):
+                      s=s[:-5]+s[-5:-2]+':'+s[-2:]
+                  dt=datetime.fromisoformat(s)
+                  if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
                   return dt.timestamp()
-              except Exception:
-                  return None
+              except: return None
+
+          def to_float(x):
+              try:
+                  if x is None: return None
+                  f=float(x)
+                  return f/1000.0 if f>86400 else f
+              except: return None
 
           def fmt_ts(t):
-              if t < 0: t = 0.0
-              h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+              if t<0: t=0.0
+              h=int(t//3600); m=int((t%3600)//60); s=t%60
               return f"{h:02d}:{m:02d}:{s:06.3f}"
 
           def clean_name(s):
-              s = (s or "").strip()
-              s = re.sub(r'[<>&]', '', s)
-              s = ''.join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
+              s=(s or "").strip()
+              s=re.sub(r'[<>&]','',s)
+              s=''.join(ch for ch in s if (ord(ch)<0x1F000 and not (0xD800<=ord(ch)<=0xDFFF)))
               return s or "Speaker"
 
-          def esc(s: str) -> str:
-              return html.escape(s or "", quote=False)
+          def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-          def collapse_ws(s: str) -> str:
-              return re.sub(r'\s+', ' ', (s or '').strip())
+          def norm_text(s):
+              if not s: return ""
+              s=s.replace("\\u2028"," ").replace("\\u2029"," ")
+              s=re.sub(r'\\s+',' ',s).strip()
+              if s.lower() in {"n","uh","um"}: return ""
+              return s
 
-          utt = []
-          with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+          def first(*vals):
+              for v in vals:
+                  if v not in (None,""): return v
+              return None
+
+          raw_utts=[]
+          with open(src,'r',encoding='utf-8',errors='ignore') as f:
               for line in f:
-                  line = line.strip()
+                  line=line.strip()
                   if not line: continue
-                  try:
-                      outer = json.loads(line)
-                  except Exception:
-                      continue
-                  payload_raw = outer.get("payload") or ""
-                  try:
-                      payload = json.loads(payload_raw)
-                  except Exception:
-                      continue
-                  body_raw = payload.get("body") or ""
-                  try:
-                      inner = json.loads(body_raw)
-                  except Exception:
-                      continue
+                  try: obj=json.loads(line)
+                  except: obj=None
 
-                  if inner.get("type") != 45:
-                      continue
-                  text = collapse_ws(inner.get("body") or "")
-                  if not text: continue
-                  if "final" in inner and not inner.get("final"):
-                      continue
-
-                  name     = inner.get("displayName") \
-                             or payload.get("sender", {}).get("display_name") \
-                             or inner.get("username") \
-                             or inner.get("user_id") \
-                             or "Speaker"
-                  username = inner.get("username") \
-                             or payload.get("sender", {}).get("screen_name") \
-                             or ""
-                  avatar   = payload.get("sender", {}).get("profile_image_url_https") \
-                             or payload.get("sender", {}).get("profile_image_url") \
-                             or ""
-
-                  ts = parse_time_iso(inner.get("programDateTime"))
-                  if ts is None:
-                      ts_raw = inner.get("timestamp")
+                  layer=None; sender={}
+                  if isinstance(obj,dict) and isinstance(obj.get("payload"),str):
                       try:
-                          ts = float(ts_raw) / 1000.0
-                      except Exception:
-                          ts = None
-                  if ts is None:
-                      continue
+                          pl=json.loads(obj["payload"])
+                          if isinstance(pl,dict) and isinstance(pl.get("body"),str):
+                              try:
+                                  layer=json.loads(pl["body"])
+                                  sender=pl.get("sender") or {}
+                              except: layer=None
+                      except: pass
+                  else:
+                      layer=obj
 
-                  utt.append({
-                      "ts": ts,
-                      "name": clean_name(name),
-                      "username": (username or "").strip(),
-                      "avatar": avatar,
-                      "text": text
-                  })
+                  def push(ts_abs, txt, disp, uname, avatar, te_abs=None):
+                      if ts_abs is None or not txt: return
+                      t2=norm_text(txt); if not t2: return
+                      raw_utts.append({
+                          "ts": float(ts_abs),
+                          "text": t2,
+                          "name": clean_name(disp or uname or "Speaker"),
+                          "username": (uname or "").lstrip("@"),
+                          "avatar": avatar or "",
+                          "end_ts": float(te_abs) if te_abs is not None else None
+                      })
 
-          utt.sort(key=lambda x: x["ts"])
-          if not utt:
+                  if isinstance(layer,dict) and layer:
+                      ttype=layer.get("type")
+                      txt  = first(layer.get("body"),layer.get("text"),layer.get("caption"))
+                      disp = first(layer.get("displayName"), (sender or {}).get("display_name"), layer.get("speaker_name"), layer.get("speakerName"))
+                      uname= first(layer.get("username"), (sender or {}).get("screen_name"), layer.get("user_id"))
+                      avat = first((sender or {}).get("profile_image_url_https"), (sender or {}).get("profile_image_url"))
+
+                      ts_abs = first(
+                          to_float(layer.get("timestamp")),
+                          parse_time_iso(layer.get("programDateTime")),
+                          to_float(layer.get("start")), to_float(layer.get("startSec")), to_float(layer.get("startMs")), to_float(layer.get("ts")), to_float(layer.get("offset"))
+                      )
+                      te_abs = first(to_float(layer.get("end")), to_float(layer.get("endSec")), to_float(layer.get("endMs")))
+
+                      if txt and (ttype is None or ttype==45 or any(k in layer for k in ("start","startMs","timestamp","programDateTime"))):
+                          if ts_abs is not None:
+                              push(ts_abs, txt, disp, uname, avat, te_abs)
+                          continue
+
+                  if isinstance(obj,dict):
+                      txt = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"))
+                      ts_abs = first(
+                          to_float(obj.get("timestamp")),
+                          parse_time_iso(obj.get("programDateTime")),
+                          to_float(obj.get("start")), to_float(obj.get("startMs")), to_float(obj.get("ts"))
+                      )
+                      disp = first(obj.get("displayName"), obj.get("speaker"), obj.get("user"), obj.get("name"))
+                      uname= first(obj.get("username"), obj.get("handle"), obj.get("screen_name"))
+                      avat = first(obj.get("profile_image_url_https"), obj.get("profile_image_url"))
+                      if txt and ts_abs is not None:
+                          push(ts_abs, txt, disp, uname, avat)
+
+          if not raw_utts:
+              os.makedirs(artdir, exist_ok=True)
+              open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\\n\\n")
+              open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
               sys.exit(0)
 
-          t0_abs = utt[0]["ts"]
-          for i, u in enumerate(utt):
-              u["start_rel"] = max(0.0, u["ts"] - t0_abs)
-              if i + 1 < len(utt):
-                  nxt = max(0.0, utt[i + 1]["ts"] - t0_abs)
-                  u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.10)
-              else:
-                  words = max(1, len(u["text"].split()))
-                  u["end_rel"] = u["start_rel"] + min(6.0, max(1.2, 0.35 * words + 0.8))
+          raw_utts.sort(key=lambda x: x["ts"])
+          EPS=0.0005; last=-1e9
+          for u in raw_utts:
+              if u["ts"]<=last: u["ts"]=last+EPS
+              last=u["ts"]
 
-          groups = []
-          GAP_MAX = 3.0
-          cur = None
-          for u in utt:
-              if (cur is not None and
-                  u["name"] == cur["name"] and
-                  u["username"] == cur["username"] and
-                  (u["start_rel"] - cur["end_rel"]) <= GAP_MAX):
-                  sep = "" if cur["text"].endswith(('.', '!', '?')) else " "
-                  cur["text"] = collapse_ws(cur["text"] + sep + u["text"])
-                  cur["end_rel"] = max(cur["end_rel"], u["end_rel"])
+          t0=raw_utts[0]["ts"]
+
+          utts=[]
+          for u in raw_utts:
+              st=(u["ts"]-t0)-shift
+              if st<0: st=0.0
+              utts.append({
+                  "start_rel": st,
+                  "end_rel": None,
+                  "text": u["text"],
+                  "name": u["name"],
+                  "username": u["username"],
+                  "avatar": u["avatar"],
+              })
+
+          MIN_DUR=0.80; MAX_DUR=10.0; GUARD=0.020
+          for i,u in enumerate(utts):
+              if i+1<len(utts):
+                  nxt=utts[i+1]["start_rel"]
+                  dur=max(MIN_DUR, min(MAX_DUR, (nxt-u["start_rel"])-GUARD))
+                  if dur<=0: dur=MIN_DUR
+                  u["end_rel"]=u["start_rel"]+dur
               else:
-                  cur = {
-                      "name": u["name"],
-                      "username": u["username"],
-                      "avatar": u["avatar"],
-                      "start_rel": u["start_rel"],
-                      "end_rel": u["end_rel"],
-                      "text": u["text"],
-                  }
+                  words=max(1, len(u["text"].split()))
+                  dur=max(MIN_DUR, min(MAX_DUR, 0.33*words+0.7))
+                  u["end_rel"]=u["start_rel"]+dur
+
+          MERGE_GAP=3.0
+          groups=[]; cur=None
+          for u in utts:
+              if (cur is not None and u["name"]==cur["name"] and u["username"]==cur["username"] and (u["start_rel"]-cur["end_rel"])<=MERGE_GAP):
+                  sep="" if re.search(r'[.!?]"?$', cur["text"]) else " "
+                  cur["text"]=(cur["text"]+sep+u["text"]).strip()
+                  cur["end_rel"]=max(cur["end_rel"], u["end_rel"])
+              else:
+                  cur={"name":u["name"],"username":u["username"],"avatar":u["avatar"],
+                       "start_rel":u["start_rel"],"end_rel":u["end_rel"],"text":u["text"]}
                   groups.append(cur)
 
-          GUARD = 0.02
-          MIN_DUR = 0.50
-          for i, g in enumerate(groups):
-              if i > 0:
-                  prev = groups[i-1]
-                  if g["start_rel"] < prev["end_rel"] + GUARD:
-                      g["start_rel"] = prev["end_rel"] + GUARD
-              if g["end_rel"] <= g["start_rel"] + MIN_DUR:
-                  g["end_rel"] = g["start_rel"] + MIN_DUR
+          prev=0.0
+          for g in groups:
+              if g["start_rel"]<prev+GUARD: g["start_rel"]=prev+GUARD
+              if g["end_rel"]<g["start_rel"]+MIN_DUR: g["end_rel"]=g["start_rel"]+MIN_DUR
+              prev=g["end_rel"]
 
           os.makedirs(artdir, exist_ok=True)
-          vtt_path = os.path.join(artdir, f"{base}.vtt")
-          with open(vtt_path, "w", encoding="utf-8") as vf:
-              vf.write("WEBVTT\n\n")
-              for g in groups:
-                  vf.write(f"{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
-                  label = g["name"]
-                  if label:
-                      vf.write(f"<v {esc(label)}>{' ' + esc(g['text'])}\n\n")
-                  else:
-                      vf.write(esc(g['text']) + "\n\n")
+          vtt_path=os.path.join(artdir,f"{base}.vtt")
+          with open(vtt_path,"w",encoding="utf-8") as vf:
+              vf.write("WEBVTT\\n\\n")
+              for i,g in enumerate(groups,1):
+                  vf.write(f"{i}\\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\\n")
+                  vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\\n\\n")
 
-          css = '''
+          css='''
           <style>
-          .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+          .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+            max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px 6px;}
           .ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
           .ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
-          .ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e2e8f0}
+          .ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e5e7eb}
           .ss3k-meta{font-size:12px;color:#64748b;margin-bottom:2px}
           .ss3k-name a{color:#0f172a;text-decoration:none}
           .ss3k-text{white-space:pre-wrap;word-break:break-word;cursor:pointer}
           </style>
           '''
-          js = '''
+          js='''
           <script>
           (function(){
             function time(s){return parseFloat(s||'0')||0}
@@ -540,44 +586,56 @@ jobs:
             function bind(){
               var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
               var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
-              var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg'));
+              var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg')); var lastId="";
               function tick(){
                 var t=audio.currentTime||0, found=null;
                 for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
                 segs.forEach(function(s){ s.classList.toggle('active', s===found); });
+                if(found){
+                  var id=found.id||"";
+                  if(id!==lastId){
+                    // Scroll so active segment is pinned to the top of the transcript pane, not page
+                    var top = found.offsetTop - cont.offsetTop;
+                    if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
+                    lastId=id;
+                  }
+                }
               }
               audio.addEventListener('timeupdate', tick);
+              audio.addEventListener('seeked', tick);
               segs.forEach(function(s){
-                s.addEventListener('click', function(){ if(audio){ audio.currentTime=time(s.dataset.start)+0.05; audio.play().catch(function(){}); }});
+                s.addEventListener('click', function(){
+                  audio.currentTime = time(s.dataset.start)+0.05; audio.play().catch(function(){});
+                });
               });
               tick();
             }
-            if(document.readyState!=='loading') bind(); else document.addEventListener('DOMContentLoaded', bind);
+            if(document.readyState!=="loading") bind(); else document.addEventListener('DOMContentLoaded', bind);
           })();
           </script>
           '''
 
-          tr_path = os.path.join(artdir, f"{base}_transcript.html")
-          with open(tr_path, "w", encoding="utf-8") as tf:
+          tr_path=os.path.join(artdir,f"{base}_transcript.html")
+          with open(tr_path,"w",encoding="utf-8") as tf:
               tf.write(css)
               tf.write('<div class="ss3k-transcript">\\n')
-              for i, g in enumerate(groups, 1):
-                  name = g["name"]
-                  uname = (g.get("username") or "").strip()
-                  prof = f"https://x.com/{html.escape(uname, True)}" if uname else ""
-                  avatar = g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
+              for i,g in enumerate(groups,1):
+                  name=g["name"]; uname=(g.get("username") or "").strip().lstrip("@")
+                  prof=f"https://x.com/{html.escape(uname, True)}" if uname else ""
+                  avatar=g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
                   if avatar and prof:
-                      avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
+                      avtag=f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
                   elif avatar:
-                      avtag = f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
+                      avtag=f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
                   else:
-                      avtag = '<div class="ss3k-avatar" aria-hidden="true"></div>'
+                      avtag='<div class="ss3k-avatar" aria-hidden="true"></div>'
+                  name_html = f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
                   if prof:
                       name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a></span>'
-                  else:
-                      name_html = f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
 
-                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{html.escape(name, True)}">')
+                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{html.escape(name, True)}"')
+                  if uname: tf.write(f' data-handle="@{html.escape(uname, True)}"')
+                  tf.write('>')
                   tf.write(avtag)
                   tf.write('<div class="ss3k-body">')
                   tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
@@ -586,13 +644,12 @@ jobs:
               tf.write('</div>\\n')
               tf.write(js)
 
-          start_iso = datetime.fromtimestamp(utt[0]["ts"], timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-          with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
-              sf.write(start_iso + "\\n")
+          start_iso = datetime.fromtimestamp(raw_utts[0]["ts"], timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          with open(os.path.join(artdir,f"{base}.start.txt"),"w",encoding="utf-8") as sf:
+              sf.write(start_iso+"\\n")
           PY
-          chmod +x ".github/workflows/scripts/gen_vtt.py"
 
-          # ---- replies/link collector (unchanged from working version) ----
+          # ---------- replies.py (unchanged) ----------
           cat > ".github/workflows/scripts/replies.py" << 'PY'
           import os, re, sys, html, tldextract
           import twitter
@@ -623,6 +680,7 @@ jobs:
           except Exception:
               pass
           def esc(x): return html.escape(x or "")
+          from collections import defaultdict
           blocks=[]
           for t in results:
               u=t.user
@@ -630,12 +688,12 @@ jobs:
               avatar=getattr(u,'profile_image_url_https', '') or ""
               text=esc(getattr(t,'full_text',None) or getattr(t,'text',None) or "")
               blocks.append(f'<div class="ss3k-reply"><img class="ss3k-ravatar" src="{esc(avatar)}" alt=""><div class="ss3k-rcontent"><div class="ss3k-rname">{esc(name)}</div><div class="ss3k-rtext">{text}</div></div></div>')
-          open(repl,"w").write("\n".join(blocks))
+          open(repl,"w").write("\\n".join(blocks))
           doms=defaultdict(set)
           def add_urls(status):
               for u in getattr(status,"urls",[]) or []:
                   u2=getattr(u,"expanded_url",None) or getattr(u,"url",None)
-                  if u2: 
+                  if u2:
                       ext=tldextract.extract(u2); dom=".".join([p for p in [ext.domain,ext.suffix] if p]); doms[dom].add(u2)
           try: add_urls(root)
           except: pass
@@ -647,7 +705,7 @@ jobs:
               lines.append(f"<h4>{esc(dom)}</h4>"); lines.append("<ul>")
               for u in sorted(doms[dom]): e=esc(u); lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
               lines.append("</ul>")
-          open(links,"w").write("\n".join(lines))
+          open(links,"w").write("\\n".join(lines))
           PY
 
       - name: Build VTT and transcript after trim
@@ -655,11 +713,11 @@ jobs:
         shell: bash
         env:
           CC_JSONL: ${{ env.CRAWLER_CC }}
-          SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
+          SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}  # ensure captions align with trimmed head
         run: |
           set -euxo pipefail
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" \
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
               python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
@@ -766,7 +824,8 @@ jobs:
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
-          TTL="${BASE}"  # keep simple; rely on WP post title or BASE
+          TTL="${TTL_FINAL:-${{ github.event.inputs.title }}}"
+          [ -z "$TTL" ] && TTL="${BASE}"
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
           TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
