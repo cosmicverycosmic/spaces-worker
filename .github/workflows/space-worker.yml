@@ -370,7 +370,7 @@ jobs:
           # (scripts content unchanged; omitted here for brevity in this snippet)
           # -- keep exactly as in your current workflow --
 
-          # For completeness, paste the same gen_vtt.py, polish_transcript.py, replies_web.py
+          # For completeness, paste the same gen_vtt.py, polish_transcript.py, replies.py
           # you’re currently using. (Your previous message already included the full text.)
 
       - name: Build VTT and transcript after trim
@@ -479,7 +479,7 @@ jobs:
           PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euo pipefail
-          python3 ".github/workflows/scripts/replies_web.py" || true
+          python3 ".github/workflows/scripts/replies.py" || true
           if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
             echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
           fi
