@@ -6,12 +6,22 @@ on:
       username:
         description: "X username (without @)"
         required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  # inherit the same auth chain used by Space Worker
+  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
+  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
+  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
 jobs:
   fetch-likes:
+    name: Fetch liked tweets
     runs-on: ubuntu-latest
-    env:
-      BEARER: ${{ secrets.X_BEARER }}
 
     steps:
       - name: Checkout
@@ -20,28 +30,60 @@ jobs:
       - name: Install jq & curl
         run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      - name: Verify token presence
+      - name: X preflight auth sanity check
+        id: x_preflight
+        shell: bash
         run: |
-          if [ -z "$BEARER" ]; then
-            echo "❌ Missing X_BEARER secret"
-            exit 1
-          fi
+          set -euo pipefail
+          AUTH="${TWITTER_AUTHORIZATION:-}"
+          AT="${TWITTER_AUTH_TOKEN:-}"
+          CT="${TWITTER_CSRF_TOKEN:-}"
+
+          if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
+          [ -n "$AUTH" ] && echo "::add-mask::$AUTH"
+          [ -n "$AT" ] && echo "::add-mask::$AT"
+          [ -n "$CT" ] && echo "::add-mask::$CT"
+
+          OK=0; REASON="no_creds"
+          [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
+          [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
+
+          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
       - name: Lookup user ID
+        if: ${{ steps.x_preflight.outputs.ok == '1' }}
         id: lookup
+        shell: bash
         run: |
+          set -euxo pipefail
           USERNAME="${{ github.event.inputs.username }}"
+          AUTH="${TWITTER_AUTHORIZATION}"
           echo "Looking up @$USERNAME ..."
-          RESP=$(curl -s -H "Authorization: Bearer $BEARER" \
+          RESP=$(curl -s -H "Authorization: $AUTH" \
+            -H "User-Agent: v2LikedTweetsPython" \
             "https://api.x.com/2/users/by/username/${USERNAME}")
           echo "$RESP"
           USER_ID=$(echo "$RESP" | jq -r '.data.id')
           echo "user_id=$USER_ID" >> "$GITHUB_OUTPUT"
 
       - name: Get last 5 liked tweets
+        if: ${{ steps.x_preflight.outputs.ok == '1' }}
+        shell: bash
         run: |
+          set -euxo pipefail
           USER_ID="${{ steps.lookup.outputs.user_id }}"
-          echo "Fetching last 5 likes for $USER_ID ..."
-          curl -s -H "Authorization: Bearer $BEARER" \
-            "https://api.x.com/2/users/${USER_ID}/liked_tweets?max_results=5" \
-            | jq '.data'
+          AUTH="${TWITTER_AUTHORIZATION}"
+          echo "Fetching last 5 liked tweets for user ID: $USER_ID"
+          curl -s -H "Authorization: $AUTH" \
+               -H "User-Agent: v2LikedTweetsPython" \
+               "https://api.x.com/2/users/${USER_ID}/liked_tweets?max_results=5" \
+               | jq '.data'
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "### Get User Likes Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Username: @${{ github.event.inputs.username }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Auth check: ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
