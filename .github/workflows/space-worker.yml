@@ -36,16 +36,22 @@ on:
         options: ["true","false"]
         default: "true"
       mode:
-        description: Limit processing to a specific area ('' = full)
+        description: Limit processing (''=full)
         required: false
         type: choice
-        options: ["", "transcript_only", "attendees_only"]
+        options: ["", "transcript_only", "attendees_only", "replies_only"]
         default: ""
       existing_mp3_url:
         description: For transcript_only provide URL to existing MP3
         required: false
         type: string
         default: ""
+      aggressive_denoise:
+        description: Use RNNoise (arnndn) denoiser (can sound “processed”)
+        required: false
+        type: choice
+        options: ["false","true"]
+        default: "false"
 
 permissions:
   contents: read
@@ -64,7 +70,7 @@ env:
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Optional: Twitter API v1.1 for one-shot replies scrape
+  # Twitter API v1.1 (for replies & shared links)
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -87,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Notify WP — queued
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -108,13 +114,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # yt-dlp (fallback) + replies dependencies
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
-          # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # container pull auth (for GHCR)
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -149,6 +152,7 @@ jobs:
           echo "base=${BASE}"    >> "$GITHUB_OUTPUT"
 
       - name: GCP auth
+        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -157,6 +161,7 @@ jobs:
 
       - name: X preflight auth sanity check
         id: x_preflight
+        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -179,7 +184,7 @@ jobs:
 
       - name: Run crawler (by id)
         id: crawl
-        if: ${{ steps.x_preflight.outputs.ok == '1' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.x_preflight.outputs.ok == '1' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -204,14 +209,12 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
-          # Most-recent audio file
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Compact metadata JSON line
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -221,26 +224,23 @@ jobs:
           fi
           [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
-          # Captions JSONL from crawler
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
       - name: Extract Space title & start (title = post title; start = post date)
-        if: ${{ steps.crawl.outcome == 'success' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           J="${ARTDIR}/_as_line.json"
           TTL=""
           START_RAW=""
-
           if [ -s "$J" ]; then
             TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
             START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J")"
           fi
-
           [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
           [ -z "$TTL" ] && TTL="${BASE}"
           echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
@@ -259,7 +259,7 @@ jobs:
           echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
 
       - name: Build VTT & syncable grouped transcript (from crawler JSONL)
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         env:
           CC_JSONL: ${{ env.CRAWLER_CC }}
@@ -279,7 +279,7 @@ jobs:
           fi
 
       - name: Notify WP — processing audio
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,7 +293,7 @@ jobs:
                          '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
 
       - name: Fallback download via yt-dlp
-        if: ${{ github.event.inputs.mode != 'attendees_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -314,7 +314,7 @@ jobs:
           echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
       - name: Trim head and tail silence
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.INPUT_FILE != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -325,11 +325,10 @@ jobs:
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
 
       - name: (Optional) Download RNNoise model for arnndn
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' && github.event.inputs.aggressive_denoise == 'true' }}
         shell: bash
         run: |
           set -euxo pipefail
-          # Try to fetch a common .rnnn model; fall back to disabled if download fails.
           M="${WORKDIR}/rnnoise.rnnn"
           curl -fsSL -o "$M" https://raw.githubusercontent.com/GregorR/rnnoise-models/master/heavyrnnoise.rnnn || true
           if [ -s "$M" ]; then
@@ -339,20 +338,20 @@ jobs:
             echo "USE_ARNNDN=0" >> "$GITHUB_ENV"
           fi
 
-      - name: Enhance + loudness normalize to MP3 (radio tone)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.AUDIO_IN != '' }}
+      - name: Enhance + loudness normalize to MP3 (natural radio tone)
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          # Radio-style chain: cleanup -> (optional RNNoise) -> spectral denoise -> de-ess -> gentle comp -> adaptive norm -> EBU R128 loudnorm (2-pass) -> mono MP3
-          PRE="highpass=f=80,lowpass=f=12000"
+          # Softer chain to avoid "hollow/echoey":
+          # HPF/LPF -> (optional RNNoise) -> mild spectral denoise -> light de-ess -> gentle comp -> EBU R128 loudnorm (2-pass) -> mono MP3
+          PRE="highpass=f=70,lowpass=f=11500"
           if [ "${USE_ARNNDN:-0}" = "1" ] && [ -s "${RNNOISE_MODEL:-}" ]; then
             PRE="${PRE},arnndn=m=${RNNOISE_MODEL}"
           fi
-          PRE="${PRE},afftdn=nr=12:nf=-28,deesser=i=0.3,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
+          PRE="${PRE},afftdn=nr=6:nf=-25,deesser=i=0.18,acompressor=threshold=-18dB:ratio=2.5:attack=8:release=200:makeup=3"
 
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
-          # Analysis pass to get measured params (reduces pumping/clipping)
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
 
@@ -373,7 +372,7 @@ jobs:
 
       - name: Upload MP3 to GCS
         id: upload_mp3
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.MP3_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -389,7 +388,7 @@ jobs:
 
       - name: Prefer crawler captions if present
         id: crawl_cc
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -397,7 +396,7 @@ jobs:
 
       - name: VTT via Deepgram (fallback)
         id: deepgram
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -411,7 +410,7 @@ jobs:
 
       - name: Upload VTT to GCS
         id: upload_vtt
-        if: ${{ github.event.inputs.mode != 'attendees_only' && env.VTT_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -427,7 +426,7 @@ jobs:
 
       - name: Build attendees JSON & HTML (from crawler)
         id: attendees
-        if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
         env:
           CAND: ${{ steps.crawl.outputs.as_line }}
@@ -473,17 +472,31 @@ jobs:
             fi
           fi
 
-      - name: Scrape Space tweet replies (one-shot, optional)
-        if: ${{ env.TW_API_CONSUMER_KEY != '' && env.TW_API_CONSUMER_SECRET != '' && env.TW_API_ACCESS_TOKEN != '' && env.TW_API_ACCESS_TOKEN_SECRET != '' }}
+      - name: Scrape Space tweet replies & shared links (best-effort; always try)
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          # Always run; the Python script will no-op if credentials are missing.
+          set +e
           python3 ".github/workflows/scripts/replies.py"
-          [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::warning title=Replies scrape failed::python exited with code $rc"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
+            echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
+          else
+            echo "::warning title=Replies HTML missing::Proceeding without replies"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
+            echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
+          else
+            echo "::warning title=Links HTML missing::Proceeding without shared links"
+          fi
 
       - name: Register assets in WP (finalize)
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
+        if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
         shell: bash
         env:
           PID:  ${{ github.event.inputs.post_id }}
@@ -537,17 +550,6 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
             --data-binary @"$REQ" | jq -r .
 
-      - name: Set WP post date to Space start (authoritative)
-        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && env.SPACE_STARTED_AT != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          DATE_GMT="$(date -u -d "${SPACE_STARTED_AT}" '+%Y-%m-%dT%H:%M:%S')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/wp/v2/posts/${{ github.event.inputs.post_id }}" \
-            -d "$(jq -n --arg d "${DATE_GMT}" '{date_gmt:$d}')" | jq -r '.id // "ok"'
-
       - name: Patch WP — attendees only
         if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
@@ -570,6 +572,28 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
             -d "$BODY" | jq -r .
 
+      - name: Patch WP — replies only
+        if: ${{ github.event.inputs.mode == 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REP="$( [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && cat "${REPLIES_PATH}" || echo "" )"
+          LNK="$( [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && cat "${LINKS_PATH}" || echo "" )"
+
+          BODY="$(jq -n \
+            --arg pid "${{ github.event.inputs.post_id }}" \
+            --arg rep "${REP}" \
+            --arg lnk "${LNK}" \
+            '{post_id: ($pid|tonumber), status:"complete", progress:100}
+             + (if ($rep|length)>0 then {ss3k_replies_html:$rep} else {} end)
+             + (if ($lnk|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+          ')"
+
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
+            -d "$BODY" | jq -r .
+
       - name: Summary
         shell: bash
         env:
@@ -577,6 +601,7 @@ jobs:
         run: |
           {
             echo "### Space Worker Summary"
+            echo "- Mode      ${{ github.event.inputs.mode }}"
             echo "- Space URL ${{ github.event.inputs.space_url }}"
             echo "- Space ID  ${SID}"
             echo "- Post ID   ${{ github.event.inputs.post_id }}"
@@ -603,15 +628,17 @@ jobs:
             fi
             if [ -n "${REPLIES_PATH:-}" ]; then
               echo "- Replies HTML generated"
+            else
+              echo "- Replies not generated"
             fi
             if [ -n "${LINKS_PATH:-}" ]; then
               echo "- Shared links HTML generated"
+            else
+              echo "- Shared links not generated"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees saved to WP (HTML)"
             else
               echo "- Attendees not extracted"
             fi
-            echo "- Preflight ok=${{ steps.x_preflight.outputs.ok }} reason=${{ steps.x_preflight.outputs.reason }}"
-            echo "- Mode      ${{ github.event.inputs.mode }}"
           } >> "$GITHUB_STEP_SUMMARY"
