@@ -1,4 +1,5 @@
-# .github/workflows/scripts/replies.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os, re, json, html, time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
 
 REPLIES_OUT = os.path.join(ARTDIR, f"{BASE}_replies.html")
 LINKS_OUT   = os.path.join(ARTDIR, f"{BASE}_links.html")
+START_PATH  = os.path.join(ARTDIR, f"{BASE}.start.txt")  # absolute ISO start from gen_vtt
 
 LINK_LABEL_AI         = (os.environ.get("LINK_LABEL_AI","keybert") or "keybert").lower()  # keybert | off
 LINK_LABEL_MODEL      = os.environ.get("LINK_LABEL_MODEL","sentence-transformers/all-MiniLM-L6-v2")
@@ -30,6 +32,7 @@ KEYBERT_NGRAM_MAX     = int(os.environ.get("KEYBERT_NGRAM_MAX","3") or "3")
 KEYBERT_USE_MMR       = (os.environ.get("KEYBERT_USE_MMR","true") or "true").lower() in ("1","true","yes","on")
 KEYBERT_DIVERSITY     = float(os.environ.get("KEYBERT_DIVERSITY","0.6") or "0.6")
 
+# ---- Helpers ----
 def esc(x:str)->str: return html.escape(x or "")
 
 def write_empty():
@@ -44,6 +47,24 @@ def parse_created_at(s):
 def fmt_utc(ts):
     try:  return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception: return ""
+
+def load_space_start_epoch(path: str) -> float | None:
+    """
+    Reads {BASE}.start.txt (ISO-8601 Z) and returns epoch seconds.
+    """
+    try:
+        if not os.path.isfile(path): return None
+        iso = open(path,"r",encoding="utf-8",errors="ignore").read().strip()
+        if not iso: return None
+        if iso.endswith("Z"): iso = iso[:-1] + "+00:00"
+        # handle +0000 → +00:00
+        m = re.search(r"[+-]\d{4}$", iso)
+        if m: iso = iso[:-5] + iso[-5:-3] + ":" + iso[-3:]
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 def smart_words(text): return [w for w in re.findall(r"[A-Za-z0-9]+", text or "") if w]
 
@@ -137,7 +158,6 @@ def kb_label(corpus_text):
         if _keybert is None:
             from keybert import KeyBERT
             from sentence_transformers import SentenceTransformer
-            # Load the ST model first so HF caches it; then give the model to KeyBERT
             st_model = SentenceTransformer(LINK_LABEL_MODEL)
             _keybert = KeyBERT(model=st_model)
         kws = _keybert.extract_keywords(
@@ -148,7 +168,6 @@ def kb_label(corpus_text):
             diversity=KEYBERT_DIVERSITY,
             top_n=KEYBERT_TOPN
         )
-        # kws is list of (phrase, score); pick best and compress to 2–3 words
         if not kws: return None
         best = sorted(kws, key=lambda x: x[1], reverse=True)[0][0]
         return compress_to_2_3_words(best)
@@ -184,7 +203,6 @@ class LinkIndex:
             if ctx: self.data[dom][url]["contexts"].add(ctx[:240])
 
     def finalize_labels(self):
-        # 1) (Optional) fetch titles for a subset
         fetched=0
         if FETCH_TITLES and FETCH_TITLES_LIMIT>0:
             for url in self.all_urls:
@@ -195,30 +213,23 @@ class LinkIndex:
                     dom=self._domain_of(url)
                     self.data[dom][url]["title"]=title
                     fetched+=1
-        # 2) Resolve label for each URL
         for dom, bucket in self.data.items():
             for url, info in bucket.items():
                 label=None
-                # Try KeyBERT on combined signal (title + top context)
                 if LINK_LABEL_AI=="keybert":
                     corpus = " ".join(
                         [info.get("title") or ""] + list(info["contexts"])[:1]
                     ).strip()
                     if corpus:
                         label = kb_label(corpus)
-                # Title fallback
                 if not label and info.get("title"):
                     label = compress_to_2_3_words(info["title"])
-                # Context fallback
                 if not label and info["contexts"]:
                     label = derive_from_context(next(iter(info["contexts"])))
-                # Slug fallback
                 if not label:
                     words = slug_to_words(url)
                     if words: label = compress_to_2_3_words(" ".join(words[:4]))
-                # Domain last
                 if not label: label = label_from_domain(dom)
-                # Normalize strictly to <=3 words
                 label = compress_to_2_3_words(label)
                 info["label"]=label
 
@@ -326,22 +337,25 @@ def fetch_conversation_adaptive(root_id_str, screen_name_hint=None, max_pages=60
         time.sleep(page_sleep)
     return tweets or None, users or None
 
-# ---------- Build threaded tree ----------
+# ---------- Build threaded tree + metadata ----------
 def build_thread_tree(root_id, tweets):
     children=defaultdict(list)
     meta={}
+    uid_of={}
     for tid, t in (tweets or {}).items():
         if str(t.get("conversation_id_str") or t.get("conversation_id") or "") != str(root_id): continue
         parent=t.get("in_reply_to_status_id_str")
         if not parent: continue
         created=parse_created_at(t.get("created_at",""))
-        meta[tid]={"created_ts":created}
+        uid=str(t.get("user_id_str") or t.get("user_id") or "")
+        meta[tid]={"created_ts":created,"uid":uid}
+        uid_of[tid]=uid
         children[str(parent)].append(tid)
+    # Sort children by time
     for pid in list(children.keys()):
         children[pid].sort(key=lambda x: meta.get(x,{}).get("created_ts",0.0))
     roots = children.get(str(root_id), [])
-    # Sort top-level by time too (already sorted in loop above)
-    return roots, children, meta
+    return roots, children, meta, uid_of
 
 # ---------- Text/link helpers ----------
 def expand_text_with_entities(text, entities):
@@ -360,13 +374,13 @@ def expand_text_with_entities(text, entities):
 
 def extract_urls_from_text(text): return re.findall(r'(https?://\S+)', text or "")
 
-# ---------- Rendering ----------
+# ---------- Rendering (with self-reply flatten + time pulse) ----------
 CSS = '''
 <style>
 .ss3k-threads{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
 .ss3k-controls{margin:8px 0 12px}
 .ss3k-controls button{font:12px system-ui;padding:6px 10px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}
-.ss3k-reply{display:flex;gap:10px;padding:10px;border:1px solid #e5e7eb;border-radius:12px;margin:8px 0;background:#fff}
+.ss3k-reply{display:flex;gap:10px;padding:10px;border:1px solid #e5e7eb;border-radius:12px;margin:8px 0;background:#fff;position:relative}
 .ss3k-ravatar{width:32px;height:32px;border-radius:50%;background:#e5e7eb;flex:0 0 32px}
 .ss3k-rcontent{flex:1 1 auto}
 .ss3k-rmeta{font-size:12px;color:#64748b;margin-bottom:4px}
@@ -376,6 +390,19 @@ CSS = '''
 .ss3k-children{margin-left:42px;border-left:2px solid #e5e7eb;padding-left:10px}
 .ss3k-toggle{font:12px system-ui;color:#0ea5e9;cursor:pointer;margin:4px 0 0 42px}
 .ss3k-hidden{display:none}
+
+/* Pulse effect on time hit */
+@keyframes ss3k-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(59,130,246,.7); }
+  70%  { box-shadow: 0 0 0 10px rgba(59,130,246,0); }
+  100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); }
+}
+.ss3k-reply.pulse { animation: ss3k-pulse 1s ease-out; }
+.ss3k-dot {
+  position:absolute; right:10px; top:10px; width:8px; height:8px; border-radius:50%;
+  background:#60a5fa; opacity:.0;
+}
+.ss3k-reply.pulse .ss3k-dot { opacity:1; }
 </style>
 '''.strip()
 
@@ -389,8 +416,11 @@ JS = r'''
   }
   function expandAll(root){ root.querySelectorAll('.ss3k-children').forEach(c=>c.classList.remove('ss3k-hidden')); }
   function collapseAll(root){ root.querySelectorAll('.ss3k-children').forEach(c=>c.classList.add('ss3k-hidden')); }
+
   function bind(){
     var root=document.querySelector('.ss3k-threads'); if(!root) return;
+
+    // expand/collapse toggles
     root.querySelectorAll('[data-toggle-for]').forEach(btn=>{
       btn.addEventListener('click', ()=>{
         var id=btn.getAttribute('data-toggle-for');
@@ -404,21 +434,75 @@ JS = r'''
     var col=root.querySelector('[data-ss3k-collapse-all]');
     if(exp) exp.addEventListener('click', ()=>expandAll(root));
     if(col) col.addEventListener('click', ()=>collapseAll(root));
+
+    // time-synced pulse (requires an <audio id="ss3k-audio">)
+    var audio = document.getElementById('ss3k-audio') || document.querySelector('audio[data-ss3k-player]');
+    var items = [].slice.call(root.querySelectorAll('.ss3k-reply[data-trel]')).map(function(el){
+      var t = parseFloat(el.getAttribute('data-trel') || 'NaN');
+      return {el: el, t: t, fired: false};
+    }).filter(function(x){ return isFinite(x.t); }).sort(function(a,b){ return a.t - b.t; });
+
+    if (audio && items.length){
+      var last = 0;
+      audio.addEventListener('seeked', function(){
+        // reset flags after big backward seek so pulses can fire again
+        if ((audio.currentTime||0) < last - 0.5) {
+          items.forEach(function(it){ it.fired = false; });
+        }
+        last = audio.currentTime || 0;
+      });
+      audio.addEventListener('timeupdate', function(){
+        var now = audio.currentTime || 0;
+        if (now >= last){
+          // forward: fire for crossings (last, now]
+          for (var i=0;i<items.length;i++){
+            var it = items[i];
+            if (!it.fired && it.t > last && it.t <= now){
+              it.fired = true;
+              it.el.classList.add('pulse');
+              setTimeout(function(el){ el.classList.remove('pulse'); }, 1100, it.el);
+            }
+          }
+        } else {
+          // backward scrub: optional re-fire if close to current time
+          for (var j=0;j<items.length;j++){
+            var jt = items[j];
+            if (Math.abs(jt.t - now) < 0.15){
+              jt.el.classList.add('pulse');
+              setTimeout(function(el){ el.classList.remove('pulse'); }, 1100, jt.el);
+            }
+          }
+        }
+        last = now;
+      });
+    }
   }
   if(document.readyState!=='loading') bind(); else document.addEventListener('DOMContentLoaded', bind);
 })();
 </script>
 '''.strip()
 
-def render_node_html(tid, tweets, users, children_map, linkdex, collapsed_by_default=True):
+def render_node_html(tid, tweets, users, children_map, meta, uid_of, linkdex, visited, start_epoch, collapsed_by_default=True):
+    """
+    Renders a node + flattens self-reply chains (same author replying to themselves).
+    'visited' prevents double rendering when we flatten.
+    """
+    if tid in visited: return ""
+    visited.add(tid)
+
     t = tweets.get(tid) or {}
-    uid = str(t.get("user_id_str") or t.get("user_id") or "")
+    uid = uid_of.get(tid, str(t.get("user_id_str") or t.get("user_id") or ""))
     u   = (users or {}).get(uid, {}) if uid else {}
     name   = u.get("name") or "User"
     handle = u.get("screen_name") or ""
     avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
-    created = parse_created_at(t.get("created_at",""))
+    created = meta.get(tid,{}).get("created_ts", parse_created_at(t.get("created_at","")))
     time_str = fmt_utc(created)
+
+    # relative time to Space start (for pulsing)
+    trel = None
+    if isinstance(start_epoch,(int,float)) and start_epoch:
+        trel = max(0.0, created - start_epoch)
 
     text_raw = t.get("full_text") or t.get("text") or ""
     ent = t.get("entities") or {}
@@ -438,51 +522,73 @@ def render_node_html(tid, tweets, users, children_map, linkdex, collapsed_by_def
     profile_url = f"https://x.com/{handle}" if handle else None
     tweet_url   = f"https://x.com/{handle}/status/{tweet_id}" if handle else f"https://x.com/i/status/{tweet_id}"
 
-    kids = children_map.get(str(tweet_id), [])
-    has_kids = len(kids) > 0
-    box_id = f"ss3k-children-{tweet_id}"
+    # ---- collect a self-reply chain starting from this tweet ----
+    flat_chain = []
+    cur = tweet_id
+    while True:
+        kids = children_map.get(cur, [])
+        # among the children, find first that is by the same user (self-reply)
+        same = [k for k in kids if uid_of.get(k) == uid and k not in visited]
+        if not same:
+            break
+        # pick chronological first; typical self-chain is linear
+        k = same[0]
+        flat_chain.append(k)
+        visited.add(k)  # mark so we don't render nested
+        cur = k  # continue chasing further self replies
 
+    # ---- render the current tweet card (with data-trel for pulse) ----
     parts=[]
-    parts.append('<div class="ss3k-reply">')
+    data_trel = f' data-trel="{trel:.3f}"' if trel is not None else ""
+    parts.append(f'<div class="ss3k-reply"{data_trel}>')
+    parts.append('<span class="ss3k-dot" aria-hidden="true"></span>')
     if profile_url:
         parts.append(f'  <a href="{esc(profile_url)}" target="_blank" rel="noopener"><img class="ss3k-ravatar" src="{esc(avatar)}" alt=""></a>')
     else:
         parts.append(f'  <img class="ss3k-ravatar" src="{esc(avatar)}" alt="">')
     parts.append('  <div class="ss3k-rcontent">')
-    meta=[]
+    meta_bits=[]
     if profile_url:
-        meta.append(f'<span class="ss3k-rname"><a href="{esc(profile_url)}" target="_blank" rel="noopener">{esc(name)}</a></span>')
+        meta_bits.append(f'<span class="ss3k-rname"><a href="{esc(profile_url)}" target="_blank" rel="noopener">{esc(name)}</a></span>')
     else:
-        meta.append(f'<span class="ss3k-rname">{esc(name)}</span>')
-    if handle: meta.append(f' <span>@{esc(handle)}</span>')
-    if tweet_url: meta.append(f' · <a href="{esc(tweet_url)}" target="_blank" rel="noopener">{esc(time_str)}</a>')
-    parts.append(f'    <div class="ss3k-rmeta">{"".join(meta)}</div>')
+        meta_bits.append(f'<span class="ss3k-rname">{esc(name)}</span>')
+    if handle: meta_bits.append(f' <span>@{esc(handle)}</span>')
+    if tweet_url: meta_bits.append(f' · <a href="{esc(tweet_url)}" target="_blank" rel="noopener">{esc(time_str)}</a>')
+    parts.append(f'    <div class="ss3k-rmeta">{"".join(meta_bits)}</div>')
     parts.append(f'    <div class="ss3k-rtext">{text_html}</div>')
     parts.append('  </div>')
     parts.append('</div>')
 
-    if has_kids:
+    # ---- render the flattened self-reply chain directly after (no indent) ----
+    for child_id in flat_chain:
+        parts.append(render_node_html(child_id, tweets, users, children_map, meta, uid_of, linkdex, visited, start_epoch, collapsed_by_default=True))
+
+    # ---- render "other users" children nested (exclude anything already visited) ----
+    other_kids = [k for k in children_map.get(tweet_id, []) if k not in visited]
+    if other_kids:
+        box_id = f"ss3k-children-{tweet_id}"
         collapsed = " ss3k-hidden" if collapsed_by_default else ""
-        collapsed_label = f"Show {len(kids)} repl{'y' if len(kids)==1 else 'ies'}"
-        expanded_label  = f"Hide repl{'y' if len(kids)==1 else 'ies'}"
+        collapsed_label = f"Show {len(other_kids)} repl{'y' if len(other_kids)==1 else 'ies'}"
+        expanded_label  = f"Hide repl{'y' if len(other_kids)==1 else 'ies'}"
         parts.append(
             f'<div class="ss3k-toggle" role="button" tabindex="0" '
             f'data-toggle-for="{box_id}" data-collapsed-label="{esc(collapsed_label)}" '
             f'data-expanded-label="{esc(expanded_label)}">{esc(collapsed_label) if collapsed_by_default else esc(expanded_label)}</div>'
         )
         parts.append(f'<div class="ss3k-children{collapsed}" id="{box_id}">')
-        for child_id in kids:
-            parts.append(render_node_html(child_id, tweets, users, children_map, linkdex, collapsed_by_default=True))
+        for kid in other_kids:
+            parts.append(render_node_html(kid, tweets, users, children_map, meta, uid_of, linkdex, visited, start_epoch, collapsed_by_default=True))
         parts.append('</div>')
 
     return "\n".join(parts)
 
-def render_thread_html(roots, tweets, users, children_map, linkdex):
+def render_thread_html(roots, tweets, users, children_map, meta, uid_of, linkdex, start_epoch):
     out=[CSS, '<div class="ss3k-threads">']
     out.append('<div class="ss3k-controls"><button type="button" data-ss3k-expand-all>Expand all</button> '
                '<button type="button" data-ss3k-collapse-all>Collapse all</button></div>')
+    visited=set()
     for rid in roots:
-        out.append(render_node_html(rid, tweets, users, children_map, linkdex, collapsed_by_default=True))
+        out.append(render_node_html(rid, tweets, users, children_map, meta, uid_of, linkdex, visited, start_epoch, collapsed_by_default=True))
     out.append('</div>')
     out.append(JS)
     return "\n".join(out)
@@ -498,7 +604,7 @@ def main():
     tweets, users = fetch_conversation_adaptive(tid_str, screen_name_hint=screen_name)
     if not tweets: write_empty(); return
 
-    roots, children_map, _meta = build_thread_tree(tid_str, tweets)
+    roots, children_map, meta, uid_of = build_thread_tree(tid_str, tweets)
 
     # Build link index from ALL tweets (root + replies + nested)
     linkdex=LinkIndex()
@@ -513,10 +619,12 @@ def main():
         for raw in extract_urls_from_text(text_raw):
             if raw not in seen:
                 seen.add(raw); linkdex.add(raw, context=text_raw)
-
     linkdex.finalize_labels()
 
-    html_out  = render_thread_html(roots, tweets, users or {}, children_map, linkdex)
+    # Try to read absolute Space start for timeline pulses
+    start_epoch = load_space_start_epoch(START_PATH)
+
+    html_out  = render_thread_html(roots, tweets, users or {}, children_map, meta, uid_of, linkdex, start_epoch)
     links_out = linkdex.render_grouped_html()
 
     open(REPLIES_OUT,"w",encoding="utf-8").write(html_out)
