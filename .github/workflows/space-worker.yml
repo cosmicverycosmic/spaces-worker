@@ -3,29 +3,23 @@ name: Space Worker
 on:
   workflow_dispatch:
     inputs:
-      # Keep accepting your legacy keys so dispatches from WP never 422.
+      # Keep legacy keys to prevent 422 from callers that still send them.
       space_url:
         description: Space or MP3 URL (legacy name)
         required: false
         type: string
         default: ""
       title:
-        description: Title hint (optional; WP ultimately sets the post title)
+        description: Title hint (optional; WP may set final title)
         required: false
         type: string
         default: ""
-      # Newer, clearer keys (both accepted; we normalize in "Resolve inputs").
+      # Preferred key; we normalize source_url > space_url in Resolve step.
       source_url:
         description: Space or MP3 URL (preferred)
         required: false
         type: string
         default: ""
-      source_kind:
-        description: What is the URL?
-        required: false
-        type: choice
-        options: ["auto","space","mp3"]
-        default: "auto"
       post_id:
         description: WordPress post ID to patch (optional)
         required: false
@@ -59,13 +53,6 @@ on:
         type: choice
         options: ["transparent","radio","aggressive"]
         default: "radio"
-      # Back-compat only. Ignored now; we always try to produce captions/transcript if possible.
-      do_transcript:
-        description: "(deprecated) kept for back-compat; ignored"
-        required: false
-        type: choice
-        options: ["true","false"]
-        default: "true"
       opts_json:
         description: Extra options as JSON (link labeling, fetch limits, etc.)
         required: false
@@ -85,7 +72,7 @@ on:
             "keybert_diversity": "0.6"
           }
 
-  # Optional server-to-server entry point: you can POST any client_payload fields.
+  # Optional server-to-server entry point (no input-count limit)
   repository_dispatch:
     types: [space_worker]
 
@@ -97,7 +84,7 @@ env:
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
 
-  # --- Google Cloud (upload to GCS; proxy via media.chbmp.org) ---
+  # --- Google Cloud ---
   GCP_SA_KEY: ${{ secrets.GCP_SA_KEY || vars.GCP_SA_KEY }}
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || vars.GCS_BUCKET }}
 
@@ -114,7 +101,7 @@ env:
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # --- (Optional) Old v1 API tokens, kept for compatibility in custom scripts ---
+  # (Optional) Old v1 API tokens, kept for compatibility in custom scripts
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -155,19 +142,19 @@ jobs:
           set -euo pipefail
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs" ".github/workflows/scripts"
 
-          # Base from workflow_dispatch
+          # From workflow_dispatch
           SRC_URL="${{ github.event.inputs.source_url }}"
           LEGACY_URL="${{ github.event.inputs.space_url }}"
           TTL_HINT="${{ github.event.inputs.title }}"
-          SRC_KIND="${{ github.event.inputs.source_kind }}"
           GCS_PFX_RAW="${{ github.event.inputs.gcs_prefix }}"
           PURPLE_URL="${{ github.event.inputs.purple_tweet_url }}"
           OPTS='${{ github.event.inputs.opts_json }}'
+          SRC_KIND=""
 
-          # Normalize URL preference: source_url > space_url
+          # Prefer source_url over legacy space_url
           if [ -z "$SRC_URL" ] && [ -n "$LEGACY_URL" ]; then SRC_URL="$LEGACY_URL"; fi
 
-          # Combine with repository_dispatch (client_payload can override)
+          # Override from repository_dispatch if provided
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             J="$(cat "$GITHUB_EVENT_PATH")"
             get() { jq -r "$1 // empty" <<<"$J"; }
@@ -180,13 +167,13 @@ jobs:
             OPTS="$(get '.client_payload.opts_json' || echo "$OPTS")"
           fi
 
-          # Prefix: default spaces/YYYY/MM (and keep a path without the leading "spaces/" for proxy)
+          # Prefix: default spaces/YYYY/MM; keep proxy path in sync
           PFX="$(echo "${GCS_PFX_RAW}" | sed -E 's#^/*##; s#/*$##')"
           if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
           echo "PREFIX=$PFX"                  >> "$GITHUB_ENV"
           echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
 
-          # Auto-detect kind if needed
+          # Auto-detect kind if not explicitly provided via repository_dispatch
           if [ -z "$SRC_KIND" ] || [ "$SRC_KIND" = "auto" ]; then
             if echo "$SRC_URL" | grep -qi '/i/spaces/'; then SRC_KIND="space"
             elif echo "$SRC_URL" | grep -qiE '\.mp3($|\?)'; then SRC_KIND="mp3"
@@ -457,18 +444,8 @@ jobs:
 
           def parse_line(line):
               d = json.loads(line)
-              # start (seconds)
-              start = (
-                  d.get("start") or d.get("s") or d.get("ts") or
-                  (d.get("offset") if isinstance(d.get("offset"), (int,float)) else None) or
-                  (d.get("startMs")/1000 if d.get("startMs") else None)
-              )
-              # duration/end (seconds)
-              end = (
-                  d.get("end") or d.get("e") or d.get("te") or
-                  (start + d.get("duration") if start is not None and isinstance(d.get("duration"), (int,float)) else None) or
-                  (d.get("endMs")/1000 if d.get("endMs") else None)
-              )
+              start = d.get("start") or d.get("s") or d.get("ts") or (d.get("offset") if isinstance(d.get("offset"), (int,float)) else None) or (d.get("startMs")/1000 if d.get("startMs") else None)
+              end   = d.get("end")   or d.get("e") or d.get("te") or ((start + d.get("duration")) if (start is not None and isinstance(d.get("duration"), (int,float))) else None) or (d.get("endMs")/1000 if d.get("endMs") else None)
               txt = d.get("text") or d.get("t") or d.get("caption") or ""
               if start is None or end is None: return None
               return max(0.0, float(start)-SHIFT), max(0.0, float(end)-SHIFT), str(txt)
@@ -485,7 +462,6 @@ jobs:
                       f.write(html.escape(t).replace("\n"," ").strip()+"\n\n")
 
           def write_html(cues, html_path):
-              # simple segment list your front-end can sync with audio
               out = ['<div id="ss3k-transcript">']
               for s,e,t in cues:
                   seg = html.escape(t).replace("\n"," ").strip()
@@ -515,7 +491,7 @@ jobs:
           PY
           chmod +x ".github/workflows/scripts/gen_vtt.py"
 
-          # --- polish_transcript.py (no-op passthrough with light cleanup) ---
+          # --- polish_transcript.py ---
           cat > ".github/workflows/scripts/polish_transcript.py" <<'PY'
           import os, re
           from pathlib import Path
@@ -525,17 +501,15 @@ jobs:
           dst = ARTDIR/f"{BASE}_transcript_polished.html"
           if not src.exists(): raise SystemExit(0)
           s = src.read_text(encoding="utf-8")
-          # tiny normalizations
           s = re.sub(r'\s+\n', '\n', s)
           s = re.sub(r'\n{3,}', '\n\n', s)
-          # ensure container id for front-end hook
           if 'id="ss3k-transcript"' not in s:
               s = f'<div id="ss3k-transcript">\n{s}\n</div>'
           dst.write_text(s, encoding="utf-8")
           PY
           chmod +x ".github/workflows/scripts/polish_transcript.py"
 
-          # --- replies.py (extract links from transcript; label with page titles or host; embed purple tweet) ---
+          # --- replies.py ---
           cat > ".github/workflows/scripts/replies.py" <<'PY'
           import os, re, json, requests, tldextract
           from pathlib import Path
@@ -570,19 +544,16 @@ jobs:
                   return None
               return None
 
-          # Prefer polished transcript, then raw
           tx = ARTDIR/f"{BASE}_transcript_polished.html"
           if not tx.exists(): tx = ARTDIR/f"{BASE}_transcript.html"
           urls = extract_urls_from_html(tx)
 
-          # Dedup preserve order
           seen=set(); uniq=[]
           for u in urls:
               if u not in seen:
                   seen.add(u); uniq.append(u)
           uniq=uniq[:FETCH_LIMIT]
 
-          # Build links list HTML
           items=[]
           for u in uniq:
               ttl = title_for(u)
@@ -595,7 +566,6 @@ jobs:
           if items:
               (ARTDIR/f"{BASE}_links.html").write_text("<ul>\n" + "\n".join(items) + "\n</ul>\n", encoding="utf-8")
 
-          # Minimal replies pane with Purple tweet (if present)
           if PURPLE:
               html = f'''
               <div class="ss3k-replies">
@@ -620,7 +590,6 @@ jobs:
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
           else
-            # mark that we couldn't get captions (we'll still try Deepgram later)
             : > "${ARTDIR}/${BASE}.start.txt"
           fi
 
@@ -634,7 +603,7 @@ jobs:
             echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
           fi
 
-      - name: VTT via Deepgram (fallback when captions missing)
+      - name: VTT via Deepgram (fallback)
         id: deepgram
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && env.MP3_PATH != '' }}
         shell: bash
@@ -664,7 +633,7 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Build attendees HTML (from crawler JSON)
+      - name: Build attendees HTML
         id: attendees
         if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
@@ -685,27 +654,25 @@ jobs:
             | ($a.metadata?.creator_results?.result?.legacy?) as $h
             | ($h.screen_name // empty) as $H
             | {
-                Host:     ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
-                "Co-hosts": ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
-                Speakers: ( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
+                host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
+                cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
+                speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
               }
           ' "${CAND}" > "$OUT_JSON" || true
           if [ -s "$OUT_JSON" ]; then
             jq -r '
-              def li: "    <li data-handle=\"@" + (.handle // "") + "\"><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
                 if (items|length) > 0
-                then "<li><strong>" + title + "</strong><ul>\n" + (items|map(li)|join("\n")) + "\n</ul></li>\n"
+                then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
                 else ""
                 end;
               . as $d
-              | "<ul>\n"
-              + section("Host";     $d.Host)
-              + section("Co-hosts"; $d["Co-hosts"])
-              + section("Speakers"; $d.Speakers)
-              + "</ul>\n"
+              | section("Host"; $d.host)
+              + section( (if ($d.cohosts|length)==1 then "Co-host" else "Co-hosts" end); $d.cohosts)
+              + section("Speakers"; $d.speakers)
             ' "$OUT_JSON" > "$OUT_HTML"
-            if grep -qi '<li' "$OUT_HTML"; then
+            if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
               echo "ATTENDEES_OK=1"       >> "$GITHUB_ENV"
             fi
@@ -786,7 +753,6 @@ jobs:
           [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH}" ] && LNK_FILE="${LINKS_PATH}"
 
           RX_FILE="${WORKDIR}/empty_reactions.json"; echo "[]" > "$RX_FILE"
-          # If you ever generate reactions JSON: [{"emoji":"👏","count":12}, ...]
           [ -s "${ARTDIR}/${BASE}_reactions.json" ] && RX_FILE="${ARTDIR}/${BASE}_reactions.json"
 
           REQ="${WORKDIR}/wp_register_body.json"
@@ -808,7 +774,7 @@ jobs:
                post_id: ($pid|tonumber),
                title:   $ttl
              }
-             + (if ($when|length)>0 then {space_started_at:$when} else {} end)
+             + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr} else {} end)
