@@ -26,7 +26,7 @@ on:
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix (default: spaces/YYYY/MM)
+        description: GCS prefix 
         required: false
         type: string
         default: ""
