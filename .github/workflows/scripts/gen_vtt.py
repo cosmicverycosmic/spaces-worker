@@ -17,20 +17,21 @@ OUTPUTS:
   {BASE}_transcript.html
   {BASE}.start.txt          (ISO-8601 UTC when absolute start known)
   {BASE}_speech.json        (processed speech segments: start,end,text, name, handle, avatar)
-  {BASE}_reactions.json     (reaction events: t, emoji, name, handle, avatar)
+  {BASE}_reactions.json     (reaction events normalized to same clock)
   {BASE}_meta.json          (counts, timing diagnostics)
 
-Design notes:
-- We *exclude* emoji-only rows from speech; they are emitted to *_reactions.json*.
-- We robustly classify timestamps as epoch vs relative and normalize both into
-  a single relative timeline, then apply SHIFT_SECS.
-- We merge nearby segments by the same speaker and produce sensible durations.
+Design fixes vs. previous versions:
+- Robust clock alignment: estimate Δ so rel+Δ ≈ (abs-abs0) using median over rows that
+  carry both clocks. Prevents "first lines" from jumping or starting at the wrong time.
+- Stable ordering: sort by time then ingestion index, never by speaker name.
+- Unicode-safe: NFC normalization and zero-width-strip to avoid stray glyphs in output.
+- Non-destructive: we do not "correct" words; we only normalize spacing and escape safely.
 """
 
-import os, sys, re, json, html
+import os, sys, re, json, html, unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-import unicodedata
+from statistics import median
+from typing import Any, Dict, List, Optional
 
 # ---------------- Env ----------------
 ARTDIR = os.environ.get("ARTDIR", "").strip() or "."
@@ -48,21 +49,15 @@ REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
 META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
 
 # ---------------- Utils ----------------
-def write_empty_outputs():
-    # Always produce files so later steps can read them safely
-    with open(VTT_PATH, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
-    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-        "speech_segments": 0, "reactions": 0, "notes": "no input"
-    }, ensure_ascii=False))
-    # Start time is optional; only write if we *know* it later.
-    return 0
-
 def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def nfc(s: str) -> str:
+    """Normalize to NFC and strip zero-width / bidi controls that cause odd glyphs."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
 
 def fmt_ts(t: float) -> str:
     if t < 0:
@@ -91,66 +86,16 @@ def parse_time_iso(s: Optional[str]) -> Optional[float]:
         return None
 
 def to_secs(x: Any) -> Optional[float]:
+    """Float conversion with ms→s guard (epoch ms ~ 1e12)."""
     if x is None:
         return None
     try:
         v = float(x)
     except Exception:
         return None
-    # ms vs s
-    if v >= 1e12:  # very likely ms
+    if v >= 1e12:  # very likely milliseconds epoch
         v = v / 1000.0
     return v
-
-def looks_like_epoch(v: float) -> bool:
-    # Rough check: > 1e6 seconds (~11.6 days) means not a tiny relative offset
-    return v >= 1e6
-
-def is_letter_or_digit(ch: str) -> bool:
-    cat = unicodedata.category(ch)
-    return cat and (cat[0] == "L" or cat[0] == "N")
-
-def has_letters_or_digits(s: str) -> bool:
-    return any(is_letter_or_digit(ch) for ch in s)
-
-def is_emoji_or_punct_only(s: str) -> bool:
-    """Return True if string has no letters/digits and consists of emoji/symbol/punct/space."""
-    text = (s or "").strip()
-    if not text:
-        return True
-    if has_letters_or_digits(text):
-        return False
-    # If there are no letters/digits, ensure the remaining characters are symbol/mark/punct/space
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat[0] in ("L", "N"):   # letters/numbers (shouldn't happen here)
-            return False
-        if ch.strip() == "":
-            continue  # whitespace ok
-        # Allow symbols (S*), marks (M*), punctuation (P*)
-        if cat[0] in ("S", "M", "P"):
-            continue
-        # Otherwise (e.g., unhandled categories), treat conservatively as not emoji-only
-        return False
-    return True
-
-def sentenceish(text: str) -> str:
-    """Light normalization to keep word-like content together."""
-    if not text:
-        return ""
-    t = text.replace("\u2028", " ").replace("\u2029", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def clean_name(name: Optional[str]) -> str:
-    s = (name or "").strip()
-    s = re.sub(r"[<>&]", "", s)
-    # odds are these IDs are 10–16 alnum w/o space; fall back in that case
-    if re.fullmatch(r"[A-Za-z0-9]{10,16}", s):
-        return "Speaker"
-    # strip astral weirdness used sometimes in handles
-    s = "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
-    return s or "Speaker"
 
 def first(*vals):
     for v in vals:
@@ -158,110 +103,127 @@ def first(*vals):
             return v
     return None
 
-# ---------------- Parsing ----------------
+# Emoji / punctuation classification
+EMOJI_RE = re.compile("[" +
+    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
+    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
+    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
+
+def is_emoji_only(s: str) -> bool:
+    if not s or not s.strip():
+        return False
+    t = ONLY_PUNCT_SPACE.sub("", s)
+    t = EMOJI_RE.sub("", t)
+    return len(t.strip()) == 0
+
+def has_letters_or_digits(s: str) -> bool:
+    return bool(re.search(r"[A-Za-z0-9]", s or ""))
+
+# ---------------- Early exit if no file ----------------
 if not (SRC and os.path.isfile(SRC)):
-    write_empty_outputs()
+    with open(VTT_PATH, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
+        "speech_segments": 0, "reactions": 0, "shift_secs_applied": SHIFT, "notes": "no input"
+    }, ensure_ascii=False))
+    open(START_PATH, "w", encoding="utf-8").write("")
     sys.exit(0)
 
-raw_speech: List[Dict[str, Any]] = []
+# ---------------- Parsing ----------------
+REL_KEYS  = ("offset", "startSec", "startMs", "start")
+ABS_KEYS  = ("programDateTime", "timestamp", "ts")
+
+raw_items: List[Dict[str, Any]] = []
 reactions: List[Dict[str, Any]] = []
-abs_times: List[float] = []   # absolute epoch seconds candidates, for start.txt
+abs_candidates: List[float] = []
+ingest_idx = 0
 
-def classify_and_collect(text: str,
-                         disp: Optional[str],
-                         uname: Optional[str],
-                         avatar: Optional[str],
-                         record: Dict[str, Any]):
-    """Decide whether a row is speech or a reaction, and collect with timestamp kind."""
-    # Choose the best timestamp from the record
-    # Prefer explicit absolute time from programDateTime
-    ts_abs = parse_time_iso(record.get("programDateTime"))
-    # Then numeric fields
-    if ts_abs is None:
-        # 'timestamp' is ambiguous → decide by scale
-        ts_unk = to_secs(record.get("timestamp"))
-        if ts_unk is not None and looks_like_epoch(ts_unk):
-            ts_abs = ts_unk
-    ts_rel = None
-    if ts_abs is None:
-        ts_rel = first(to_secs(record.get("start")),
-                       to_secs(record.get("startSec")),
-                       to_secs(record.get("startMs")),
-                       to_secs(record.get("ts")),
-                       to_secs(record.get("offset")))
-        # If only 'timestamp' exists and small, consider it relative
-        if ts_rel is None and ts_unk is not None and not looks_like_epoch(ts_unk):
-            ts_rel = ts_unk
+def pick_rel_abs(d: Dict[str, Any]) -> (Optional[float], Optional[float]):
+    """Classify fields into relative seconds and absolute epoch seconds.
 
-    # Also bank any absolute we see for start.txt
-    if ts_abs is not None:
-        abs_times.append(ts_abs)
+    Logic:
+      - REL from explicit rel keys.
+      - For numeric 'timestamp'/'ts': treat as ABS only if clearly epoch (>= 1e6).
+        Otherwise, if REL is still None, use as REL.
+      - 'programDateTime' is always ABS (ISO).
+    """
+    rel: Optional[float] = None
+    abs_ts: Optional[float] = None
 
-    t = sentenceish(text)
-    name = clean_name(first(disp, uname, "Speaker"))
+    # explicit relative
+    for k in REL_KEYS:
+        if k in d and d[k] not in (None, ""):
+            v = to_secs(d[k])
+            if v is not None:
+                rel = v
+                break
+
+    # absolute family
+    if "programDateTime" in d and d["programDateTime"] not in (None, ""):
+        abs_ts = parse_time_iso(d["programDateTime"])
+
+    # numeric abs/rel dual keys
+    for key in ("timestamp", "ts"):
+        if key in d and d[key] not in (None, ""):
+            v = to_secs(d[key])
+            if v is None:
+                continue
+            if v >= 1e6:
+                # epoch seconds
+                abs_ts = v
+            else:
+                # likely relative seconds; only take if we don't already have rel
+                if rel is None:
+                    rel = v
+
+    return rel, abs_ts
+
+def harvest_from_dict(d: Dict[str, Any]):
+    global ingest_idx
+    txt = first(d.get("body"), d.get("text"), d.get("caption"), d.get("payloadText"))
+    if not txt:
+        return
+    sender = d.get("sender") or {}
+    disp = first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
+                 (sender or {}).get("display_name"), d.get("name"), d.get("user"))
+    uname = first(d.get("username"), d.get("handle"), d.get("screen_name"),
+                  d.get("user_id"), (sender or {}).get("screen_name"))
+    avatar = first((sender or {}).get("profile_image_url_https"),
+                   (sender or {}).get("profile_image_url"),
+                   d.get("profile_image_url_https"), d.get("profile_image_url"))
+
+    rel, abs_ts = pick_rel_abs(d)
+
+    text = nfc(str(txt)).strip()
+    if not has_letters_or_digits(text) and not is_emoji_only(text):
+        return
+
+    name = nfc(first(disp, uname, "Speaker") or "Speaker")
     handle = (uname or "").lstrip("@")
     avatar_url = avatar or ""
 
-    # Speech admission rule:
-    #  - drop emoji/punct-only rows (put into reactions instead)
-    #  - otherwise accept as speech
-    if is_emoji_or_punct_only(t):
-        # Store as reaction if we have any time notion; else drop
-        kind = "epoch" if ts_abs is not None else ("rel" if ts_rel is not None else None)
-        if kind is None:
-            return
-        reactions.append({
-            "t_kind": kind,
-            "ts": float(ts_abs if kind == "epoch" else ts_rel),
-            "emoji": t,
-            "name": name,
-            "username": handle,
-            "avatar": avatar_url
-        })
+    if is_emoji_only(text):
+        if abs_ts is not None or rel is not None:
+            reactions.append({
+                "idx": ingest_idx, "rel": rel, "abs": abs_ts,
+                "emoji": text, "name": name, "handle": handle, "avatar": avatar_url
+            })
+        ingest_idx += 1
         return
 
-    # Speech
-    kind = "epoch" if ts_abs is not None else ("rel" if ts_rel is not None else None)
-    if kind is None:
-        # no time? drop safely
-        return
-    raw_speech.append({
-        "t_kind": kind,
-        "ts": float(ts_abs if kind == "epoch" else ts_rel),
-        "text": t,
-        "name": name,
-        "username": handle,
-        "avatar": avatar_url
+    raw_items.append({
+        "idx": ingest_idx, "rel": rel, "abs": abs_ts, "text": text,
+        "name": name, "username": handle, "avatar": avatar_url
     })
-
-def harvest_from_obj(obj: Dict[str, Any]):
-    """
-    Attempt to pull text + user from different shapes we see in the JSONL.
-    """
-    # Common text fields
-    txt = first(obj.get("body"), obj.get("text"), obj.get("caption"), obj.get("payloadText"))
-    disp = first(obj.get("displayName"), obj.get("speaker_name"), obj.get("speakerName"),
-                 obj.get("name"), obj.get("user"))
-    uname = first(obj.get("username"), obj.get("handle"), obj.get("screen_name"), obj.get("user_id"))
-    avatar = first(obj.get("profile_image_url_https"), obj.get("profile_image_url"))
-
-    # Some logs include nested "sender" for user info
-    sender = obj.get("sender") or {}
-    if isinstance(sender, dict):
-        disp = first(disp, sender.get("display_name"))
-        uname = first(uname, sender.get("screen_name"))
-        avatar = first(avatar, sender.get("profile_image_url_https"), sender.get("profile_image_url"))
-
-    # Try to classify this record if we have any text-like content
-    if txt:
-        classify_and_collect(txt, disp, uname, avatar, obj)
+    ingest_idx += 1
+    if abs_ts is not None:
+        abs_candidates.append(abs_ts)
 
 def ingest_line(line: str):
-    """
-    Each line may be:
-      - a dict row with caption or reaction fields
-      - a wrapper with 'payload' -> JSON, possibly with 'body' stringified JSON
-    """
     line = (line or "").strip()
     if not line:
         return
@@ -270,38 +232,50 @@ def ingest_line(line: str):
     except Exception:
         return
 
-    # Some crawlers wrap: {"payload": "...json..."} or {"payload": {"body": "..."}}
-    if isinstance(obj, dict) and "payload" in obj and isinstance(obj["payload"], (str, dict)):
-        pl = obj["payload"]
+    # consider multiple possible layers
+    layers: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        layers.append(obj)
+        pl = obj.get("payload")
+        # payload as stringified JSON
         if isinstance(pl, str):
             try:
-                pl = json.loads(pl)
+                plj = json.loads(pl)
+                if isinstance(plj, dict):
+                    layers.append(plj)
+                    body = plj.get("body")
+                    if isinstance(body, str):
+                        try:
+                            inner = json.loads(body)
+                            if isinstance(inner, dict):
+                                # merge sender if exists at payload
+                                if isinstance(plj.get("sender"), dict):
+                                    inner = dict(inner)
+                                    inner["sender"] = plj["sender"]
+                                layers.append(inner)
+                        except Exception:
+                            pass
             except Exception:
-                pl = {}
-        if isinstance(pl, dict):
-            # Some store JSON in pl["body"] as string
+                pass
+        # payload already dict
+        elif isinstance(pl, dict):
+            layers.append(pl)
             body = pl.get("body")
             if isinstance(body, str):
                 try:
                     inner = json.loads(body)
                     if isinstance(inner, dict):
-                        # Merge known fields into a record-like dict
-                        record = dict(inner)
-                        # also attach sender for names/avatars
                         if isinstance(pl.get("sender"), dict):
-                            record["sender"] = pl["sender"]
-                        harvest_from_obj(record)
-                        return
+                            inner = dict(inner)
+                            inner["sender"] = pl["sender"]
+                        layers.append(inner)
                 except Exception:
                     pass
-            # If body wasn't a stringified JSON, still try to use payload fields
-            record = dict(pl)
-            harvest_from_obj(record)
-            return
 
-    # Otherwise use obj directly
-    if isinstance(obj, dict):
-        harvest_from_obj(obj)
+    # harvest
+    for d in layers:
+        if isinstance(d, dict):
+            harvest_from_dict(d)
 
 # -------- Read JSONL --------
 with open(SRC, "r", encoding="utf-8", errors="ignore") as f:
@@ -309,70 +283,75 @@ with open(SRC, "r", encoding="utf-8", errors="ignore") as f:
         ingest_line(ln)
 
 # If nothing collected, output empty artifacts
-if not raw_speech and not reactions:
-    write_empty_outputs()
-    # Write start if we have any absolute times
-    if abs_times:
-        start_iso = datetime.fromtimestamp(min(abs_times), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        open(START_PATH, "w", encoding="utf-8").write(start_iso + "\n")
+if not raw_items and not reactions:
+    with open(VTT_PATH, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
+        "speech_segments": 0, "reactions": 0,
+        "inputs": {"raw_items": 0, "abs_candidates": 0},
+        "shift_secs_applied": SHIFT
+    }, ensure_ascii=False))
+    # Start time is optional; only write if we *know* it later.
+    open(START_PATH, "w", encoding="utf-8").write("")
     sys.exit(0)
 
-# ------------- Time normalization -------------
-def normalize_events(evts: List[Dict[str, Any]], shift_secs: float):
-    """
-    Normalize mixed epoch/relative events into a single relative timeline.
-    Adds 't_rel' (seconds >= 0) to each item.
-    """
-    epochs = [e for e in evts if e["t_kind"] == "epoch"]
-    rels   = [e for e in evts if e["t_kind"] == "rel"]
+# ------------- Time normalization with Δ alignment -------------
+abs0 = min(abs_candidates) if abs_candidates else None
+if abs0 is not None:
+    deltas = []
+    for it in raw_items:
+        if it["abs"] is not None and it["rel"] is not None:
+            deltas.append((it["abs"] - abs0) - it["rel"])
+    # also consider reaction rows for better statistics
+    for r in reactions:
+        if r["abs"] is not None and r["rel"] is not None:
+            deltas.append((r["abs"] - abs0) - r["rel"])
 
-    base_epoch = min((e["ts"] for e in epochs), default=None)
-    # 'rels' are already relative; we use their own base as 0
-    for e in epochs:
-        e["t_rel0"] = e["ts"] - (base_epoch or 0.0)
-    for e in rels:
-        e["t_rel0"] = e["ts"]  # they are already relative
+    delta = median(deltas) if deltas else 0.0
+else:
+    delta = 0.0
 
-    # Global zero is the min among the two clusters
-    t0 = min([*(e["t_rel0"] for e in epochs), *(e["t_rel0"] for e in rels)]) if (epochs or rels) else 0.0
-    for e in evts:
-        e["t_rel"] = max(0.0, e["t_rel0"] - t0 - shift_secs)
+def rel_time_from_item(rel: Optional[float], abs_ts: Optional[float]) -> float:
+    """Map mixed rel/abs clocks onto a single relative timeline, then apply SHIFT."""
+    if rel is not None:
+        t = rel + delta
+    elif abs_ts is not None and abs0 is not None:
+        t = abs_ts - abs0
+    else:
+        t = 0.0
+    return max(0.0, t - SHIFT)
 
-# Apply normalization separately to speech and reactions
-normalize_events(raw_speech, SHIFT)
-normalize_events(reactions, SHIFT)
+# apply times
+norm: List[Dict[str, Any]] = []
+for it in raw_items:
+    t = rel_time_from_item(it["rel"], it["abs"])
+    norm.append({**it, "t": float(t)})
 
-# Keep for meta
-diag = {
-    "speech_input": len(raw_speech),
-    "reactions_input": len(reactions),
-    "shift_secs": SHIFT,
-}
+# Sort by time then ingestion index (stable). Never sort by speaker name.
+norm.sort(key=lambda x: (x["t"], x["idx"]))
+EPS = 5e-4
+last = -1e9
+for u in norm:
+    if u["t"] <= last:
+        u["t"] = last + EPS
+    last = u["t"]
 
 # ------------- Build speech segments -------------
-# Sort by relative start
-raw_speech.sort(key=lambda x: (x["t_rel"], x["name"], x["username"]))
-
-# Compute naive end times from next start, constrained
 MIN_DUR = 0.80
 MAX_DUR = 10.0
 GUARD   = 0.020
+MERGE_GAP = 3.0
 
 segments: List[Dict[str, Any]] = []
-for i, u in enumerate(raw_speech):
-    st = u["t_rel"]
-    if i + 1 < len(raw_speech):
-        nxt = raw_speech[i + 1]["t_rel"]
-        dur = max(MIN_DUR, min(MAX_DUR, (nxt - st) - GUARD))
-        if dur <= 0:
-            dur = MIN_DUR
-    else:
-        # Estimate final duration by words
-        words = max(1, len(u["text"].split()))
-        dur = max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+# initial small duration per event
+for u in norm:
+    st = u["t"]
     segments.append({
         "start": st,
-        "end": st + dur,
+        "end": st + MIN_DUR,
         "text": u["text"],
         "name": u["name"],
         "username": u["username"],
@@ -380,12 +359,11 @@ for i, u in enumerate(raw_speech):
     })
 
 # Merge adjacent segments by same speaker if gap <= MERGE_GAP
-MERGE_GAP = 3.0
 merged: List[Dict[str, Any]] = []
 cur: Optional[Dict[str, Any]] = None
 
 def end_sentence_punct(s: str) -> bool:
-    return bool(re.search(r'[.!?]"?$', s.strip()))
+    return bool(re.search(r'[.!?]"?$', (s or "").strip()))
 
 for seg in segments:
     if (cur is not None
@@ -399,7 +377,18 @@ for seg in segments:
         cur = dict(seg)
         merged.append(cur)
 
-# Ensure strictly increasing, padded by GUARD
+# Smooth end times based on following start
+for i, g in enumerate(merged):
+    if i + 1 < len(merged):
+        nxt = merged[i + 1]["start"]
+        dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
+        g["end"] = g["start"] + dur
+    else:
+        # Estimate final duration by words
+        words = max(1, len((g["text"] or "").split()))
+        g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+
+# Ensure strictly increasing and clamp
 prev_end = 0.0
 for g in merged:
     if g["start"] < prev_end + GUARD:
@@ -419,7 +408,7 @@ with open(VTT_PATH, "w", encoding="utf-8") as vf:
 CSS = '''
 <style>
 .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px;}
+  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px}
 .ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
 .ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
 .ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e5e7eb}
@@ -432,30 +421,27 @@ CSS = '''
 JS = r'''
 <script>
 (function(){
-  function time(v){ var x = parseFloat(v||'0'); return isFinite(x) ? x : 0; }
-  function within(t,seg){ return t>=time(seg.dataset.start) && t<time(seg.dataset.end); }
+  function time(s){return parseFloat(s||'0')||0}
+  function within(t,seg){return t>=time(seg.dataset.start) && t<time(seg.dataset.end)}
   function bind(){
     var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
     var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
-    var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg')); var lastId="";
+    var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg'));
     function tick(){
       var t=audio.currentTime||0, found=null;
       for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
       segs.forEach(function(s){ s.classList.toggle('active', s===found); });
       if(found){
-        var id=found.id||"";
-        if(id!==lastId){
-          var top = found.offsetTop - cont.offsetTop;
-          if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
-          lastId=id;
-        }
+        var top = found.offsetTop - cont.offsetTop;
+        if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
       }
     }
     audio.addEventListener('timeupdate', tick);
     audio.addEventListener('seeked', tick);
     segs.forEach(function(s){
       s.addEventListener('click', function(){
-        audio.currentTime = time(s.dataset.start)+0.05; audio.play && audio.play().catch(function(){});
+        audio.currentTime = time(s.dataset.start)+0.05;
+        if (audio.play) audio.play().catch(function(){});
       });
     });
     tick();
@@ -480,9 +466,9 @@ with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as tf:
         else:
             avtag = '<div class="ss3k-avatar" aria-hidden="true"></div>'
 
-        name_html = f'<strong>{html.escape(name, True)}</strong>'
+        name_html = f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
         if prof:
-            name_html = f'<a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a>'
+            name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a></span>'
 
         tf.write(
             f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start"]:.3f}" data-end="{g["end"]:.3f}"'
@@ -492,8 +478,7 @@ with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as tf:
         tf.write('>')
         tf.write(avtag)
         tf.write('<div class="ss3k-body">')
-        tf.write(f'<div class="ss3k-meta"><span class="ss3k-name">{name_html}</span> · '
-                 f'<time>{fmt_ts(g["start"])}</time>–<time>{fmt_ts(g["end"])}</time></div>')
+        tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start"])}</time>–<time>{fmt_ts(g["end"])}</time></div>')
         tf.write(f'<div class="ss3k-text">{esc(g["text"])}</div>')
         tf.write('</div></div>\n')
     tf.write('</div>\n' + JS + "\n")
@@ -512,32 +497,46 @@ open(SPEECH_JSON_PATH, "w", encoding="utf-8").write(
     json.dumps(speech_out, ensure_ascii=False)
 )
 
-# Reactions sidecar
-reactions.sort(key=lambda r: r["t_rel"])
-react_out = [{
-    "t": round(r["t_rel"], 3),
-    "emoji": r["emoji"],
-    "name": r["name"],
-    "handle": r["username"],
-    "avatar": r["avatar"],
-} for r in reactions]
+# Reactions sidecar (normalize onto same relative clock)
+rx_out = []
+for r in reactions:
+    if r["rel"] is not None:
+        t = r["rel"] + (delta or 0.0)
+    elif r["abs"] is not None and abs0 is not None:
+        t = r["abs"] - abs0
+    else:
+        continue
+    t = max(0.0, t - SHIFT)
+    rx_out.append({
+        "t": round(t, 3),
+        "emoji": r["emoji"],
+        "name": r["name"],
+        "handle": r["handle"],
+        "avatar": r["avatar"],
+    })
 open(REACT_JSON_PATH, "w", encoding="utf-8").write(
-    json.dumps(react_out, ensure_ascii=False)
+    json.dumps(rx_out, ensure_ascii=False)
 )
 
-# Meta
-open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-    "speech_segments": len(merged),
-    "reactions": len(react_out),
-    "inputs": {
-        "raw_speech_rows": len(raw_speech),
-        "raw_reaction_rows": len(reactions),
-        "abs_time_rows": len(abs_times),
-    },
-    "shift_secs_applied": SHIFT,
-}, ensure_ascii=False))
+# ------------- Meta + start time -------------
+start_iso = ""
+if abs_candidates:
+    start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+open(START_PATH, "w", encoding="utf-8").write((start_iso or "") + "\n")
 
-# ------------- Start time (ISO Z) -------------
-if abs_times:
-    start_iso = datetime.fromtimestamp(min(abs_times), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    open(START_PATH, "w", encoding="utf-8").write(start_iso + "\n")
+meta = {
+    "speech_segments": len(merged),
+    "reactions": len(rx_out),
+    "inputs": {
+        "raw_items": len(raw_items),
+        "abs_candidates": len(abs_candidates),
+        "raw_reaction_rows": len(reactions),
+    },
+    "timing": {
+        "shift_secs_applied": SHIFT,
+        "abs0_present": abs0 is not None,
+        "delta_used": round(delta, 6) if abs0 is not None else 0.0,
+        "first_caption_start": round(merged[0]["start"], 3) if merged else None,
+    }
+}
+open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
