@@ -253,7 +253,7 @@ jobs:
           OK=0; REASON="no_creds"
           [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
           [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
-          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
+          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
@@ -330,7 +330,7 @@ jobs:
           LEAD="$(awk '/silence_end/ {print $5; exit}' "$LOG" || true)"
           case "$LEAD" in ''|*[^0-9.]* ) LEAD="0.0" ;; esac
           echo "TRIM_LEAD=${LEAD}" >> "$GITHUB_ENV"
-          echo "lead=${LEAD}"       >> "$GITHUB_OUTPUT"
+          echo "lead=${LEAD}" >> "$GITHUB_OUTPUT"
 
       - name: Trim head and tail (RF64-safe)
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
@@ -423,158 +423,8 @@ jobs:
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "audio_raw=${RAW}" >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
-
-      - name: Helper scripts (gen_vtt, polish, replies)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ".github/workflows/scripts"
-
-          # --- gen_vtt.py ---
-          cat > ".github/workflows/scripts/gen_vtt.py" <<'PY'
-          import os, json, re, html
-          from pathlib import Path
-
-          ARTDIR = Path(os.environ.get("ARTDIR","."))
-          BASE   = os.environ.get("BASE","space")
-          CC     = os.environ.get("CC_JSONL","")
-          SHIFT  = float(os.environ.get("SHIFT_SECS","0") or "0")
-
-          def parse_line(line):
-              d = json.loads(line)
-              start = d.get("start") or d.get("s") or d.get("ts") or (d.get("offset") if isinstance(d.get("offset"), (int,float)) else None) or (d.get("startMs")/1000 if d.get("startMs") else None)
-              end   = d.get("end")   or d.get("e") or d.get("te") or ((start + d.get("duration")) if (start is not None and isinstance(d.get("duration"), (int,float))) else None) or (d.get("endMs")/1000 if d.get("endMs") else None)
-              txt = d.get("text") or d.get("t") or d.get("caption") or ""
-              if start is None or end is None: return None
-              return max(0.0, float(start)-SHIFT), max(0.0, float(end)-SHIFT), str(txt)
-
-          def to_ts(s):
-              h=int(s//3600); m=int((s%3600)//60); sec=s-(h*3600+m*60)
-              return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.',',')
-
-          def write_vtt(cues, vtt_path):
-              with open(vtt_path, "w", encoding="utf-8") as f:
-                  f.write("WEBVTT\n\n")
-                  for i,(s,e,t) in enumerate(cues,1):
-                      f.write(f"{to_ts(s)} --> {to_ts(e)}\n")
-                      f.write(html.escape(t).replace("\n"," ").strip()+"\n\n")
-
-          def write_html(cues, html_path):
-              out = ['<div id="ss3k-transcript">']
-              for s,e,t in cues:
-                  seg = html.escape(t).replace("\n"," ").strip()
-                  if not seg: continue
-                  out.append(f'<div class="ss3k-seg" data-start="{s:.3f}" data-end="{e:.3f}"><div class="txt">{seg}</div></div>')
-              out.append("</div>")
-              Path(html_path).write_text("\n".join(out), encoding="utf-8")
-
-          if not CC or not Path(CC).exists():
-              raise SystemExit(0)
-
-          cues=[]
-          with open(CC, "r", encoding="utf-8") as fh:
-              for line in fh:
-                  line=line.strip()
-                  if not line: continue
-                  try:
-                      r=parse_line(line)
-                      if r: cues.append(r)
-                  except Exception:
-                      continue
-
-          cues.sort(key=lambda x: x[0])
-          if not cues: raise SystemExit(0)
-          write_vtt(cues, ARTDIR/f"{BASE}.vtt")
-          write_html(cues, ARTDIR/f"{BASE}_transcript.html")
-          PY
-          chmod +x ".github/workflows/scripts/gen_vtt.py"
-
-          # --- polish_transcript.py ---
-          cat > ".github/workflows/scripts/polish_transcript.py" <<'PY'
-          import os, re
-          from pathlib import Path
-          ARTDIR = Path(os.environ.get("ARTDIR","."))
-          BASE   = os.environ.get("BASE","space")
-          src = ARTDIR/f"{BASE}_transcript.html"
-          dst = ARTDIR/f"{BASE}_transcript_polished.html"
-          if not src.exists(): raise SystemExit(0)
-          s = src.read_text(encoding="utf-8")
-          s = re.sub(r'\s+\n', '\n', s)
-          s = re.sub(r'\n{3,}', '\n\n', s)
-          if 'id="ss3k-transcript"' not in s:
-              s = f'<div id="ss3k-transcript">\n{s}\n</div>'
-          dst.write_text(s, encoding="utf-8")
-          PY
-          chmod +x ".github/workflows/scripts/polish_transcript.py"
-
-          # --- replies.py ---
-          cat > ".github/workflows/scripts/replies.py" <<'PY'
-          import os, re, json, requests, tldextract
-          from pathlib import Path
-          from bs4 import BeautifulSoup
-
-          ARTDIR = Path(os.environ.get("ARTDIR","."))
-          BASE   = os.environ.get("BASE","space")
-          PURPLE = os.environ.get("PURPLE_TWEET_URL","").strip()
-          FETCH_TITLES = (os.environ.get("LINK_LABEL_FETCH_TITLES","true").lower() == "true")
-          FETCH_LIMIT  = int(os.environ.get("LINK_LABEL_FETCH_LIMIT","18") or "18")
-          TIMEOUT      = int(os.environ.get("LINK_LABEL_TIMEOUT_SEC","4") or "4")
-
-          def extract_urls_from_html(path: Path):
-              if not path.exists(): return []
-              soup = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
-              urls=set()
-              for a in soup.find_all("a", href=True):
-                  href=a["href"].strip()
-                  if href.startswith("http://") or href.startswith("https://"):
-                      urls.add(href)
-              return list(urls)
-
-          def title_for(url):
-              if not FETCH_TITLES: return None
-              try:
-                  r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent":"Mozilla/5.0"})
-                  r.raise_for_status()
-                  soup = BeautifulSoup(r.text, "html.parser")
-                  t = soup.title.string.strip() if soup.title and soup.title.string else None
-                  if t: return re.sub(r'\s+', ' ', t)
-              except Exception:
-                  return None
-              return None
-
-          tx = ARTDIR/f"{BASE}_transcript_polished.html"
-          if not tx.exists(): tx = ARTDIR/f"{BASE}_transcript.html"
-          urls = extract_urls_from_html(tx)
-
-          seen=set(); uniq=[]
-          for u in urls:
-              if u not in seen:
-                  seen.add(u); uniq.append(u)
-          uniq=uniq[:FETCH_LIMIT]
-
-          items=[]
-          for u in uniq:
-              ttl = title_for(u)
-              if not ttl:
-                  ext = tldextract.extract(u)
-                  host = ".".join([p for p in [ext.domain, ext.suffix] if p])
-                  ttl = host or u
-              items.append(f'<li><a href="{u}" target="_blank" rel="noopener">{ttl}</a></li>')
-
-          if items:
-              (ARTDIR/f"{BASE}_links.html").write_text("<ul>\n" + "\n".join(items) + "\n</ul>\n", encoding="utf-8")
-
-          if PURPLE:
-              html = f'''
-              <div class="ss3k-replies">
-                <p><a href="{PURPLE}" target="_blank" rel="noopener">Open conversation on X (purple pill)</a></p>
-              </div>
-              '''.strip()
-              (ARTDIR/f"{BASE}_replies.html").write_text(html, encoding="utf-8")
-          PY
-          chmod +x ".github/workflows/scripts/replies.py"
 
       - name: Build VTT + transcript (from crawler captions if present)
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
@@ -616,6 +466,15 @@ jobs:
             "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
             -o "${ARTDIR}/${BASE}.vtt" || true
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+
+      - name: Transcript from VTT (if no CC transcript)
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' && env.TRANSCRIPT_PATH == '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ARTDIR="${ARTDIR}" BASE="${BASE}" \
+            python3 ".github/workflows/scripts/vtt_to_html.py"
+          [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
 
       - name: Upload VTT (proxy link via media.chbmp.org)
         id: upload_vtt
@@ -661,16 +520,18 @@ jobs:
           ' "${CAND}" > "$OUT_JSON" || true
           if [ -s "$OUT_JSON" ]; then
             jq -r '
-              def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def li: "<li><a href=\"" + (.url//"#") + "\" target=\"_blank\" rel=\"noopener\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
                 if (items|length) > 0
-                then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
+                then "<li><strong>" + title + "</strong><ul>" + (items|map(li)|join("")) + "</ul></li>"
                 else ""
                 end;
               . as $d
-              | section("Host"; $d.host)
+              | "<ul>"
+              + section("Host"; $d.host)
               + section( (if ($d.cohosts|length)==1 then "Co-host" else "Co-hosts" end); $d.cohosts)
               + section("Speakers"; $d.speakers)
+              + "</ul>"
             ' "$OUT_JSON" > "$OUT_HTML"
             if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
@@ -679,7 +540,7 @@ jobs:
           fi
 
       - name: Scrape replies & shared links
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
+        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'replies_only' && env.PURPLE_TWEET_URL != '' }}
         shell: bash
         env:
           PURPLE_TWEET_URL: ${{ env.PURPLE_TWEET_URL }}
@@ -698,6 +559,7 @@ jobs:
           python3 ".github/workflows/scripts/replies.py" || true
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ]   && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html"   >> "$GITHUB_ENV" || true
+          [ -s "${ARTDIR}/${BASE}_reactions.json" ] && echo "REACTIONS_PATH=${ARTDIR}/${BASE}_reactions.json" >> "$GITHUB_ENV" || true
 
       - name: Derive title + start time
         id: meta
@@ -753,7 +615,7 @@ jobs:
           [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH}" ] && LNK_FILE="${LINKS_PATH}"
 
           RX_FILE="${WORKDIR}/empty_reactions.json"; echo "[]" > "$RX_FILE"
-          [ -s "${ARTDIR}/${BASE}_reactions.json" ] && RX_FILE="${ARTDIR}/${BASE}_reactions.json"
+          [ -n "${REACTIONS_PATH:-}" ] && [ -s "${REACTIONS_PATH}" ] && RX_FILE="${REACTIONS_PATH}"
 
           REQ="${WORKDIR}/wp_register_body.json"
           jq -n \
@@ -764,15 +626,15 @@ jobs:
             --arg vtt   "${VTTU}" \
             --arg when  "${START_ISO:-}" \
             --rawfile ath "${ATH_FILE}" \
-            --rawfile tr  "${TR_FILE}" \
+            --rawfile tr "${TR_FILE}" \
             --rawfile rep "${REP_FILE}" \
             --rawfile lnk "${LNK_FILE}" \
-            --rawfile rx  "${RX_FILE}" \
+            --rawfile rx "${RX_FILE}" \
             '{
                gcs_url: $gcs,
-               mime:    $mime,
+               mime: $mime,
                post_id: ($pid|tonumber),
-               title:   $ttl
+               title: $ttl
              }
              + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
