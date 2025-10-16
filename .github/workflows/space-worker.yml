@@ -3,7 +3,6 @@ name: Space Worker
 on:
   workflow_dispatch:
     inputs:
-      # Keep legacy keys to prevent 422 from callers that still send them.
       space_url:
         description: Space or MP3 URL (legacy name)
         required: false
@@ -14,7 +13,6 @@ on:
         required: false
         type: string
         default: ""
-      # Preferred key; we normalize source_url > space_url in Resolve step.
       source_url:
         description: Space or MP3 URL (preferred)
         required: false
@@ -72,7 +70,6 @@ on:
             "keybert_diversity": "0.6"
           }
 
-  # Optional server-to-server entry point (no input-count limit)
   repository_dispatch:
     types: [space_worker]
 
@@ -225,9 +222,9 @@ jobs:
           [ -z "$SID" ] && SID="unknown"
           BASE="space-$(date +%m-%d-%Y)-${SID}"
           echo "SPACE_ID=${SID}" >> "$GITHUB_ENV"
-          echo "BASE=${BASE}"    >> "$GITHUB_ENV"
+          echo "BASE=${BASE}" >> "$GITHUB_ENV"
           echo "space_id=${SID}" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE}"    >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
 
       - name: GCP auth
         if: ${{ github.event.inputs.mode != 'replies_only' }}
@@ -253,7 +250,7 @@ jobs:
           OK=0; REASON="no_creds"
           [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
           [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
-          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
+          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
@@ -299,7 +296,7 @@ jobs:
           fi
 
       - name: Fallback download via yt-dlp (Space URL)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.SOURCE_KIND != 'mp3' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && env.SOURCE_URL != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.SOURCE_KIND != 'mp3' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && env.SOURCE_URL != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -312,7 +309,7 @@ jobs:
           echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
 
       - name: Use provided MP3 (transcript_only)
-        if: ${{ github.event.inputs.mode == 'transcript_only' && env.SOURCE_KIND == 'mp3' && env.SOURCE_URL != '' }}
+        if: ${{ github.event.inputs.mode == 'transcript_only' && env.SOURCE_KIND != 'mp3' && env.SOURCE_URL != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -321,7 +318,7 @@ jobs:
 
       - name: Detect lead silence seconds
         id: detect
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -333,7 +330,7 @@ jobs:
           echo "lead=${LEAD}" >> "$GITHUB_OUTPUT"
 
       - name: Trim head and tail (RF64-safe)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -345,7 +342,7 @@ jobs:
 
       - name: Probe audio format
         id: probe
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -356,7 +353,7 @@ jobs:
           echo "SRC_SR=${SR}" >> "$GITHUB_ENV"
 
       - name: Encode MP3 (profile)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.AUDIO_IN != '' }}
         shell: bash
         env:
           PROF: ${{ github.event.inputs.audio_profile != '' && github.event.inputs.audio_profile || 'radio' }}
@@ -412,7 +409,7 @@ jobs:
 
       - name: Upload MP3 (proxy link via media.chbmp.org)
         id: upload_mp3
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -423,11 +420,11 @@ jobs:
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "audio_raw=${RAW}" >> "$GITHUB_OUTPUT"
+          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Build VTT + transcript (from crawler captions if present)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') }}
         shell: bash
         env:
           CC_JSONL: ${{ env.CRAWLER_CC }}
@@ -435,8 +432,7 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
-              python3 ".github/workflows/scripts/gen_vtt.py"
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" python3 ".github/workflows/scripts/gen_vtt.py" || true
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
           else
@@ -444,7 +440,7 @@ jobs:
           fi
 
       - name: Polish transcript (light)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.TRANSCRIPT_PATH != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.TRANSCRIPT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -455,7 +451,7 @@ jobs:
 
       - name: VTT via Deepgram (fallback)
         id: deepgram
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && env.MP3_PATH != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -468,7 +464,7 @@ jobs:
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
       - name: Transcript from VTT (if no CC transcript)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' && env.TRANSCRIPT_PATH == '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH != '' && env.TRANSCRIPT_PATH == '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -478,7 +474,7 @@ jobs:
 
       - name: Upload VTT (proxy link via media.chbmp.org)
         id: upload_vtt
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -492,9 +488,9 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Build attendees HTML
+      - name: Build attendees HTML (if crawler metadata exists)
         id: attendees
-        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'attendees_only') && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
         env:
           CAND: ${{ steps.crawl.outputs.as_line }}
@@ -505,7 +501,7 @@ jobs:
           jq -r '
             def mkp:
               { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
-                name:   (.display_name       // .user_results?.result?.legacy?.name)
+                name: (.display_name // .user_results?.result?.legacy?.name)
               }
               | select(.handle!=null and .handle!="" )
               | . + { url: ("https://x.com/" + .handle) };
@@ -513,34 +509,32 @@ jobs:
             | ($a.metadata?.creator_results?.result?.legacy?) as $h
             | ($h.screen_name // empty) as $H
             | {
-                host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
-                cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
+                host: ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
+                cohosts: ( ($a.participants?.admins // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
                 speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
               }
           ' "${CAND}" > "$OUT_JSON" || true
           if [ -s "$OUT_JSON" ]; then
             jq -r '
-              def li: "<li><a href=\"" + (.url//"#") + "\" target=\"_blank\" rel=\"noopener\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def li: " <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
                 if (items|length) > 0
-                then "<li><strong>" + title + "</strong><ul>" + (items|map(li)|join("")) + "</ul></li>"
+                then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
                 else ""
                 end;
               . as $d
-              | "<ul>"
-              + section("Host"; $d.host)
+              | section("Host"; $d.host)
               + section( (if ($d.cohosts|length)==1 then "Co-host" else "Co-hosts" end); $d.cohosts)
               + section("Speakers"; $d.speakers)
-              + "</ul>"
             ' "$OUT_JSON" > "$OUT_HTML"
             if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
-              echo "ATTENDEES_OK=1"       >> "$GITHUB_ENV"
+              echo "ATTENDEES_OK=1" >> "$GITHUB_ENV"
             fi
           fi
 
       - name: Scrape replies & shared links
-        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'replies_only' && env.PURPLE_TWEET_URL != '' }}
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'replies_only') && env.PURPLE_TWEET_URL != '' }}
         shell: bash
         env:
           PURPLE_TWEET_URL: ${{ env.PURPLE_TWEET_URL }}
