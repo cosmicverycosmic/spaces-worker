@@ -1,59 +1,41 @@
-import sys
-import os
-import json
-from bs4 import BeautifulSoup
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, re, html, unicodedata
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: polish_transcript.py input_html [reactions_json] [output_html]")
-        sys.exit(1)
-    in_path = sys.argv[1]
-    reactions_path = sys.argv[2] if len(sys.argv) > 2 else ''
-    out_path = sys.argv[3] if len(sys.argv) > 3 else in_path.replace('.html', '_polished.html')
+ARTDIR = os.environ.get("ARTDIR",".")
+BASE   = os.environ.get("BASE","space")
+INP    = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+OUT    = os.path.join(ARTDIR, f"{BASE}_transcript_polished.html")
 
-    with open(in_path, 'r') as f:
-        soup = BeautifulSoup(f.read(), 'html.parser')
+if not os.path.isfile(INP) or os.path.getsize(INP)==0:
+    raise SystemExit(0)
 
-    # Light polish: trim extra spaces, no arbitrary word-to-emoji
-    for txt in soup.find_all(class_='txt'):
-        text = txt.text.strip()
-        txt.string = ' '.join(text.split())
+RAW = open(INP,"r",encoding="utf-8",errors="ignore").read()
 
-    # Integrate reactions if provided
-    if reactions_path and os.path.isfile(reactions_path):
-        with open(reactions_path, 'r') as rf:
-            reactions = json.load(rf)
-        # Assume reactions = [{"time": sec_float, "emoji": "😊", "count": int}, ...]
-        segs = soup.find_all(class_='ss3k-seg')
-        for r in reactions:
-            t = r.get('time', 0)
-            emoji = r.get('emoji', '')
-            count = r.get('count', 1)
-            if not emoji: continue
-            # Find closest seg where start <= t < end
-            closest = None
-            min_diff = float('inf')
-            for seg in segs:
-                start = float(seg.get('data-start', 0))
-                end = float(seg.get('data-end', float('inf')))
-                if start <= t < end:
-                    closest = seg
-                    break
-                diff = abs(start - t)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest = seg
-            if closest:
-                existing = closest.get('data-reactions', '[]')
-                try:
-                    reacts = json.loads(existing)
-                except json.JSONDecodeError:
-                    reacts = []
-                reacts.append({"emoji": emoji, "count": count})
-                closest['data-reactions'] = json.dumps(reacts)
+TEXT_NODE = re.compile(r'(<(?:div|span)\s+class="ss3k-text"[^>]*>)(.*?)(</(?:div|span)>)', re.S|re.I)
+ZW_RE  = re.compile(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F]")
+SPC_RE = re.compile(r"\s+")
+SPACE_BEFORE_PUNCT = re.compile(r"\s+([,.;:!?])")
+PUNCT_STICKY       = re.compile(r"([,;:])([^\s])")
 
-    with open(out_path, 'w') as f:
-        f.write(str(soup))
+def ascii_punct(s:str)->str:
+    s = unicodedata.normalize("NFC", s or "")
+    s = ZW_RE.sub("", s)
+    s = s.replace("\u2018","'").replace("\u2019","'")
+    s = s.replace("\u201C",'"').replace("\u201D",'"')
+    s = re.sub(r"\bi\b", "I", s)  # lone i → I (minimal)
+    s = SPACE_BEFORE_PUNCT.sub(r"\1", s)
+    s = PUNCT_STICKY.sub(r"\1 \2", s)
+    s = SPC_RE.sub(" ", s).strip()
+    return s
 
-if __name__ == "__main__":
-    main()
+def repl(m):
+    open_tag, txt, close_tag = m.group(1), m.group(2), m.group(3)
+    txt = ascii_punct(html.unescape(txt))
+    txt = txt.replace("<","&lt;").replace(">","&gt;")
+    return f"{open_tag}{txt}{close_tag}"
+
+POL = TEXT_NODE.sub(repl, RAW)
+POL = re.sub(r"\n{3,}", "\n\n", POL)
+
+open(OUT,"w",encoding="utf-8").write(POL)
