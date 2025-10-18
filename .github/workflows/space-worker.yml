@@ -1,34 +1,31 @@
 name: Space Worker
+
 on:
   workflow_dispatch:
     inputs:
       space_url:
-        description: Space or MP3 URL (legacy name)
-        required: false
-        type: string
-        default: ""
-      title:
-        description: Title hint (optional; WP may set final title)
-        required: false
-        type: string
-        default: ""
-      source_url:
-        description: Space or MP3 URL (preferred)
+        description: X or Twitter Space URL
         required: false
         type: string
         default: ""
       post_id:
-        description: WordPress post ID to patch (optional)
+        description: Existing WordPress post ID (optional)
         required: false
         type: string
         default: ""
       gcs_prefix:
-        description: GCS prefix
+        description: GCS prefix (default spaces/YYYY/MM)
         required: false
         type: string
         default: ""
       make_public:
-        description: Make uploaded objects public
+        description: Make uploaded artifacts public
+        required: false
+        type: choice
+        options: ["true","false"]
+        default: "true"
+      do_transcript:
+        description: Generate transcript when captions are not available
         required: false
         type: choice
         options: ["true","false"]
@@ -39,61 +36,55 @@ on:
         type: choice
         options: ["","transcript_only","attendees_only","replies_only"]
         default: ""
+      existing_mp3_url:
+        description: For transcript_only provide URL to existing MP3
+        required: false
+        type: string
+        default: ""
+      aggressive_denoise:
+        description: Use RNNoise arnndn denoiser
+        required: false
+        type: choice
+        options: ["false","true"]
+        default: "false"
       purple_tweet_url:
-        description: Purple-pill tweet URL (optional)
+        description: Purple pill tweet URL (optional)
         required: false
         type: string
         default: ""
       audio_profile:
-        description: Audio profile
+        description: Audio profile for encode (default 'radio')
         required: false
         type: choice
         options: ["transparent","radio","aggressive"]
         default: "radio"
-      opts_json:
-        description: Extra options as JSON (link labeling, fetch limits, etc.)
-        required: false
-        type: string
-        default: |
-          {
-            "aggressive_denoise": "false",
-            "link_label_ai": "keybert",
-            "link_label_model": "sentence-transformers/all-MiniLM-L6-v2",
-            "fetch_titles": "true",
-            "fetch_limit": "18",
-            "fetch_timeout_sec": "4",
-            "keybert_topn": "8",
-            "keybert_ngram_min": "1",
-            "keybert_ngram_max": "3",
-            "keybert_use_mmr": "true",
-            "keybert_diversity": "0.6"
-          }
-  repository_dispatch:
-    types: [space_worker]
+
 permissions:
   contents: read
   packages: read
+
 env:
-  WORKDIR: ${{ github.workspace }}/work
-  ARTDIR: ${{ github.workspace }}/out
-  # --- Google Cloud ---
-  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY || vars.GCP_SA_KEY }}
-  GCS_BUCKET: ${{ secrets.GCS_BUCKET || vars.GCS_BUCKET }}
-  # --- WordPress REST (App Password) ---
-  WP_BASE_URL: ${{ secrets.WP_BASE_URL || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
-  WP_USER: ${{ secrets.WP_USER || vars.WP_USER }}
-  WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD || vars.WP_APP_PASSWORD }}
-  # --- Transcription fallback (Deepgram) ---
+  GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
+  GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
+  WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
+  WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
+  WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
-  # --- X/Twitter auth (bearer and/or cookie) for crawler ---
-  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
-  TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN || vars.X_AUTH_TOKEN }}
-  TWITTER_CSRF_TOKEN: ${{ secrets.TWITTER_CSRF_TOKEN || secrets.X_CSRF || vars.TWITTER_CSRF_TOKEN || vars.X_CSRF }}
-  # (Optional) Old v1 API tokens, kept for compatibility in custom scripts
-  TW_API_CONSUMER_KEY: ${{ secrets.TW_API_CONSUMER_KEY || vars.TW_API_CONSUMER_KEY }}
-  TW_API_CONSUMER_SECRET: ${{ secrets.TW_API_CONSUMER_SECRET || vars.TW_API_CONSUMER_SECRET }}
-  TW_API_ACCESS_TOKEN: ${{ secrets.TW_API_ACCESS_TOKEN || vars.TW_API_ACCESS_TOKEN }}
+
+  # X/Twitter auth
+  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
+  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
+  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
+
+  # Legacy (compat)
+  TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
+  TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
+  TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
   TW_API_ACCESS_TOKEN_SECRET: ${{ secrets.TW_API_ACCESS_TOKEN_SECRET || vars.TW_API_ACCESS_TOKEN_SECRET }}
+
+  WORKDIR: ${{ github.workspace }}/work
+  ARTDIR:  ${{ github.workspace }}/out
+
 jobs:
   process:
     name: Process Space
@@ -102,9 +93,33 @@ jobs:
     concurrency:
       group: ${{ format('space-worker-{0}-{1}', github.ref, github.event.inputs.post_id != '' && github.event.inputs.post_id || github.run_id) }}
       cancel-in-progress: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Export basic inputs to env
+        shell: bash
+        run: |
+          echo "PURPLE_TWEET_URL=${{ github.event.inputs.purple_tweet_url }}" >> "$GITHUB_ENV"
+          echo "SOURCE_KIND=" >> "$GITHUB_ENV"
+          echo "SOURCE_URL="  >> "$GITHUB_ENV"
+
+      - name: Notify WP queued
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && github.event.inputs.mode != 'replies_only' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
+                       --arg status "queued" \
+                       --arg msg "Workflow received and queued" \
+                       --arg run "${{ github.run_id }}" \
+                       --argjson progress 1 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
       - name: Install deps
         shell: bash
         run: |
@@ -112,84 +127,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          python3 -m pip install --no-cache-dir yt-dlp requests beautifulsoup4 tldextract
-          python3 -m pip install --no-cache-dir keybert "sentence-transformers>=2.2.0"
-          # gcloud SDK for gsutil
+          python3 -m pip install --no-cache-dir yt-dlp tldextract
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
-      - name: Resolve inputs (supports repository_dispatch)
-        id: resolve
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs" ".github/workflows/scripts"
-          # From workflow_dispatch
-          SRC_URL="${{ github.event.inputs.source_url }}"
-          LEGACY_URL="${{ github.event.inputs.space_url }}"
-          TTL_HINT="${{ github.event.inputs.title }}"
-          GCS_PFX_RAW="${{ github.event.inputs.gcs_prefix }}"
-          PURPLE_URL="${{ github.event.inputs.purple_tweet_url }}"
-          OPTS='${{ github.event.inputs.opts_json }}'
-          SRC_KIND=""
-          # Prefer source_url over legacy space_url
-          if [ -z "$SRC_URL" ] && [ -n "$LEGACY_URL" ]; then SRC_URL="$LEGACY_URL"; fi
-          # Override from repository_dispatch if provided
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            J="$(cat "$GITHUB_EVENT_PATH")"
-            get() { jq -r "$1 // empty" <<<"$J"; }
-            SRC_URL="$(get '.client_payload.source_url' || echo "$SRC_URL")"
-            [ -z "$SRC_URL" ] && SRC_URL="$(get '.client_payload.space_url' || echo "$SRC_URL")"
-            SRC_KIND="$(get '.client_payload.source_kind' || echo "$SRC_KIND")"
-            TTL_HINT="$(get '.client_payload.title' || echo "$TTL_HINT")"
-            PURPLE_URL="$(get '.client_payload.purple_tweet_url' || echo "$PURPLE_URL")"
-            GCS_PFX_RAW="$(get '.client_payload.gcs_prefix' || echo "$GCS_PFX_RAW")"
-            OPTS="$(get '.client_payload.opts_json' || echo "$OPTS")"
-          fi
-          # Prefix: default spaces/YYYY/MM; keep proxy path in sync
-          PFX="$(echo "${GCS_PFX_RAW}" | sed -E 's#^/*##; s#/*$##')"
-          if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
-          echo "PREFIX=$PFX" >> "$GITHUB_ENV"
-          echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
-          # Auto-detect kind if not explicitly provided via repository_dispatch
-          if [ -z "$SRC_KIND" ] || [ "$SRC_KIND" = "auto" ]; then
-            if echo "$SRC_URL" | grep -qi '/i/spaces/'; then SRC_KIND="space"
-            elif echo "$SRC_URL" | grep -qiE '\.mp3($|\?)'; then SRC_KIND="mp3"
-            else SRC_KIND=""
-            fi
-          fi
-          echo "SOURCE_URL=$SRC_URL" >> "$GITHUB_ENV"
-          echo "SOURCE_KIND=$SRC_KIND" >> "$GITHUB_ENV"
-          echo "TITLE_HINT=$TTL_HINT" >> "$GITHUB_ENV"
-          echo "PURPLE_TWEET_URL=$PURPLE_URL" >> "$GITHUB_ENV"
-          # Options JSON
-          OPTS="${OPTS:-{}}"
-          echo "$OPTS" > "$WORKDIR/opts.json"
-          jq -e . "$WORKDIR/opts.json" >/dev/null 2>&1 || echo '{}' > "$WORKDIR/opts.json"
-          AGG="$(jq -r '.aggressive_denoise // "false"' "$WORKDIR/opts.json")"
-          echo "AGGRESSIVE_DENOISE=$AGG" >> "$GITHUB_ENV"
-          echo "LINK_LABEL_AI=$(jq -r '.link_label_ai // "keybert"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "LINK_LABEL_MODEL=$(jq -r '.link_label_model // "sentence-transformers/all-MiniLM-L6-v2"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "LINK_LABEL_FETCH_TITLES=$(jq -r '.fetch_titles // "true"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "LINK_LABEL_FETCH_LIMIT=$(jq -r '.fetch_limit // "18"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "LINK_LABEL_TIMEOUT_SEC=$(jq -r '.fetch_timeout_sec // "4"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "KEYBERT_TOPN=$(jq -r '.keybert_topn // "8"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "KEYBERT_NGRAM_MIN=$(jq-r '.keybert_ngram_min // "1"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "KEYBERT_NGRAM_MAX=$(jq -r '.keybert_ngram_max // "3"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "KEYBERT_USE_MMR=$(jq -r '.keybert_use_mmr // "true"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-          echo "KEYBERT_DIVERSITY=$(jq -r '.keybert_diversity // "0.6"' "$WORKDIR/opts.json")" >> "$GITHUB_ENV"
-      - name: Validate config
+
+      - name: Validate config and prefixes
+        id: cfg
         shell: bash
         run: |
           set -euxo pipefail
           test -n "${GCP_SA_KEY}" || { echo "GCP_SA_KEY missing"; exit 1; }
           test -n "${GCS_BUCKET}" || { echo "GCS_BUCKET missing"; exit 1; }
+          mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs" ".github/workflows/scripts"
+          PFX="$(echo "${{ github.event.inputs.gcs_prefix }}" | sed -E 's#^/*##; s#/*$##')"
+          if [ -z "$PFX" ]; then PFX="spaces/$(date +%Y)/$(date +%m)"; fi
+          echo "PREFIX=$PFX"                  >> "$GITHUB_ENV"
+          echo "BUCKET_PREFIX=${PFX#spaces/}" >> "$GITHUB_ENV"
+
       - name: Derive Space ID and base
         id: ids
         shell: bash
         env:
-          URL: ${{ env.SOURCE_URL }}
+          URL: ${{ github.event.inputs.space_url }}
         run: |
           set -euxo pipefail
           SID=""
@@ -199,9 +160,10 @@ jobs:
           [ -z "$SID" ] && SID="unknown"
           BASE="space-$(date +%m-%d-%Y)-${SID}"
           echo "SPACE_ID=${SID}" >> "$GITHUB_ENV"
-          echo "BASE=${BASE}" >> "$GITHUB_ENV"
+          echo "BASE=${BASE}"    >> "$GITHUB_ENV"
           echo "space_id=${SID}" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}"    >> "$GITHUB_OUTPUT"
+
       - name: GCP auth
         if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
@@ -209,9 +171,10 @@ jobs:
           set -euxo pipefail
           printf '%s' "${GCP_SA_KEY}" > "${HOME}/gcp-key.json"
           gcloud auth activate-service-account --key-file="${HOME}/gcp-key.json" >/dev/null
-      - name: X preflight (Space only)
+
+      - name: X preflight auth
         id: x_preflight
-        if: ${{ github.event.inputs.mode != 'replies_only' && env.SOURCE_KIND != 'mp3' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -225,12 +188,13 @@ jobs:
           OK=0; REASON="no_creds"
           [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
           [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
-          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
+          echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
-      - name: Run twspace-crawler
+
+      - name: Run crawler
         id: crawl
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only' || github.event.inputs.mode == 'attendees_only') && env.SOURCE_KIND != 'mp3' && steps.x_preflight.outputs.ok == '1' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.x_preflight.outputs.ok == '1' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -251,10 +215,13 @@ jobs:
             --id "${SID}" --force > >(tee -a "$LOG_STD") 2> >(tee -a "$LOG_ERR" >&2)
           RC=$?
           set -e
+          echo "crawler_exit=${RC}"
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
+            echo "SOURCE_KIND=crawler" >> "$GITHUB_ENV"
+            echo "SOURCE_URL=${{ github.event.inputs.space_url }}" >> "$GITHUB_ENV"
           fi
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
@@ -268,28 +235,35 @@ jobs:
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
-      - name: Fallback download via yt-dlp (Space URL)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.SOURCE_KIND != 'mp3' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && env.SOURCE_URL != '' }}
+
+      - name: Fallback download via yt-dlp
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && (steps.crawl.outputs.audio_file == '' || steps.crawl.outcome != 'success') && github.event.inputs.existing_mp3_url == '' && github.event.inputs.space_url != '' }}
         shell: bash
         working-directory: ${{ env.WORKDIR }}
         env:
-          URL: ${{ env.SOURCE_URL }}
+          URL: ${{ github.event.inputs.space_url }}
         run: |
           set -euxo pipefail
           yt-dlp -o "%(title)s.%(ext)s" -f "bestaudio/best" "$URL"
           IN="$(ls -S | head -n1 || true)"
           test -f "$IN" || { echo "No file downloaded"; exit 1; }
           echo "INPUT_FILE=$PWD/$IN" >> "$GITHUB_ENV"
-      - name: Use provided MP3 (transcript_only)
-        if: ${{ github.event.inputs.mode == 'transcript_only' && env.SOURCE_KIND == 'mp3' && env.SOURCE_URL != '' }}
+          echo "SOURCE_KIND=yt-dlp"  >> "$GITHUB_ENV"
+          echo "SOURCE_URL=${URL}"   >> "$GITHUB_ENV"
+
+      - name: Use provided MP3 for transcript_only
+        if: ${{ github.event.inputs.mode == 'transcript_only' && github.event.inputs.existing_mp3_url != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          curl -L "${SOURCE_URL}" -o "${ARTDIR}/${BASE}.mp3"
+          curl -L "${{ github.event.inputs.existing_mp3_url }}" -o "${ARTDIR}/${BASE}.mp3"
           echo "INPUT_FILE=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
+          echo "SOURCE_KIND=existing_mp3"         >> "$GITHUB_ENV"
+          echo "SOURCE_URL=${{ github.event.inputs.existing_mp3_url }}" >> "$GITHUB_ENV"
+
       - name: Detect lead silence seconds
         id: detect
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.INPUT_FILE != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -298,9 +272,10 @@ jobs:
           LEAD="$(awk '/silence_end/ {print $5; exit}' "$LOG" || true)"
           case "$LEAD" in ''|*[^0-9.]* ) LEAD="0.0" ;; esac
           echo "TRIM_LEAD=${LEAD}" >> "$GITHUB_ENV"
-          echo "lead=${LEAD}" >> "$GITHUB_OUTPUT"
+          echo "lead=${LEAD}"       >> "$GITHUB_OUTPUT"
+
       - name: Trim head and tail (RF64-safe)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.INPUT_FILE != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.INPUT_FILE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -309,9 +284,10 @@ jobs:
             -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
             -rf64 always -c:a pcm_s16le "$TRIM_WAV"
           echo "AUDIO_IN=${TRIM_WAV}" >> "$GITHUB_ENV"
+
       - name: Probe audio format
         id: probe
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.AUDIO_IN != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -320,8 +296,9 @@ jobs:
           SR=$(echo "$J" | jq -r '.streams[0].sample_rate // "48000"')
           echo "SRC_CH=${CH}" >> "$GITHUB_ENV"
           echo "SRC_SR=${SR}" >> "$GITHUB_ENV"
-      - name: Encode MP3 (profile)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.AUDIO_IN != '' }}
+
+      - name: Encode MP3 with selected profile
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.AUDIO_IN != '' }}
         shell: bash
         env:
           PROF: ${{ github.event.inputs.audio_profile != '' && github.event.inputs.audio_profile || 'radio' }}
@@ -338,7 +315,7 @@ jobs:
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
             awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
             if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-              I=$(jq -r '.input_i // "-16"' "$PASS1_JSON")
+              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
               TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
               LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
               TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
@@ -352,7 +329,7 @@ jobs:
             fi
           else
             PRE="highpass=f=70,lowpass=f=11500,afftdn=nr=8:nf=-25,deesser=i=0.2,acompressor=threshold=-18dB:ratio=2.8:attack=8:release=200:makeup=3"
-            if [ "${AGGRESSIVE_DENOISE}" = "true" ]; then
+            if [ "${{ github.event.inputs.aggressive_denoise }}" = "true" ]; then
               M="${WORKDIR}/rnnoise.rnnn"
               curl -fsSL -o "$M" https://raw.githubusercontent.com/GregorR/rnnoise-models/master/heavyrnnoise.rnnn || true
               if [ -s "$M" ]; then PRE="arnndn=m=${M},${PRE}"; fi
@@ -361,7 +338,7 @@ jobs:
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
             awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
             if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-              I=$(jq -r '.input_i // "-16"' "$PASS1_JSON")
+              I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
               TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
               LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
               TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
@@ -374,9 +351,10 @@ jobs:
             fi
           fi
           echo "MP3_PATH=${OUT}" >> "$GITHUB_ENV"
-      - name: Upload MP3 (proxy link via media.chbmp.org)
+
+      - name: Upload MP3 to GCS
         id: upload_mp3
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.MP3_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -387,10 +365,585 @@ jobs:
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "audio_raw=${RAW}" >> "$GITHUB_OUTPUT"
+          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
-      - name: Build VTT + transcript (from crawler captions if present)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') }}
+
+      - name: Write helper scripts (gen_vtt, polish, replies)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ".github/workflows/scripts"
+
+          # -------- gen_vtt.py --------
+          cat > ".github/workflows/scripts/gen_vtt.py" << 'PY'
+          #!/usr/bin/env python3
+          import json, os, re, html, sys
+          from datetime import datetime, timezone
+
+          artdir = os.environ.get("ARTDIR") or ""
+          base   = os.environ.get("BASE") or ""
+          src    = os.environ.get("CC_JSONL") or ""
+          shift  = float(os.environ.get("SHIFT_SECS") or "0")
+
+          if not (artdir and base and src and os.path.isfile(src)):
+              os.makedirs(artdir, exist_ok=True)
+              open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
+              open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
+              open(os.path.join(artdir,f"{base}_reactions.json"),"w",encoding="utf-8").write("[]")
+              open(os.path.join(artdir,f"{base}.start.txt"),"w",encoding="utf-8").write("")
+              sys.exit(0)
+
+          EMOJI_RE = re.compile("[" +
+              "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
+              "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
+              "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+          ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
+
+          def is_emoji_only(s: str) -> bool:
+              if not s or not s.strip(): return False
+              t = ONLY_PUNCT_SPACE.sub("", s)
+              t = EMOJI_RE.sub("", t)
+              return len(t.strip()) == 0
+
+          def parse_time_iso(s):
+              if not s: return None
+              s=s.strip()
+              try:
+                  if s.endswith('Z'): s=s[:-1]+'+00:00'
+                  if re.search(r'[+-]\d{4}$', s):
+                      s=s[:-5]+s[-5:-2]+':'+s[-2:]
+                  dt=datetime.fromisoformat(s)
+                  if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+                  return dt.timestamp()
+              except: return None
+
+          def to_float_seconds(x):
+              try:
+                  if x is None: return None
+                  f=float(x)
+                  return f/1000.0 if f>4_000_000 else f
+              except: return None
+
+          def first(*vals):
+              for v in vals:
+                  if v not in (None,""): return v
+              return None
+
+          def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+          REL_KEYS  = ("offset","startSec","startMs","start")
+          ABS_KEYS  = ("timestamp","programDateTime","ts")
+
+          raw_items=[]
+          reactions=[]
+          abs_candidates=[]
+
+          with open(src,'r',encoding='utf-8',errors='ignore') as f:
+              for line in f:
+                  line=line.strip()
+                  if not line: continue
+                  try:
+                      obj=json.loads(line)
+                  except:
+                      continue
+
+                  layer=None; sender={}
+                  if isinstance(obj,dict) and isinstance(obj.get("payload"),str):
+                      try:
+                          pl=json.loads(obj["payload"])
+                          if isinstance(pl,dict) and isinstance(pl.get("body"),str):
+                              try:
+                                  layer=json.loads(pl["body"])
+                                  sender=pl.get("sender") or {}
+                              except: layer=None
+                      except: pass
+                  else:
+                      layer=obj
+
+                  def push_item(rel_ts, abs_ts, txt, disp, uname, avatar):
+                      if not txt: return
+                      if is_emoji_only(txt):
+                          if abs_ts is not None or rel_ts is not None:
+                              reactions.append({
+                                  "t_abs": abs_ts,
+                                  "t_rel": rel_ts,
+                                  "emoji": txt,
+                                  "name":  (disp or uname or "") or "",
+                                  "handle": (uname or "").lstrip("@"),
+                                  "avatar": avatar or ""
+                              })
+                          return
+                      raw_items.append({
+                          "rel": rel_ts, "abs": abs_ts,
+                          "text": txt,
+                          "name": (disp or uname or "Speaker"),
+                          "username": (uname or "").lstrip("@"),
+                          "avatar": avatar or ""
+                      })
+                      if abs_ts is not None:
+                          abs_candidates.append(abs_ts)
+
+                  def pick_rel_abs(d):
+                      rel=None
+                      for k in REL_KEYS:
+                          if k in d and d[k] not in (None,""):
+                              rel = to_float_seconds(d[k])
+                              if rel is not None: break
+                      abs_ts=None
+                      for k in ABS_KEYS:
+                          if k in d and d[k] not in (None,""):
+                              if k=="programDateTime":
+                                  abs_ts = parse_time_iso(d[k]); 
+                              else:
+                                  abs_ts = to_float_seconds(d[k])
+                              if abs_ts is not None: break
+                      return rel, abs_ts
+
+                  candidates=[]
+                  if isinstance(layer,dict) and layer:
+                      d=layer
+                      txt = first(d.get("body"), d.get("text"), d.get("caption"))
+                      disp=first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
+                                 (sender or {}).get("display_name"))
+                      uname=first(d.get("username"), d.get("user_id"), (sender or {}).get("screen_name"))
+                      avat=first((sender or {}).get("profile_image_url_https"),
+                                 (sender or {}).get("profile_image_url"))
+                      rel,abs_ts = pick_rel_abs(d)
+                      if txt:
+                          candidates.append((rel,abs_ts,txt,disp,uname,avat,None))
+
+                  if isinstance(obj,dict):
+                      txt = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"))
+                      disp=first(obj.get("displayName"), obj.get("speaker"), obj.get("user"), obj.get("name"))
+                      uname=first(obj.get("username"), obj.get("handle"), obj.get("screen_name"))
+                      avat=first(obj.get("profile_image_url_https"), obj.get("profile_image_url"))
+                      rel,abs_ts = pick_rel_abs(obj)
+                      if txt:
+                          candidates.append((rel,abs_ts,txt,disp,uname,avat,None))
+
+                  for (rel,abs_ts,txt,disp,uname,avat,_) in candidates:
+                      if not re.search(r"[A-Za-z0-9]", txt) and not is_emoji_only(txt):
+                          continue
+                      push_item(rel,abs_ts,txt,disp,uname,avat)
+
+          if not raw_items:
+              os.makedirs(artdir, exist_ok=True)
+              open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
+              open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
+              open(os.path.join(artdir,f"{base}_reactions.json"),"w",encoding="utf-8").write("[]")
+              open(os.path.join(artdir,f"{base}.start.txt"),"w",encoding="utf-8").write("")
+              sys.exit(0)
+
+          abs0 = min(abs_candidates) if abs_candidates else None
+          norm=[]
+          for it in raw_items:
+              if it["rel"] is not None:
+                  t = it["rel"]
+              elif it["abs"] is not None and abs0 is not None:
+                  t = it["abs"] - abs0
+              else:
+                  t = 0.0
+              t = max(0.0, t - shift)
+              norm.append({ **it, "t": float(t) })
+
+          norm.sort(key=lambda x: x["t"])
+          EPS=0.0005
+          last=-1e9
+          for u in norm:
+              if u["t"] <= last: u["t"] = last + EPS
+              last = u["t"]
+
+          def fmt_ts(t):
+              if t<0: t=0.0
+              h=int(t//3600); m=int((t%3600)//60); s=t%60
+              return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+          MERGE_GAP=3.0
+          groups=[]; cur=None
+          for u in norm:
+              if cur and u["username"]==cur["username"] and u["name"]==cur["name"] and (u["t"]-cur["end"])<=MERGE_GAP:
+                  sep = "" if re.search(r'[.!?]"?$', cur["text"]) else " "
+                  cur["text"]=(cur["text"]+sep+u["text"]).strip()
+                  cur["end"]=max(cur["end"], u["t"]+0.8)
+              else:
+                  cur={"name":u["name"],"username":u["username"],"avatar":u["avatar"],
+                       "start":u["t"],"end":u["t"]+0.8,"text":u["text"]}
+                  groups.append(cur)
+
+          MIN_DUR=0.80; MAX_DUR=10.0; GUARD=0.020
+          for i,g in enumerate(groups):
+              if i+1<len(groups):
+                  nxt=groups[i+1]["start"]
+                  dur=max(MIN_DUR, min(MAX_DUR, (nxt-g["start"])-GUARD))
+                  g["end"]=g["start"]+dur
+              else:
+                  words=max(1, len(g["text"].split()))
+                  dur=max(MIN_DUR, min(MAX_DUR, 0.33*words+0.7))
+                  g["end"]=g["start"]+dur
+
+          os.makedirs(artdir, exist_ok=True)
+          with open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8") as vf:
+              vf.write("WEBVTT\n\n")
+              for i,g in enumerate(groups,1):
+                  vf.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n")
+                  vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
+
+          css='''
+          <style>
+          .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+            max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px}
+          .ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
+          .ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
+          .ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e5e7eb}
+          .ss3k-meta{font-size:12px;color:#64748b;margin-bottom:2px}
+          .ss3k-name a{color:#0f172a;text-decoration:none}
+          .ss3k-text{white-space:pre-wrap;word-break:break-word;cursor:pointer}
+          </style>
+          '''
+          js='''
+          <script>
+          (function(){
+            function time(s){return parseFloat(s||'0')||0}
+            function within(t,seg){return t>=time(seg.dataset.start) && t<time(seg.dataset.end)}
+            function bind(){
+              var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
+              var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
+              var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg'));
+              function tick(){
+                var t=audio.currentTime||0, found=null;
+                for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
+                segs.forEach(function(s){ s.classList.toggle('active', s===found); });
+                if(found){
+                  var top = found.offsetTop - cont.offsetTop;
+                  if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
+                }
+              }
+              audio.addEventListener('timeupdate', tick);
+              audio.addEventListener('seeked', tick);
+              segs.forEach(function(s){
+                s.addEventListener('click', function(){
+                  audio.currentTime = time(s.dataset.start)+0.05; audio.play && audio.play().catch(function(){});
+                });
+              });
+              tick();
+            }
+            if(document.readyState!=="loading") bind(); else document.addEventListener('DOMContentLoaded', bind);
+          })();
+          </script>
+          '''
+          with open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8") as tf:
+              tf.write(css); tf.write('<div class="ss3k-transcript">\\n')
+              for i,g in enumerate(groups,1):
+                  uname=(g["username"] or "").lstrip("@")
+                  prof=f"https://x.com/{html.escape(uname, True)}" if uname else ""
+                  avatar=g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
+                  if avatar and prof:
+                      avtag=f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
+                  elif avatar:
+                      avtag=f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
+                  else:
+                      avtag='<div class="ss3k-avatar" aria-hidden="true"></div>'
+                  name_html = f'<span class="ss3k-name"><strong>{html.escape(g["name"], True)}</strong></span>'
+                  if prof:
+                      name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(g["name"], True)}</strong></a></span>'
+                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start"]:.3f}" data-end="{g["end"]:.3f}"')
+                  if uname: tf.write(f' data-handle="@{html.escape(uname, True)}"')
+                  tf.write('>')
+                  tf.write(avtag)
+                  tf.write('<div class="ss3k-body">')
+                  tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start"])}</time>–<time>{fmt_ts(g["end"])}</time></div>')
+                  tf.write(f'<div class="ss3k-text">{html.escape(g["text"], True)}</div>')
+                  tf.write('</div></div>\\n')
+              tf.write('</div>\\n'); tf.write(js)
+
+          rx=[]
+          if reactions:
+              for r in reactions:
+                  if r["t_rel"] is not None:
+                      t=r["t_rel"]
+                  elif r["t_abs"] is not None and abs0 is not None:
+                      t=r["t_abs"]-abs0
+                  else:
+                      continue
+                  t=max(0.0, t - shift)
+                  rx.append({
+                      "t": round(t,3),
+                      "emoji": r["emoji"],
+                      "name": r["name"],
+                      "handle": r["handle"],
+                      "avatar": r["avatar"]
+                  })
+          with open(os.path.join(artdir,f"{base}_reactions.json"),"w",encoding="utf-8") as rf:
+              json.dump(rx, rf, ensure_ascii=False)
+
+          start_iso=""
+          if abs_candidates:
+              start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          with open(os.path.join(artdir,f"{base}.start.txt"),"w",encoding="utf-8") as sf:
+              sf.write((start_iso or "") + "\\n")
+          PY
+          chmod +x ".github/workflows/scripts/gen_vtt.py"
+
+          # -------- polish_transcript.py --------
+          cat > ".github/workflows/scripts/polish_transcript.py" << 'PY'
+          #!/usr/bin/env python3
+          # Polishes the HTML transcript ONLY (preserves speakers/timestamps).
+          import os, re, html
+          ARTDIR = os.environ.get("ARTDIR",".")
+          BASE   = os.environ.get("BASE","space")
+          INP    = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+          OUT    = os.path.join(ARTDIR, f"{BASE}_transcript_polished.html")
+          if not os.path.exists(INP) or os.path.getsize(INP) == 0: raise SystemExit(0)
+          raw_html = open(INP, "r", encoding="utf-8", errors="ignore").read()
+          TEXT_NODE = re.compile(r'(<(?:div|span)\s+class="ss3k-text"[^>]*>)(.*?)(</(?:div|span)>)', re.S | re.I)
+          EMOJI_RE = re.compile("[" + "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" + "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" + "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+          ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
+          def is_emoji_only(s:str)->bool:
+              if not s.strip(): return False
+              t = ONLY_PUNCT_SPACE.sub("", s); t = EMOJI_RE.sub("", t); return len(t.strip())==0
+          def clean_text(t:str)->str:
+            if is_emoji_only(t): return ""
+            t=t.replace("ɱ 2e","’re").replace("ɱ 2","m ").replace(" 2e","’re").replace(" 2 "," to ")
+            t = re.sub(r"\s+", " ", t).strip()
+            t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+            t = re.sub(r"([,;:])([^ \n])", r"\1 \2", t)
+            t = re.sub(r"\bi\b", "I", t)
+            return t
+          spans=[]; 
+          def _collect(m): spans.append(m.group(2)); return m.group(0)
+          TEXT_NODE.sub(_collect, raw_html)
+          cleaned=[clean_text(t) for t in spans]
+          it=iter(cleaned)
+          def _replace(m):
+              open_tag, old_text, close_tag=m.group(1), m.group(2), m.group(3)
+              try: new_text=next(it)
+              except StopIteration: new_text=old_text
+              return f"{open_tag}{html.escape(new_text, True)}{close_tag}"
+          polished_html=TEXT_NODE.sub(_replace, raw_html)
+          polished_html=re.sub(r"\n{3,}", "\n\n", polished_html)
+          open(OUT,"w",encoding="utf-8").write(polished_html)
+          PY
+          chmod +x ".github/workflows/scripts/polish_transcript.py"
+
+          # -------- replies.py (improved) --------
+          cat > ".github/workflows/scripts/replies.py" << 'PY'
+          #!/usr/bin/env python3
+          import os, re, sys, json, html, time
+          from collections import defaultdict
+          try:
+              import tldextract
+          except Exception:
+              tldextract = None
+
+          ARTDIR = os.environ.get("ARTDIR",".")
+          BASE   = os.environ.get("BASE","space")
+          PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
+
+          REPLIES_OUT = os.path.join(ARTDIR, f"{BASE}_replies.html")
+          LINKS_OUT   = os.path.join(ARTDIR, f"{BASE}_links.html")
+
+          def write_empty():
+              os.makedirs(ARTDIR, exist_ok=True)
+              open(REPLIES_OUT,"w",encoding="utf-8").write("")
+              open(LINKS_OUT,"w",encoding="utf-8").write("")
+
+          def esc(x): return html.escape(x or "")
+
+          def http_json(url, method="GET", headers=None, data=None, timeout=30):
+              import urllib.request
+              req = urllib.request.Request(url=url, method=method)
+              if headers:
+                  for k, v in headers.items(): req.add_header(k, v)
+              body = data.encode("utf-8") if isinstance(data, str) else data
+              try:
+                  with urllib.request.urlopen(req, data=body, timeout=timeout) as r:
+                      txt = r.read().decode("utf-8", "ignore")
+                      return json.loads(txt)
+              except Exception:
+                  return None
+
+          def get_guest_token(bearer):
+              if not bearer: return None
+              headers = {"authorization": bearer, "content-type": "application/json", "user-agent": "Mozilla/5.0"}
+              d = http_json("https://api.twitter.com/1.1/guest/activate.json", method="POST", headers=headers, data="{}")
+              return (d or {}).get("guest_token")
+
+          def fetch_conversation(tid_str):
+              bearer = (os.environ.get("TWITTER_AUTHORIZATION","") or "").strip()
+              at     = (os.environ.get("TWITTER_AUTH_TOKEN","") or "").strip()
+              ct0    = (os.environ.get("TWITTER_CSRF_TOKEN","") or "").strip()
+              headers = {"user-agent":"Mozilla/5.0","accept":"application/json, text/plain, */*"}
+              if at and ct0:
+                  if bearer: headers["authorization"]=bearer
+                  headers["x-csrf-token"]=ct0
+                  headers["cookie"]=f"auth_token={at}; ct0={ct0}"
+              elif bearer:
+                  gt = get_guest_token(bearer)
+                  if not gt: return None
+                  headers["authorization"]=bearer
+                  headers["x-guest-token"]=gt
+              else:
+                  return None
+              url=f"https://api.twitter.com/2/timeline/conversation/{tid_str}.json?tweet_mode=extended&include_ext_alt_text=true"
+              data=http_json(url, headers=headers)
+              if not data: return None
+              tweets=(data.get("globalObjects", {}) or {}).get("tweets", {}) or {}
+              users =(data.get("globalObjects", {}) or {}).get("users", {}) or {}
+              return (tweets, users) if tweets else None
+
+          HTTP_RE = re.compile(r"(https?://[^\s<>'\")]+)")
+          MENTION_RE = re.compile(r"(?<!\w)@([A-Za-z0-9_]{1,15})")
+          HASH_RE = re.compile(r"(?<!\w)#([A-Za-z0-9_]{2,60})")
+
+          def expand_text_with_entities(text, entities):
+              text=text or ""; entities=entities or {}
+              for u in sorted(entities.get("urls") or [], key=lambda x: len(x.get("url","")), reverse=True):
+                  short=u.get("url") or ""; expanded=u.get("expanded_url") or u.get("unwound_url") or short
+                  if short and expanded and short in text: text=text.replace(short, expanded)
+              out=esc(text)
+              out=HTTP_RE.sub(lambda m: f'<a href="{esc(m.group(1))}" target="_blank" rel="noopener">{esc(m.group(1))}</a>', out)
+              out=MENTION_RE.sub(lambda m: f'<a href="https://x.com/{esc(m.group(1))}" target="_blank" rel="noopener">@{esc(m.group(1))}</a>', out)
+              out=HASH_RE.sub(lambda m: f'<a href="https://x.com/hashtag/{esc(m.group(1))}" target="_blank" rel="noopener">#{esc(m.group(1))}</a>', out)
+              return out.replace("\r\n","\n").replace("\r","\n").replace("\n","<br>")
+
+          def add_link(bucket, url):
+              if not url or not url.startswith("http"): return
+              dom=url
+              if tldextract:
+                  try:
+                      ext=tldextract.extract(url); dom=".".join([p for p in [ext.domain, ext.suffix] if p])
+                  except Exception: pass
+              bucket[dom].add(url)
+
+          def pretty_link_title(url):
+              try:
+                  m=re.match(r"https?://([^/]+)(/[^?#]*)?", url); host=m.group(1) if m else ""; path=(m.group(2) or "/").strip("/")
+                  h=host.lower()
+                  if "youtube." in h or "youtu.be" in h: return "YouTube"
+                  if "substack" in h: return "Substack"
+                  if "x.com" in h or "twitter.com" in h: return "Tweet"
+                  if "chbmp" in h: return "CHBMP"
+                  if "who.int" in h: return "WHO"
+                  if "pubmed" in h or "nih.gov" in h: return "PubMed"
+                  if "github.com" in h: return "GitHub"
+                  parts=[p for p in re.split(r"[-_/]+", path) if p and len(p)>2][:3]
+                  parts=[re.sub(r"[^A-Za-z0-9]+","",p).title() for p in parts][:3]
+                  if parts: return " ".join(parts[:3])
+                  brand = host.split("."); brand = brand[-2] if len(brand)>1 else brand[0]
+                  return brand.title()
+              except Exception:
+                  return "Link"
+
+          def parse_time(ts):
+              try: return time.mktime(time.strptime(ts, "%a %b %d %H:%M:%S %z %Y"))
+              except Exception: return 0.0
+
+          def collect_links_from_tweet(tw, links_by_domain):
+              ent=tw.get("entities") or {}
+              for u in (ent.get("urls") or []):
+                  add_link(links_by_domain, u.get("expanded_url") or u.get("unwound_url") or u.get("url"))
+              ext_ent=tw.get("extended_entities") or {}
+              for m in (ext_ent.get("media") or []):
+                  add_link(links_by_domain, m.get("expanded_url") or m.get("media_url_https") or m.get("media_url"))
+              q=tw.get("quoted_status_permalink") or {}
+              add_link(links_by_domain, q.get("expanded") or q.get("url"))
+
+          def build_tree(tweets, users, root_id):
+              nodes={}; children=defaultdict(list); links_by_domain=defaultdict(set)
+              for tid, tw in tweets.items():
+                  conv=str(tw.get("conversation_id_str") or tw.get("conversation_id") or "")
+                  if conv == root_id: nodes[tid]=tw
+              if root_id in tweets and root_id not in nodes: nodes[root_id]=tweets[root_id]
+              for tid, tw in nodes.items(): collect_links_from_tweet(tw, links_by_domain)
+              for tid, tw in nodes.items():
+                  parent = tw.get("in_reply_to_status_id_str") or ""
+                  cur=parent; attached=False
+                  while cur:
+                      if cur in nodes:
+                          children[cur].append(tid); attached=True; break
+                      nxt=tweets.get(cur, {}); cur=nxt.get("in_reply_to_status_id_str") or ""
+                  if not attached and tid != root_id: children[root_id].append(tid)
+              for p in list(children.keys()):
+                  children[p].sort(key=lambda k: parse_time(nodes[k].get("created_at","")))
+              return nodes, children, links_by_domain
+
+          CSS = """
+          <style>
+          .ss3k-reply{display:flex;gap:10px;padding:10px 8px;border-bottom:1px solid #eee}
+          .ss3k-ravatar{width:32px;height:32px;border-radius:50%}
+          .ss3k-rname{font:600 14px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Arial}
+          .ss3k-rhandle,.ss3k-rtime{font:12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#64748b;text-decoration:none}
+          .ss3k-rcontent{flex:1}
+          .ss3k-rtext{margin-top:4px;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial}
+          details.ss3k-thread{margin:6px 0 8px 42px}
+          details.ss3k-thread > summary{cursor:pointer;color:#2563eb}
+          .ss3k-links h4{margin:14px 0 6px 0;font:600 14px/1.2 system-ui}
+          .ss3k-links ul{margin:0 0 10px 16px;padding:0}
+          .ss3k-links li{margin:2px 0}
+          </style>
+          """.strip()
+
+          def render_thread(nodes, children, users, root_id):
+              def expanded_text(tw): return expand_text_with_entities(tw.get("full_text") or tw.get("text") or "", tw.get("entities") or {})
+              def render_item(tid, depth=0):
+                  t = nodes[tid]; uid=str(t.get("user_id_str") or ""); u=users.get(uid, {})
+                  name=u.get("name") or "User"; handle=u.get("screen_name") or ""
+                  avatar=(u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
+                  text_html=expanded_text(t); url=f"https://x.com/{handle}/status/{tid}"
+                  ts=t.get("created_at","")
+                  try: ts_short=time.strftime("%Y-%m-%d %H:%M:%SZ", time.strptime(ts, "%a %b %d %H:%M:%S %z %Y"))
+                  except Exception: ts_short=ts
+                  kids=children.get(tid, [])
+                  head=(f'<div class="ss3k-reply" style="margin-left:{depth*16}px">'
+                        f'  <a href="https://x.com/{esc(handle)}" target="_blank" rel="noopener">'
+                        f'    <img class="ss3k-ravatar" src="{esc(avatar)}" alt=""></a>'
+                        f'  <div class="ss3k-rcontent">'
+                        f'    <div class="ss3k-rname">'
+                        f'      <a href="https://x.com/{esc(handle)}" target="_blank" rel="noopener">{esc(name)}</a>'
+                        f'      <span class="ss3k-rhandle">@{esc(handle)}</span>'
+                        f'      · <a class="ss3k-rtime" href="{esc(url)}" target="_blank" rel="noopener">{esc(ts_short)}</a>'
+                        f'    </div>'
+                        f'    <div class="ss3k-rtext">{text_html}</div>'
+                        f'  </div>'
+                        f'</div>')
+                  if not kids: return head
+                  body="".join(render_item(k, depth+1) for k in kids)
+                  return head + f'<details class="ss3k-thread" style="margin-left:{depth*16}px"><summary>Show {len(kids)} repl{"y" if len(kids)==1 else "ies"}</summary>{body}</details>'
+              roots = children.get(root_id, [])
+              roots.sort(key=lambda k: parse_time(nodes[k].get("created_at","")))
+              return CSS + "".join(render_item(tid,0) for tid in roots)
+
+          def render_links_list(links_by_domain):
+              lines=["<div class='ss3k-links'>"]
+              for dom in sorted(links_by_domain):
+                  group=sorted(links_by_domain[dom]); 
+                  if not group: continue
+                  lines.append(f"<h4>{esc(dom)}</h4>"); lines.append("<ul>")
+                  for u in group:
+                      try: nm = pretty_link_title(u)
+                      except Exception: nm = u
+                      lines.append(f'<li><a href="{esc(u)}" target="_blank" rel="noopener">{esc(nm)}</a></li>')
+                  lines.append("</ul>")
+              lines.append("</div>"); return "\n".join(lines)
+
+          def main():
+              if not PURPLE: write_empty(); return
+              m=re.search(r"/status/(\d+)", PURPLE)
+              if not m: write_empty(); return
+              tid_str=m.group(1); out=fetch_conversation(tid_str)
+              if out is None: write_empty(); return
+              tweets, users = out
+              nodes, children, links_by_domain = build_tree(tweets, users, tid_str)
+              if not nodes: write_empty(); return
+              os.makedirs(ARTDIR, exist_ok=True)
+              open(REPLIES_OUT,"w",encoding="utf-8").write(render_thread(nodes, children, users, tid_str))
+              open(LINKS_OUT,"w",encoding="utf-8").write(render_links_list(links_by_domain))
+          if __name__ == "__main__": main()
+          PY
+          chmod +x ".github/workflows/scripts/replies.py"
+
+      - name: Build VTT and transcript after trim
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         env:
           CC_JSONL: ${{ env.CRAWLER_CC }}
@@ -398,24 +951,26 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" python3 ".github/workflows/scripts/gen_vtt.py"
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
+              python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-          else
-            : > "${ARTDIR}/${BASE}.start.txt"
+            [ -s "${ARTDIR}/${BASE}_reactions.json" ] && echo "REACTIONS_PATH=${ARTDIR}/${BASE}_reactions.json" >> "$GITHUB_ENV" || true
           fi
-      - name: Polish transcript (light)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.TRANSCRIPT_PATH != '' }}
+
+      - name: Polish transcript (optional)
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.TRANSCRIPT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
-          python3 ".github/workflows/scripts/polish_transcript.py"
+          python3 ".github/workflows/scripts/polish_transcript.py" || true
           if [ -s "${ARTDIR}/${BASE}_transcript_polished.html" ]; then
             echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
           fi
-      - name: VTT via Deepgram (fallback)
+
+      - name: VTT via Deepgram fallback
         id: deepgram
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && env.MP3_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -426,16 +981,10 @@ jobs:
             "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
             -o "${ARTDIR}/${BASE}.vtt" || true
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-      - name: Transcript from VTT (if no CC transcript)
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH != '' && env.TRANSCRIPT_PATH == '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ARTDIR="${ARTDIR}" BASE="${BASE}" python3 ".github/workflows/scripts/vtt_to_html.py"
-          [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-      - name: Upload VTT (proxy link via media.chbmp.org)
+
+      - name: Upload VTT to GCS
         id: upload_vtt
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') && env.VTT_PATH != '' }}
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -446,11 +995,12 @@ jobs:
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
           fi
-          echo "vtt_raw=${RAW}" >> "$GITHUB_OUTPUT"
+          echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
+
       - name: Build attendees HTML
         id: attendees
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'attendees_only') && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
         shell: bash
         env:
           CAND: ${{ steps.crawl.outputs.as_line }}
@@ -461,7 +1011,7 @@ jobs:
           jq -r '
             def mkp:
               { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
-                name: (.display_name // .user_results?.result?.legacy?.name)
+                name:   (.display_name       // .user_results?.result?.legacy?.name)
               }
               | select(.handle!=null and .handle!="" )
               | . + { url: ("https://x.com/" + .handle) };
@@ -469,14 +1019,14 @@ jobs:
             | ($a.metadata?.creator_results?.result?.legacy?) as $h
             | ($h.screen_name // empty) as $H
             | {
-                host: ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
-                cohosts: ( ($a.participants?.admins // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
+                host:    ( if $H != "" then [ {handle:$H, name:($h.name // ""), url:("https://x.com/" + $H)} ] else [] end ),
+                cohosts: ( ($a.participants?.admins   // []) | map(mkp) | map(select(.handle != $H)) | unique_by(.handle) ),
                 speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
               }
           ' "${CAND}" > "$OUT_JSON" || true
           if [ -s "$OUT_JSON" ]; then
             jq -r '
-              def li: " <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
+              def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
               def section(title; items):
                 if (items|length) > 0
                 then "<h3>" + title + "</h3>\n<ul>\n" + (items|map(li)|join("\n")) + "\n</ul>\n"
@@ -489,45 +1039,38 @@ jobs:
             ' "$OUT_JSON" > "$OUT_HTML"
             if grep -qi '<li><a ' "$OUT_HTML"; then
               echo "ATTN_HTML=${OUT_HTML}" >> "$GITHUB_ENV"
-              echo "ATTENDEES_OK=1" >> "$GITHUB_ENV"
+              echo "ATTENDEES_OK=1"       >> "$GITHUB_ENV"
             fi
           fi
-      - name: Scrape replies & shared links
-        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'replies_only') && env.PURPLE_TWEET_URL != '' }}
+
+      - name: Scrape replies and shared links (web)
         shell: bash
         env:
-          PURPLE_TWEET_URL: ${{ env.PURPLE_TWEET_URL }}
-          LINK_LABEL_AI: ${{ env.LINK_LABEL_AI }}
-          LINK_LABEL_MODEL: ${{ env.LINK_LABEL_MODEL }}
-          LINK_LABEL_FETCH_TITLES: ${{ env.LINK_LABEL_FETCH_TITLES }}
-          LINK_LABEL_FETCH_LIMIT: ${{ env.LINK_LABEL_FETCH_LIMIT }}
-          LINK_LABEL_TIMEOUT_SEC: ${{ env.LINK_LABEL_TIMEOUT_SEC }}
-          KEYBERT_TOPN: ${{ env.KEYBERT_TOPN }}
-          KEYBERT_NGRAM_MIN: ${{ env.KEYBERT_NGRAM_MIN }}
-          KEYBERT_NGRAM_MAX: ${{ env.KEYBERT_NGRAM_MAX }}
-          KEYBERT_USE_MMR: ${{ env.KEYBERT_USE_MMR }}
-          KEYBERT_DIVERSITY: ${{ env.KEYBERT_DIVERSITY }}
+          PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
-          set -euxo pipefail
-          python3 ".github/workflows/scripts/replies.py"
-          [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}_reactions.json" ] && echo "REACTIONS_PATH=${ARTDIR}/${BASE}_reactions.json" >> "$GITHUB_ENV" || true
-      - name: Derive title + start time
+          set -euo pipefail
+          python3 ".github/workflows/scripts/replies.py" || true
+          if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
+            echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
+            echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
+          fi
+
+      - name: Derive Space title and publish date
         id: meta
         shell: bash
         env:
           AS_LINE: ${{ steps.crawl.outputs.as_line }}
-          TITLE_HINT: ${{ env.TITLE_HINT }}
         run: |
           set -euo pipefail
           TTL=""
           if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
             TTL="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.name // .title // "")' "${AS_LINE}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
           fi
-          if [ -z "$TTL" ] && [ -n "${TITLE_HINT:-}" ]; then TTL="${TITLE_HINT}"; fi
           if [ -z "$TTL" ]; then TTL="${BASE}"; fi
           echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
+
           START_ISO=""
           if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
             MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
@@ -541,91 +1084,82 @@ jobs:
           fi
           if [ -z "$START_ISO" ]; then START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; fi
           echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
-      - name: Register assets in WordPress
-        if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
+
+      - name: Register/Update in WP (assets, transcript, replies, links, emoji)
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
         env:
-          PID: ${{ github.event.inputs.post_id }}
-          AUD: ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
-          VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy || steps.upload_vtt.outputs.vtt_raw }}
+          PID:  ${{ github.event.inputs.post_id }}
+          AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
+          VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${BASE}}"
+
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
+
           TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
           [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ] && TR_FILE="${TRANSCRIPT_PATH}"
+
           REP_FILE="${WORKDIR}/empty_replies.html"; : > "$REP_FILE"
-          [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && REP_FILE="${REPLIES_PATH}"
+          [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH}" ] && REP_FILE="${REPLIES_PATH}"
+
           LNK_FILE="${WORKDIR}/empty_links.html"; : > "$LNK_FILE"
-          [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && LNK_FILE="${LINKS_PATH}"
-          REAC_FILE="${WORKDIR}/empty_reactions.json"; : > "$REAC_FILE"
-          [ -n "${REACTIONS_PATH:-}" ] && [ -s "${REACTIONS_PATH:-}" ] && REAC_FILE="${REACTIONS_PATH}"
+          [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH}" ] && LNK_FILE="${LINKS_PATH}"
+
+          RX_FILE="${WORKDIR}/empty_reactions.json"; echo "[]" > "$RX_FILE"
+          if [ -s "${ARTDIR}/${BASE}_reactions.json" ]; then
+            RX_FILE="${ARTDIR}/${BASE}_reactions.json"
+          fi
+
           REQ="${WORKDIR}/wp_register_body.json"
           jq -n \
-            --arg gcs "${AUD}" \
-            --arg mime "audio/mpeg" \
-            --arg pid "${PID}" \
-            --arg ttl "${TTL}" \
-            --arg vtt "${VTTU}" \
-            --arg when "${START_ISO:-}" \
+            --arg pid   "${PID}" \
+            --arg ttl   "${TTL}" \
+            --arg when  "${START_ISO:-}" \
+            --arg gcs   "${AUD}" \
+            --arg mime  "audio/mpeg" \
+            --arg vtt   "${VTTU}" \
             --rawfile ath "${ATH_FILE}" \
-            --rawfile tr "${TR_FILE}" \
+            --rawfile tr  "${TR_FILE}" \
             --rawfile rep "${REP_FILE}" \
             --rawfile lnk "${LNK_FILE}" \
-            --rawfile reac "${REAC_FILE}" \
+            --rawfile rx  "${RX_FILE}" \
             '{
-               gcs_url: $gcs,
-               mime: $mime,
                post_id: ($pid|tonumber),
-               title: $ttl
+               title:   $ttl
              }
              + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
+             + (if ($gcs|length)>0 then {gcs_url:$gcs, mime:$mime} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
-             + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr} else {} end)
+             + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
              + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
-             + (if ($reac|gsub("\\s";"")|length)>0 then {reactions_json:$reac} else {} end)
+             + (if ($rx|gsub("\\s";"")|length)>2 then {reactions_json:$rx} else {} end)
             ' > "$REQ"
+
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
             --data-binary @"$REQ" | jq -r .
-      - name: Patch WP attendees only
-        if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
+
+      - name: Done / finalize status
+        if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          AT_HTML=""
-          if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then AT_HTML="$(cat "${ATTN_HTML}")"; fi
-          BODY="$(jq -n --arg pid "${{ github.event.inputs.post_id }}" --arg ath "${AT_HTML}" \
-            '{post_id: ($pid|tonumber), status:"complete", progress:100}
-             + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
-      - name: Patch WP replies only
-        if: ${{ github.event.inputs.mode == 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          REP="$( [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && cat "${REPLIES_PATH}" || echo "" )"
-          LNK="$( [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && cat "${LINKS_PATH}" || echo "" )"
-          REAC="$( [ -n "${REACTIONS_PATH:-}" ] && [ -s "${REACTIONS_PATH:-}" ] && cat "${REACTIONS_PATH}" || echo "" )"
-          BODY="$(jq -n --arg pid "${{ github.event.inputs.post_id }}" --arg rep "${REP}" --arg lnk "${LNK}" --arg reac "${REAC}" \
-            '{post_id: ($pid|tonumber), status:"complete", progress:100}
-             + (if ($rep|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|length)>0 then {shared_links_html:$lnk} else {} end)
-             + (if ($reac|length)>0 then {reactions_json:$reac} else {} end)')"
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" -H "Content-Type: application/json" \
-            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" -d "$BODY" | jq -r .
-      - name: Upload artifacts for troubleshooting
-        uses: actions/upload-artifact@v4
-        with:
-          name: space-artifacts-${{ steps.ids.outputs.space_id || github.run_id }}
-          path: |
-            ${{ env.ARTDIR }}/**
-          retention-days: 3
+          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/worker-status" \
+            -d "$(jq -n --arg pid "${{ github.event.inputs.post_id }}" \
+                       --arg status "complete" \
+                       --arg msg "Artifacts processed and registered" \
+                       --arg run "${{ github.run_id }}" \
+                       --argjson progress 100 \
+                       '{post_id: ($pid|tonumber), status:$status, message:$msg, run_id:$run, progress:$progress}')"
+
       - name: Summary
         shell: bash
         env:
