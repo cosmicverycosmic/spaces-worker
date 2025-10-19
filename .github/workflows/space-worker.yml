@@ -76,7 +76,7 @@ env:
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # safer defaults for polishing
+  # safer defaults for polishing (WP plugin may also do cleanup; these are harmless here)
   TRANSCRIPT_GEC: "false"
   TRANSCRIPT_SMART_QUOTES: "false"
   TRANSCRIPT_STRIP_EMOJI: "true"
@@ -125,6 +125,192 @@ jobs:
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+
+      - name: Bootstrap helper scripts (gen_vtt, polish_transcript, replies)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p scripts
+
+          cat > scripts/gen_vtt.py << 'PY'
+          import os, json, sys, html
+          from pathlib import Path
+
+          def to_seconds(v):
+              if v is None: return None
+              if isinstance(v,(int,float)): 
+                  # Heuristic: large ints likely ms
+                  return v/1000.0 if v>1e4 else float(v)
+              if isinstance(v,str):
+                  s=v.strip()
+                  if s.isdigit():
+                      s=float(s)
+                      return s/1000.0 if s>1e4 else s
+                  try:
+                      return float(s)
+                  except: return None
+              return None
+
+          def pick(d, keys):
+              for k in keys:
+                  if k in d and d[k] is not None:
+                      return d[k]
+              return None
+
+          def fmt_time(s):
+              if s < 0: s = 0.0
+              h = int(s//3600); m=int((s%3600)//60); sec = s - (h*3600 + m*60)
+              return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.',',')
+
+          CC_JSONL = os.environ.get("CC_JSONL","").strip()
+          ARTDIR   = os.environ.get("ARTDIR","").strip() or "."
+          BASE     = os.environ.get("BASE","space").strip() or "space"
+          SHIFT    = float(os.environ.get("SHIFT_SECS","0") or "0")
+          # ABS_ANCHOR_EPOCH is not required for VTT; ignore if present
+
+          if not CC_JSONL or not Path(CC_JSONL).exists():
+              sys.exit(0)  # nothing to do, let fallback (Deepgram) handle
+
+          cues=[]
+          with open(CC_JSONL, 'r', encoding='utf-8') as f:
+              for line in f:
+                  line=line.strip()
+                  if not line: continue
+                  try:
+                      o=json.loads(line)
+                  except: 
+                      continue
+                  # Try common key shapes from twspace-crawler and variants
+                  txt = pick(o, ['text','caption','content','t','c']) or ''
+                  txt = txt.strip()
+                  if not txt: continue
+
+                  start = pick(o, ['start','start_s','start_sec'])
+                  if start is None:
+                      start = pick(o, ['start_ms','startMs'])
+                  end   = pick(o, ['end','end_s','end_sec'])
+                  if end is None:
+                      end   = pick(o, ['end_ms','endMs'])
+                  dur   = pick(o, ['duration','duration_s','dur','len'])
+                  if dur is None:
+                      dur   = pick(o, ['duration_ms','durationMs'])
+
+                  s = to_seconds(start)
+                  e = to_seconds(end)
+                  d = to_seconds(dur)
+
+                  if s is None and e is None:
+                      # try timestamp key
+                      ts = to_seconds(pick(o, ['ts','time','t']))
+                      if ts is not None:
+                          s = ts
+                  if s is None: 
+                      continue
+                  if e is None:
+                      if d is not None:
+                          e = s + d
+                      else:
+                          e = s + max(1.8, min(6.0, len(txt)/8.0))
+
+                  # Align to trimmed audio head
+                  s -= SHIFT
+                  e -= SHIFT
+                  if e <= 0: 
+                      continue
+
+                  cues.append((max(0.0,s), max(e, s+0.5), txt))
+
+          cues.sort(key=lambda x: x[0])
+          out_vtt = Path(ARTDIR) / f"{BASE}.vtt"
+          out_tr  = Path(ARTDIR) / f"{BASE}_transcript.html"
+
+          with open(out_vtt, 'w', encoding='utf-8') as v:
+              v.write("WEBVTT\n\n")
+              for s,e,txt in cues:
+                  v.write(f"{fmt_time(s)} --> {fmt_time(e)}\n")
+                  v.write(html.escape(txt).replace("&lt;br&gt;","<br>").replace("\\n","<br>"))
+                  v.write("\n\n")
+
+          # very simple transcript: one cue per paragraph
+          with open(out_tr, 'w', encoding='utf-8') as t:
+              t.write("<!doctype html><meta charset='utf-8'><title>Transcript</title><pre>")
+              for _,__,txt in cues:
+                  t.write(html.escape(txt))
+                  t.write("\n")
+              t.write("</pre>")
+          PY
+          chmod +x scripts/gen_vtt.py
+
+          cat > scripts/polish_transcript.py << 'PY'
+          import os, re, html
+          from pathlib import Path
+
+          def strip_emoji(s:str)->str:
+              # broad emoji ranges (safe subset)
+              return re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\ufe0e\ufe0f\u200d]+","",s)
+
+          def drop_emoji_only_lines(txt:str)->str:
+              out=[]
+              for ln in txt.splitlines():
+                  core = strip_emoji(ln)
+                  core = re.sub(r"[^\w]+","",core, flags=re.UNICODE).strip()
+                  if core=="":
+                      # keep empty lines, but drop lines that were only emoji
+                      continue
+                  out.append(ln)
+              return "\n".join(out)
+
+          def smart_quotes(s:str)->str:
+              # naive single pass; good enough for captions
+              s = s.replace('"',"”")
+              s = re.sub(r'(^|\s)“', r'\1“', s)  # keep some open quotes (best effort)
+              s = s.replace("''","”").replace("``","“")
+              s = s.replace("'", "’")
+              return s
+
+          ARTDIR   = os.environ.get("ARTDIR","").strip() or "."
+          BASE     = os.environ.get("BASE","space").strip() or "space"
+          GEC      = os.environ.get("TRANSCRIPT_GEC","false").lower()=="true" # unused placeholder
+          SMART    = os.environ.get("TRANSCRIPT_SMART_QUOTES","false").lower()=="true"
+          STRIP_E  = os.environ.get("TRANSCRIPT_STRIP_EMOJI","true").lower()=="true"
+          DROP_E   = os.environ.get("TRANSCRIPT_DROP_EMOJI_ONLY","true").lower()=="true"
+
+          raw = Path(ARTDIR) / f"{BASE}_transcript.html"
+          if not raw.exists():
+              raise SystemExit(0)
+
+          txt = raw.read_text(encoding="utf-8")
+          # extract inside <pre> if present
+          m = re.search(r"<pre>(.*)</pre>", txt, re.S|re.I)
+          body = html.unescape(m.group(1)) if m else txt
+
+          if STRIP_E:
+              body = strip_emoji(body)
+          if DROP_E:
+              body = drop_emoji_only_lines(body)
+          if SMART:
+              body = smart_quotes(body)
+
+          out = Path(ARTDIR) / f"{BASE}_transcript_polished.html"
+          out.write_text("<!doctype html><meta charset='utf-8'><title>Transcript</title><pre>"+html.escape(body)+"</pre>", encoding="utf-8")
+          PY
+          chmod +x scripts/polish_transcript.py
+
+          cat > scripts/replies.py << 'PY'
+          import os, html
+          from pathlib import Path
+          ARTDIR = os.environ.get("ARTDIR","").strip() or "."
+          BASE   = os.environ.get("BASE","space").strip() or "space"
+          PURPLE = os.environ.get("PURPLE_TWEET_URL","").strip()
+
+          # Minimal, non-failing stubs; real scraping can be added later.
+          (Path(ARTDIR)/f"{BASE}_replies.html").write_text(
+              "<h3>Replies</h3>\n" + (f"<p>Seed tweet: <a href='{html.escape(PURPLE)}'>{html.escape(PURPLE)}</a></p>\n" if PURPLE else "<p>No seed tweet.</p>\n"),
+              encoding="utf-8"
+          )
+          (Path(ARTDIR)/f"{BASE}_links.html").write_text("<h3>Links</h3>\n<ul></ul>\n", encoding="utf-8")
+          PY
+          chmod +x scripts/replies.py
 
       - name: Validate config and prefixes
         id: cfg
@@ -209,11 +395,13 @@ jobs:
           RC=$?
           set -e
           echo "crawler_exit=${RC}"
+
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
+
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -221,12 +409,14 @@ jobs:
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line.json" || true
             echo "AS_LINE_JSON=${ARTDIR}/_as_line.json" >> "$GITHUB_ENV"
+            echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT"
           fi
+
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
-          # anchor epoch from metadata (used by gen_vtt.py)
+
           ANCHOR=""
           if [ -s "${ARTDIR}/_as_line.json" ]; then
             MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${ARTDIR}/_as_line.json" || true)"
