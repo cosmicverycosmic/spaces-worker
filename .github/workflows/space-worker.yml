@@ -108,7 +108,6 @@ jobs:
               existing_mp3_url:pick("existing_mp3_url")
             }
           ' "$EVENT" > "$RUNNER_TEMP/in.json"
-
           # Export to env with defaults
           SPACE_URL=$(jq -r '.space_url' "$RUNNER_TEMP/in.json")
           POST_ID=$(jq -r '.post_id' "$RUNNER_TEMP/in.json")
@@ -118,7 +117,6 @@ jobs:
           DO_TRANS=$(jq -r '.do_transcript' "$RUNNER_TEMP/in.json")
           MODE=$(jq -r '.mode' "$RUNNER_TEMP/in.json")
           EXISTING_MP3=$(jq -r '.existing_mp3_url' "$RUNNER_TEMP/in.json")
-
           echo "IN_SPACE_URL=$SPACE_URL"           >> "$GITHUB_ENV"
           echo "IN_POST_ID=$POST_ID"               >> "$GITHUB_ENV"
           echo "IN_TITLE=$TITLE"                   >> "$GITHUB_ENV"
@@ -205,16 +203,13 @@ jobs:
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
-
           if [ -n "$AUTH" ] && ! printf '%s' "$AUTH" | grep -q '^Bearer '; then AUTH=""; fi
           [ -n "${TWITTER_AUTHORIZATION:-}" ] && echo "::add-mask::${TWITTER_AUTHORIZATION}"
           [ -n "$AT" ] && echo "::add-mask::${AT}"
           [ -n "$CT" ] && echo "::add-mask::${CT}"
-
           OK=0; REASON="no_creds"
           [ -n "$AT" ] && [ -n "$CT" ] && OK=1 && REASON="cookie_ok" || true
           [ -n "$AUTH" ] && OK=1 && REASON="${REASON}_bearer_present" || true
-
           echo "ok=${OK}"         >> "$GITHUB_OUTPUT"
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
@@ -229,10 +224,8 @@ jobs:
           set -euxo pipefail
           mkdir -p "${ARTDIR}" "${ARTDIR}/logs"
           docker pull ghcr.io/hitomarukonpaku/twspace-crawler:latest || true
-
           LOG_STD="${ARTDIR}/logs/crawler_${SID}.out.log"
           LOG_ERR="${ARTDIR}/logs/crawler_${SID}.err.log"
-
           set +e
           timeout 20m docker run --rm \
             -e TWITTER_AUTHORIZATION \
@@ -245,13 +238,11 @@ jobs:
           RC=$?
           set -e
           echo "crawler_exit=${RC}"
-
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
-
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
@@ -262,7 +253,6 @@ jobs:
             [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
           fi
           [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
-
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
@@ -608,7 +598,6 @@ jobs:
           set -euxo pipefail
           OUT_JSON="${ARTDIR}/attendees.json"
           OUT_HTML="${ARTDIR}/attendees.html"
-
           jq -r '
             def mkp:
               { handle: (.twitter_screen_name // .user_results?.result?.legacy?.screen_name),
@@ -616,7 +605,6 @@ jobs:
               }
               | select(.handle!=null and .handle!="")
               | . + { url: ("https://x.com/" + .handle) };
-
             (.audioSpace // .) as $a
             | ($a.metadata?.creator_results?.result?.legacy?) as $h
             | ($h.screen_name // empty) as $H
@@ -626,7 +614,6 @@ jobs:
                 speakers:( ($a.participants?.speakers // []) | map(mkp) | unique_by(.handle) )
               }
           ' "${CAND}" > "$OUT_JSON" || true
-
           if [ -s "$OUT_JSON" ]; then
             jq -r '
               def li: "  <li><a href=\"" + (.url//"#") + "\">" + ((.name // "") + " (@" + (.handle // "") + ")") + "</a></li>";
@@ -746,8 +733,8 @@ jobs:
               child=""
               if n["children"]:
                   cid=f"children-{t.id}"; btn=f"Show {len(n['children'])} repl" + ("y" if len(n["children"])==1 else "ies")
-                  child=(f'\\n      <button class="ss3k-toggle" data-label="{esc(btn)}" data-hide="Hide replies" onclick="ss3kToggleReplies(\\'{cid}\\', this)">{esc(btn)}</button>\\n'
-                         f'      <div class="ss3k-children" id="{cid}">\\n' + "\\n".join(render(c,level+1) for c in n["children"]) + "\\n      </div>")
+                  child=(f'\n      <button class="ss3k-toggle" data-label="{esc(btn)}" data-hide="Hide replies" onclick="ss3kToggleReplies(\\'{cid}\\', this)">{esc(btn)}</button>\n'
+                         f'      <div class="ss3k-children" id="{cid}">\n' + "\n".join(render(c,level+1) for c in n["children"]) + "\n      </div>")
               return f'''
       <div class="ss3k-reply-card" id="{t.id}" data-level="{level}">
         <div class="ss3k-reply-head">
@@ -786,13 +773,13 @@ jobs:
             if(btn){ btn.textContent=open?(btn.dataset.label||'Show replies'):(btn.dataset.hide||'Hide replies'); }
           }
           </script>
-          <div class="ss3k-replies">'''; html_bottom="\\n</div>\\n"
-          replies_html = html_top + "\\n" + render(node[root.id]) + "\\n" + html_bottom
+          <div class="ss3k-replies">'''; html_bottom="\n</div>\n"
+          replies_html = html_top + "\n" + render(node[root.id]) + "\n" + html_bottom
           parts=[]
           for dom in sorted(domain_links):
-              links="\\n".join(f'  <li><a href="{html.escape(u, True)}" target="_blank" rel="noopener">{html.escape(u, True)}</a></li>' for u in domain_links[dom])
-              parts.append(f"<h4>{html.escape(dom, True)}</h4>\\n<ul>\\n{links}\\n</ul>")
-          links_html="\\n\\n".join(parts)
+              links="\n".join(f'  <li><a href="{html.escape(u, True)}" target="_blank" rel="noopener">{html.escape(u, True)}</a></li>' for u in domain_links[dom])
+              parts.append(f"<h4>{html.escape(dom, True)}</h4>\n<ul>\n{links}\n</ul>")
+          links_html="\n\n".join(parts)
           open(os.path.join(out_dir, f"{base}_replies.html"), "w", encoding="utf-8").write(replies_html)
           open(os.path.join(out_dir, f"{base}_links.html"), "w", encoding="utf-8").write(links_html)
           PY
@@ -810,19 +797,14 @@ jobs:
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${IN_TITLE:-}}"
-
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
-
           TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
           [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ] && TR_FILE="${TRANSCRIPT_PATH}"
-
           REP_FILE="${WORKDIR}/empty_replies.html"; : > "$REP_FILE"
           [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH}" ] && REP_FILE="${REPLIES_PATH}"
-
           LNK_FILE="${WORKDIR}/empty_links.html"; : > "$LNK_FILE"
           [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH}" ] && LNK_FILE="${LINKS_PATH}"
-
           REQ="${WORKDIR}/wp_register_body.json"
           jq -n \
             --arg gcs   "${AUD}" \
@@ -844,11 +826,10 @@ jobs:
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
-             + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
-             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
+             + (if ($rep|gsub("\\s";"")|length)>0 then {replies_html:$rep} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {links_html:$lnk} else {} end)
+             + (if ($started|length)>0 then {space_date:$started} else {} end)
             ' > "$REQ"
-
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
@@ -874,14 +855,12 @@ jobs:
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
             AT_HTML="$(cat "${ATTN_HTML}")"
           fi
-
           BODY="$(jq -n \
             --arg pid "${IN_POST_ID}" \
             --arg ath "${AT_HTML}" \
             '{post_id: ($pid|tonumber), status:"complete", progress:100}
              + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
           ')"
-
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/patch-assets" \
@@ -906,7 +885,7 @@ jobs:
             fi
             if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
-            elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
+            elseif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
