@@ -64,7 +64,7 @@ env:
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Optional: twitter API v1.1 (for one-shot reply scraping)
+  # Optional: Twitter API v1.1 for one-shot replies scrape
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -108,13 +108,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # yt-dlp for fallback; python-twitter + tldextract for replies scraping
-          python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract html5lib
+          # yt-dlp (fallback) + replies dependencies
+          python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract
           # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # docker login for crawler image
+          # container pull auth (for GHCR)
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -159,7 +159,7 @@ jobs:
         id: x_preflight
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           AUTH="${TWITTER_AUTHORIZATION:-}"
           AT="${TWITTER_AUTH_TOKEN:-}"
           CT="${TWITTER_CSRF_TOKEN:-}"
@@ -204,57 +204,64 @@ jobs:
           set -e
           echo "crawler_exit=${RC}"
 
+          # Most-recent audio file
           AUDIO_FILE="$(find "${ARTDIR}" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.aac' -o -iname '*.webm' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.ts' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           if [ -n "${AUDIO_FILE:-}" ] && [ -f "${AUDIO_FILE}" ]; then
             echo "INPUT_FILE=${AUDIO_FILE}" >> "$GITHUB_ENV"
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
+          # Capture a compact JSON line from logs for metadata parsing
           RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -z "$RAW" ]; then
             RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           fi
           if [ -n "$RAW" ]; then
-            printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
-            printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line_after_pipe.txt" || true
-            [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
+            printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line.json" || true
           fi
-          [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
+          [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
+          # Captions JSONL from crawler
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
-      - name: Extract Space title & start from crawler metadata
+      - name: Extract Space title & start (title = post title; start = post date)
         if: ${{ steps.crawl.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           J="${ARTDIR}/_as_line.json"
-          # Title
+          TTL=""
+          START_RAW=""
+
           if [ -s "$J" ]; then
-            TITLE="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
-            if [ -n "$TITLE" ] && [ "$TITLE" != "null" ]; then
-              echo "SPACE_TITLE=${TITLE}" >> "$GITHUB_ENV"
-            fi
-            # started_at can be ms epoch or ISO; handle both
-            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // empty)' "$J")"
-            if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
-              if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
-                SEC=$((START_RAW/1000))
-                DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ')"
-              else
-                DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-              fi
-              [ -n "$DATE_GMT" ] && echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
+            TTL="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
+            # Prefer explicit started_at (ms epoch) or startedAt (ISO)
+            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // .metadata.scheduled_start // .metadata.created_at // empty)' "$J")"
+          fi
+
+          # Title fallback chain: Space title -> manual input -> BASE
+          [ -z "$TTL" ] && TTL="${{ github.event.inputs.title }}"
+          [ -z "$TTL" ] && TTL="${BASE}"
+          echo "SPACE_TITLE=${TTL}" >> "$GITHUB_ENV"
+          echo "TTL_FINAL=${TTL}"   >> "$GITHUB_ENV"
+
+          # Convert start time to UTC ISO (Z). If ms epoch, divide; if ISO, parse; else fallback to now.
+          DATE_GMT=""
+          if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
+            if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
+              SEC=$((START_RAW/1000))
+              DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ')"
+            else
+              DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
             fi
           fi
-          # Final title preference: Space title > input title
-          TTL="${SPACE_TITLE:-${{ github.event.inputs.title }}}"
-          echo "TTL_FINAL=${TTL}" >> "$GITHUB_ENV"
+          [ -z "$DATE_GMT" ] && DATE_GMT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
 
-      - name: Build VTT & syncable grouped transcript from crawler JSONL
+      - name: Build VTT & syncable grouped transcript (from crawler JSONL)
         if: ${{ github.event.inputs.mode != 'attendees_only' }}
         shell: bash
         run: |2
@@ -277,14 +284,12 @@ jobs:
           def parse_time_iso(s):
               if not s: return None
               s = s.strip()
-              if s.endswith('Z'):
-                  s = s[:-1] + '+00:00'
+              if s.endswith('Z'): s = s[:-1] + '+00:00'
               if re.search(r'[+-]\d{4}$', s):
                   s = s[:-5] + s[-5:-2] + ':' + s[-2:]
               try:
                   dt = datetime.fromisoformat(s)
-                  if dt.tzinfo is None:
-                      dt = dt.replace(tzinfo=timezone.utc)
+                  if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
                   return dt.timestamp()
               except Exception:
                   return None
@@ -303,34 +308,24 @@ jobs:
 
           def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-          # Load utterances from crawler chat/captions (type 45)
+          # Load utterances (type 45)
           utt = []
           with open(src, 'r', encoding='utf-8', errors='ignore') as f:
               for line in f:
                   line = line.strip()
                   if not line: continue
-                  try:
-                      outer = json.loads(line)
-                  except Exception:
-                      continue
-                  payload_raw = outer.get("payload")
-                  if not payload_raw: continue
-                  try:
-                      payload = json.loads(payload_raw)
-                  except Exception:
-                      continue
-                  body_raw = payload.get("body")
-                  if not body_raw: continue
-                  try:
-                      inner = json.loads(body_raw)
-                  except Exception:
-                      continue
-                  if inner.get("type") != 45:
-                      continue
+                  try: outer = json.loads(line)
+                  except Exception: continue
+                  payload_raw = outer.get("payload") or ""
+                  try: payload = json.loads(payload_raw)
+                  except Exception: continue
+                  body_raw = payload.get("body") or ""
+                  try: inner = json.loads(body_raw)
+                  except Exception: continue
+                  if inner.get("type") != 45: continue
                   text = (inner.get("body") or "").strip()
                   if not text: continue
-                  if "final" in inner and not inner.get("final"):  # only finalized fragments
-                      continue
+                  if "final" in inner and not inner.get("final"): continue
                   name     = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
                              or inner.get("username") or inner.get("user_id") or "Speaker"
                   username = inner.get("username") or payload.get("sender", {}).get("screen_name") or ""
@@ -338,18 +333,15 @@ jobs:
                              or payload.get("sender", {}).get("profile_image_url") or ""
                   ts = parse_time_iso(inner.get("programDateTime"))
                   if ts is None:
-                      try:
-                          ts = int(inner.get("timestamp")) / 1000.0
-                      except Exception:
-                          ts = None
+                      try: ts = int(inner.get("timestamp")) / 1000.0
+                      except Exception: ts = None
                   if ts is None: continue
                   utt.append({"ts": ts, "name": clean_name(name), "username": username, "avatar": avatar, "text": text})
 
           utt.sort(key=lambda x: x["ts"])
-          if not utt:
-              raise SystemExit(0)
+          if not utt: raise SystemExit(0)
 
-          # Derive start/end for raw utterances
+          # Relative timings
           t0_abs = utt[0]["ts"]
           for i,u in enumerate(utt):
               u["start_rel"] = u["ts"] - t0_abs
@@ -358,23 +350,20 @@ jobs:
                   u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
               else:
                   words = max(1, len(u["text"].split()))
-                  dur = min(6.0, max(1.2, 0.35*words + 0.8))
-                  u["end_rel"] = u["start_rel"] + dur
+                  u["end_rel"] = u["start_rel"] + min(6.0, max(1.2, 0.35*words + 0.8))
 
-          # Group consecutive utterances by same speaker when close in time
+          # Group adjacent same-speaker fragments
           groups = []
-          GAP_MAX = 4.0  # seconds between fragments to merge
+          GAP_MAX = 4.0
           cur = None
           for u in utt:
               if (cur is not None and
                   u["name"] == cur["name"] and
                   u["username"] == cur["username"] and
                   (u["start_rel"] - cur["end_rel"]) <= GAP_MAX):
-                  # merge
                   sep = "" if cur["text"].endswith(('.', '!', '?')) else " "
                   cur["text"] = (cur["text"] + sep + u["text"]).strip()
                   cur["end_rel"] = max(cur["end_rel"], u["end_rel"])
-                  cur["_last_ts"] = u["ts"]
               else:
                   cur = {
                       "name": u["name"],
@@ -383,20 +372,17 @@ jobs:
                       "start_rel": u["start_rel"],
                       "end_rel": u["end_rel"],
                       "text": u["text"],
-                      "_last_ts": u["ts"],
                   }
                   groups.append(cur)
 
-          # Write WEBVTT (grouped)
-          vtt_path = os.path.join(artdir, f"{base}.vtt")
-          with open(vtt_path, "w", encoding="utf-8") as vf:
+          # WEBVTT
+          with open(os.path.join(artdir, f"{base}.vtt"), "w", encoding="utf-8") as vf:
               vf.write("WEBVTT\n\n")
-              for idx, g in enumerate(groups, 1):
+              for idx,g in enumerate(groups,1):
                   vf.write(f"{idx}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
                   vf.write(f"<b>{esc(g['name'])}</b>: {esc(g['text'])}\n\n")
 
-          # Player-syncable HTML transcript with avatars + data-start/end
-          tr_path = os.path.join(artdir, f"{base}_transcript.html")
+          # Syncable transcript HTML
           css = '''
           <style>
           .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
@@ -432,38 +418,36 @@ jobs:
           })();
           </script>
           '''
+          tr_path = os.path.join(artdir, f"{base}_transcript.html")
           with open(tr_path, "w", encoding="utf-8") as tf:
               tf.write(css)
               tf.write('<div class="ss3k-transcript">\\n')
               for i,g in enumerate(groups,1):
-                  name = esc(g["name"])
-                  uname= (g.get("username") or "").strip()
+                  name = g["name"]
+                  uname = (g.get("username") or "").strip()
                   prof = f"https://x.com/{html.escape(uname, True)}" if uname else ""
                   avatar = g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
-                  avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{esc(avatar)}" alt=""></a>' if avatar else ''
-                  name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{name}</strong></a></span>' if prof else f'<span class="ss3k-name"><strong>{name}</strong></span>'
-                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{name}">')
-                  tf.write(avtag or '<div style="width:26px;height:26px"></div>')
+                  avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>' if avatar and prof else (f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">' if avatar else '<div style="width:26px;height:26px"></div>')
+                  name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a></span>' if prof else f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
+                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{html.escape(name, True)}">')
+                  tf.write(avtag)
                   tf.write('<div class="ss3k-body">')
                   tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
-                  tf.write(f'<div class="ss3k-text">{esc(g["text"])}</div>')
+                  tf.write(f'<div class="ss3k-text">{html.escape(g["text"], True)}</div>')
                   tf.write('</div></div>\\n')
               tf.write('</div>\\n')
               tf.write(js)
 
-          # Earliest absolute timestamp → used to set WP post date
-          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          # Also save earliest absolute timestamp for fallback (used only if crawler lacked start)
+          start_iso = datetime.fromtimestamp(utt[0]["ts"], timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
           with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
               sf.write(start_iso + "\n")
           PYCODE
           CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
-          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
-            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+          [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+          # Only set SPACE_STARTED_AT from transcript if crawler start was NOT available
+          if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
             echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
           fi
           fi
@@ -519,12 +503,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          PRE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,acompressor=threshold=-18dB:ratio=3:attack=6:release=250:makeup=6,dynaudnorm=p=1:m=7:s=12"
+          # Radio-style chain: cleanup -> de-ess -> gentle comp -> adaptive norm -> EBU R128 loudnorm (2-pass) -> mono MP3
+          PRE="highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-28,deesser=i=12,acompressor=threshold=-20dB:ratio=3:attack=6:release=250:makeup=5,dynaudnorm=p=1:m=7:s=12"
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
+          # Analysis pass
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
           if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
-            I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON"); TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON"); LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON"); TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
+            I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
+            TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
+            LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
+            TH=$(jq -r '.input_thresh // "-26"' "$PASS1_JSON")
             ffmpeg -hide_banner -y -i "$AUDIO_IN" \
               -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$I:measured_TP=$TP:measured_LRA=$LRA:measured_thresh=$TH:linear=true" \
               -ar 48000 -ac 1 -c:a libmp3lame -b:a 160k "${ARTDIR}/${BASE}.mp3"
@@ -556,7 +545,7 @@ jobs:
         if: ${{ github.event.inputs.mode != 'attendees_only' }}
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
       - name: VTT via Deepgram (fallback)
@@ -643,10 +632,9 @@ jobs:
         run: |2
           set -euxo pipefail
           cat > "${WORKDIR}/replies.py" <<'PY'
-          import os, json, re, html
+          import os, json, html
           from collections import defaultdict
-          import tldextract
-          import twitter
+          import tldextract, twitter
 
           out_dir = os.environ["ARTDIR"]
           base    = os.environ["BASE"]
@@ -658,7 +646,8 @@ jobs:
               try:
                   data = json.load(open(as_json, "r", encoding="utf-8", errors="ignore"))
                   a = (data.get("audioSpace") or {})
-                  creator = (a.get("username") or a.get("creator_results",{}).get("result",{}).get("legacy",{}).get("screen_name"))
+                  # prefer username field, fallback to legacy
+                  creator = a.get("username") or a.get("creator_results",{}).get("result",{}).get("legacy",{}).get("screen_name")
               except Exception:
                   pass
 
@@ -674,7 +663,6 @@ jobs:
                             access_token_key=at, access_token_secret=ats,
                             sleep_on_rate_limit=True, tweet_mode='extended')
 
-          terms = [f"i/spaces/{space_id}", f"https://twitter.com/i/spaces/{space_id}"]
           def do_search(q, pages=5):
               res=[]; max_id=None
               for _ in range(pages):
@@ -683,6 +671,7 @@ jobs:
                   res.extend(batch); max_id = min(t.id for t in batch) - 1
               return res
 
+          terms = [f"i/spaces/{space_id}", f"https://twitter.com/i/spaces/{space_id}"]
           candidates = do_search(terms[0])
           if creator: candidates += do_search(f'from:{creator} "{terms[0]}"')
 
@@ -704,7 +693,7 @@ jobs:
           if root is None:
               root = sorted(cands, key=lambda x: x.created_at_in_seconds or 0)[0]
 
-          # replies via search
+          # get replies via search
           q = f"to:{root.user.screen_name} since_id:{root.id}"
           all_replies=[]; max_id=None
           for _ in range(25):
@@ -731,8 +720,7 @@ jobs:
                   href=u.expanded_url or u.url
                   if not href or href in seen: continue
                   seen.add(href)
-                  dom=tldextract.extract(href)
-                  host=dom.registered_domain or href
+                  host=tldextract.extract(href).registered_domain or href
                   chips.append(f'<a class="ss3k-link-card" href="{esc(href)}" target="_blank" rel="noopener">{esc(host)}</a>')
               return ('\n        <div class="ss3k-link-cards">' + "\n          " + "\n          ".join(chips) + "\n        </div>") if chips else ""
 
@@ -750,7 +738,7 @@ jobs:
               for u in (t.urls or []):
                   href=u.expanded_url or u.url
                   if not href: continue
-                  dom=tldextract.extract(href); host=dom.registered_domain or href
+                  host=tldextract.extract(href).registered_domain or href
                   if href not in domain_links[host]: domain_links[host].append(href)
           for t in [root]+all_replies: collect(t)
 
@@ -830,12 +818,8 @@ jobs:
           open(os.path.join(out_dir, f"{base}_links.html"), "w", encoding="utf-8").write(links_html)
           PY
           python3 "${WORKDIR}/replies.py"
-          if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
-            echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
-            echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
-          fi
+          [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
+          [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
 
       - name: Register assets in WP (finalize)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
@@ -846,10 +830,11 @@ jobs:
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
-          # Title priority: Space title (from crawler) > manual input
+          # Title = Space title; fallback already computed
           TTL="${TTL_FINAL:-${{ github.event.inputs.title }}}"
+          [ -z "$TTL" ] && TTL="${BASE}"
 
-          # Rawfile fallbacks (avoid "argument list too long")
+          # Rawfiles (avoid argv length limits)
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
 
@@ -893,7 +878,7 @@ jobs:
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
             --data-binary @"$REQ" | jq -r .
 
-      - name: Set WP post date to Space start (optional)
+      - name: Set WP post date to Space start (authoritative)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && env.SPACE_STARTED_AT != '' && github.event.inputs.post_id != '' }}
         shell: bash
         run: |
@@ -953,7 +938,7 @@ jobs:
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
-              echo "- Transcript embedded to WP (sync-ready)"
+              echo "- Transcript embedded (sync-ready)"
             else
               echo "- Transcript not generated"
             fi
