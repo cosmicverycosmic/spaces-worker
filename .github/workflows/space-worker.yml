@@ -81,7 +81,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      # Use post_id when available (from either trigger); otherwise run_id
       group: ${{ format('space-worker-{0}-{1}', github.ref, (github.event.inputs.post_id || github.event.client_payload.post_id || '') != '' && (github.event.inputs.post_id || github.event.client_payload.post_id) || github.run_id) }}
       cancel-in-progress: false
 
@@ -89,7 +88,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- NEW: Normalize inputs from workflow_dispatch or repository_dispatch ----
       - name: Normalize dispatch inputs (wd or rd)
         shell: bash
         run: |
@@ -108,7 +106,6 @@ jobs:
               existing_mp3_url:pick("existing_mp3_url")
             }
           ' "$EVENT" > "$RUNNER_TEMP/in.json"
-          # Export to env with defaults
           SPACE_URL=$(jq -r '.space_url' "$RUNNER_TEMP/in.json")
           POST_ID=$(jq -r '.post_id' "$RUNNER_TEMP/in.json")
           TITLE=$(jq -r '.title' "$RUNNER_TEMP/in.json")
@@ -148,13 +145,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # yt-dlp for fallback; python-twitter + tldextract for replies scraping
           python3 -m pip install --no-cache-dir yt-dlp python-twitter tldextract html5lib
-          # gcloud
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
-          # docker login for crawler image
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
 
       - name: Validate config and prefixes
@@ -284,9 +278,8 @@ jobs:
           echo "TTL_FINAL=${TTL}" >> "$GITHUB_ENV"
 
       - name: Build VTT & syncable grouped transcript from crawler JSONL
-        # We'll gate transcript by MODE at runtime inside the script
         shell: bash
-        run: |2
+        run: |
           set -euxo pipefail
           if [ "${IN_MODE:-}" = "attendees_only" ]; then
             echo "Skipping transcript per mode=attendees_only"
@@ -320,8 +313,8 @@ jobs:
               return f"{h:02d}:{m:02d}:{s:06.3f}"
           def clean_name(s):
               s = s or ""
-              s = re.sub(r'[<>&]', '', s)              # strip only angle brackets
-              s = ''.join(ch for ch in s if (ch in '\t\n' or ord(ch) >= 32))  # keep emoji
+              s = re.sub(r'[<>&]', '', s)
+              s = ''.join(ch for ch in s if (ch in '\t\n' or ord(ch) >= 32))
               s = s.strip()
               return s or "Speaker"
           def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -374,7 +367,7 @@ jobs:
                   cur["text"]=(cur["text"]+sep+u["text"]).strip()
                   cur["end_rel"]=max(cur["end_rel"],u["end_rel"]); cur["_last_ts"]=u["ts"]
               else:
-                  cur={"name":u["name"],"username":u["username"],"avatar":u["avatar"],
+                  cur={"name":u["name"],"username":u["username"] ,"avatar":u["avatar"],
                        "start_rel":u["start_rel"],"end_rel":u["end_rel"],"text":u["text"],"_last_ts":u["ts"]}
                   groups.append(cur)
           vtt_path=os.path.join(artdir,f"{base}.vtt")
@@ -636,7 +629,7 @@ jobs:
       - name: Scrape Space tweet replies (one-shot, optional)
         if: ${{ env.TW_API_CONSUMER_KEY != '' && env.TW_API_CONSUMER_SECRET != '' && env.TW_API_ACCESS_TOKEN != '' && env.TW_API_ACCESS_TOKEN_SECRET != '' }}
         shell: bash
-        run: |2
+        run: |
           set -euxo pipefail
           cat > "${WORKDIR}/replies.py" <<'PY'
           import os, json, html
@@ -735,24 +728,26 @@ jobs:
                   cid=f"children-{t.id}"; btn=f"Show {len(n['children'])} repl" + ("y" if len(n["children"])==1 else "ies")
                   child=(f'\n      <button class="ss3k-toggle" data-label="{esc(btn)}" data-hide="Hide replies" onclick="ss3kToggleReplies(\\'{cid}\\', this)">{esc(btn)}</button>\n'
                          f'      <div class="ss3k-children" id="{cid}">\n' + "\n".join(render(c,level+1) for c in n["children"]) + "\n      </div>")
-              return f'''
-      <div class="ss3k-reply-card" id="{t.id}" data-level="{level}">
-        <div class="ss3k-reply-head">
-          <a href="{prof}" target="_blank" rel="noopener">
-            <img class="avatar" src="{esc(av)}" alt="">
-          </a>
-          <div>
-            <div>
-              <a href="{prof}" target="_blank" rel="noopener"><strong>{esc(name)}</strong></a>
-              <span style="color:#64748b">@{esc(sn)}</span>
-            </div>
-            <div class="ss3k-reply-meta">
-              <a href="{tw}" target="_blank" rel="noopener"><time datetime="{iso}">{iso.replace('T',' ')} UTC</time></a>
-            </div>
-          </div>
-        </div>
-        <div class="ss3k-reply-content">{content}</div>{media}{links}{child}
-      </div>'''.rstrip()
+              lines = [
+                  f'<div class="ss3k-reply-card" id="{t.id}" data-level="{level}">',
+                  '  <div class="ss3k-reply-head">',
+                  f'    <a href="{prof}" target="_blank" rel="noopener">',
+                  f'      <img class="avatar" src="{esc(av)}" alt="">',
+                  '    </a>',
+                  '    <div>',
+                  '      <div>',
+                  f'        <a href="{prof}" target="_blank" rel="noopener"><strong>{esc(name)}</strong></a>',
+                  f'        <span style="color:#64748b">@{esc(sn)}</span>',
+                  '      </div>',
+                  '      <div class="ss3k-reply-meta">',
+                  f'        <a href="{tw}" target="_blank" rel="noopener"><time datetime="{iso}">{iso.replace("T"," ")} UTC</time></a>',
+                  '      </div>',
+                  '    </div>',
+                  '  </div>',
+                  f'  <div class="ss3k-reply-content">{content}</div>{media}{links}{child}',
+                  '</div>',
+              ]
+              return "\n".join(lines)
           html_top='''<style>
           .ss3k-replies{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
           .ss3k-reply-card{border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:10px 0;background:#fff;box-shadow:0 1px 1px rgba(0,0,0,.03)}
@@ -826,9 +821,9 @@ jobs:
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
-             + (if ($rep|gsub("\\s";"")|length)>0 then {replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {links_html:$lnk} else {} end)
-             + (if ($started|length)>0 then {space_date:$started} else {} end)
+             + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
@@ -885,7 +880,7 @@ jobs:
             fi
             if [ -n "${{ steps.upload_vtt.outputs.vtt_proxy }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_proxy }}"
-            elseif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
+            elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT       ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
             if [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ]; then
@@ -900,7 +895,6 @@ jobs:
             echo "- Mode      ${IN_MODE:-}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Artifact manifest + GitHub artifact upload ----------
       - name: Create artifact manifest
         if: ${{ always() }}
         shell: bash
