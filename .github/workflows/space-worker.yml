@@ -47,7 +47,7 @@ on:
         type: string
         default: ""
   repository_dispatch:
-    types: [space_worker]  # Use this to bypass the 10-input limit
+    types: [space_worker]
 
 permissions:
   contents: read
@@ -277,7 +277,7 @@ jobs:
           TTL="${SPACE_TITLE:-${IN_TITLE:-}}"
           echo "TTL_FINAL=${TTL}" >> "$GITHUB_ENV"
 
-      - name: Build VTT & syncable grouped transcript from crawler JSONL
+      - name: Build VTT & syncable grouped transcript from crawler JSONL (align to real start)
         shell: bash
         run: |
           set -euxo pipefail
@@ -294,15 +294,23 @@ jobs:
           import json, os, re, html
           from datetime import datetime, timezone
           artdir = os.environ.get("ARTDIR"); base = os.environ.get("BASE"); src = os.environ.get("CC_JSONL") or ""
-          if not src: raise SystemExit(0)
+          space_start=os.environ.get("SPACE_STARTED_AT","").strip()
+          def iso_to_epoch(s):
+              if not s: return None
+              if s.endswith('Z'): s=s[:-1] + '+00:00'
+              # allow +0000 format
+              if re.search(r'[+-]\d{4}$', s): s=s[:-5] + s[-5:-2] + ':' + s[-2:]
+              try:
+                  return datetime.fromisoformat(s).timestamp()
+              except Exception:
+                  return None
+          space_start_epoch = iso_to_epoch(space_start) if space_start else None
           def parse_time_iso(s):
               if not s: return None
               s=s.strip()
               if s.endswith('Z'): s=s[:-1] + '+00:00'
-              import re as _re
-              if _re.search(r'[+-]\d{4}$', s): s=s[:-5] + s[-5:-2] + ':' + s[-2:]
+              if re.search(r'[+-]\d{4}$', s): s=s[:-5] + s[-5:-2] + ':' + s[-2:]
               try:
-                  from datetime import datetime, timezone
                   dt = datetime.fromisoformat(s)
                   if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
                   return dt.timestamp()
@@ -311,13 +319,13 @@ jobs:
               if t < 0: t = 0.0
               h=int(t//3600); m=int((t%3600)//60); s=t%60
               return f"{h:02d}:{m:02d}:{s:06.3f}"
+          def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
           def clean_name(s):
               s = s or ""
               s = re.sub(r'[<>&]', '', s)
               s = ''.join(ch for ch in s if (ch in '\t\n' or ord(ch) >= 32))
               s = s.strip()
               return s or "Speaker"
-          def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
           utt=[]
           with open(src,'r',encoding='utf-8',errors='ignore') as f:
               for line in f:
@@ -350,26 +358,31 @@ jobs:
                   utt.append({"ts":ts,"name":clean_name(name),"username":username,"avatar":avatar,"text":text})
           utt.sort(key=lambda x:x["ts"])
           if not utt: raise SystemExit(0)
-          t0_abs=utt[0]["ts"]
+          first_caption_abs = utt[0]["ts"]
+          # choose reference: real start if we have it, else first caption
+          ref = space_start_epoch if space_start_epoch else first_caption_abs
+          cap_offset = 0
+          if space_start_epoch:
+              cap_offset = max(0, int(round(first_caption_abs - space_start_epoch)))
+          # build merged/compacted groups with times relative to ref
+          groups=[]; GAP_MAX=4.0; cur=None
+          def rel(t): return max(0.0, t - ref)
           for i,u in enumerate(utt):
-              u["start_rel"]=u["ts"]-t0_abs
-              if i+1<len(utt):
-                  nxt=utt[i+1]["ts"]-t0_abs
-                  u["end_rel"]=max(u["start_rel"]+0.6, nxt-0.1)
+              start_rel = rel(u["ts"])
+              # estimate end based on next or text len
+              if i+1 < len(utt):
+                  next_rel = rel(utt[i+1]["ts"])
+                  end_rel  = max(start_rel + 0.6, next_rel - 0.1)
               else:
                   words=max(1,len(u["text"].split()))
-                  dur=min(6.0,max(1.2,0.35*words+0.8))
-                  u["end_rel"]=u["start_rel"]+dur
-          groups=[]; GAP_MAX=4.0; cur=None
-          for u in utt:
-              if (cur is not None and u["name"]==cur["name"] and u["username"]==cur["username"] and (u["start_rel"]-cur["end_rel"])<=GAP_MAX):
+                  end_rel = start_rel + min(6.0,max(1.2,0.35*words+0.8))
+              u2={"name":u["name"],"username":u["username"],"avatar":u["avatar"],"text":u["text"],"start_rel":start_rel,"end_rel":end_rel,"ts":u["ts"]}
+              if (cur is not None and u2["name"]==cur["name"] and u2["username"]==cur["username"] and (u2["start_rel"]-cur["end_rel"])<=GAP_MAX):
                   sep="" if cur["text"].endswith(('.', '!', '?')) else " "
-                  cur["text"]=(cur["text"]+sep+u["text"]).strip()
-                  cur["end_rel"]=max(cur["end_rel"],u["end_rel"]); cur["_last_ts"]=u["ts"]
+                  cur["text"]=(cur["text"]+sep+u2["text"]).strip()
+                  cur["end_rel"]=max(cur["end_rel"],u2["end_rel"])
               else:
-                  cur={"name":u["name"],"username":u["username"] ,"avatar":u["avatar"],
-                       "start_rel":u["start_rel"],"end_rel":u["end_rel"],"text":u["text"],"_last_ts":u["ts"]}
-                  groups.append(cur)
+                  cur=u2; groups.append(cur)
           vtt_path=os.path.join(artdir,f"{base}.vtt")
           with open(vtt_path,"w",encoding="utf-8") as vf:
               vf.write("WEBVTT\n\n")
@@ -395,30 +408,33 @@ jobs:
           if(document.readyState!=='loading') bind(); else document.addEventListener('DOMContentLoaded',bind);})();</script>'''
           with open(tr_path,"w",encoding="utf-8") as tf:
               tf.write(css); tf.write('<div class="ss3k-transcript">\\n')
-              def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-              import html as _html
-              def fmt_ts(t): 
+              def fmt_ts2(t): 
                   h=int(t//3600); m=int((t%3600)//60); s=t%60
                   return f"{h:02d}:{m:02d}:{s:06.3f}"
+              def esc2(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
               for i,g in enumerate(groups,1):
-                  name=esc(g["name"]); uname=(g.get("username") or "").strip()
-                  prof=f"https://x.com/{_html.escape(uname, True)}" if uname else ""
-                  avatar=g.get("avatar") or (f"https://unavatar.io/x/{_html.escape(uname, True)}" if uname else "")
-                  avtag=f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{esc(avatar)}" alt=""></a>' if avatar else '<div style="width:26px;height:26px"></div>'
+                  name=esc2(g["name"]); uname=(g.get("username") or "").strip()
+                  prof=f"https://x.com/{uname}" if uname else ""
+                  avatar=g.get("avatar") or (f"https://unavatar.io/x/{uname}" if uname else "")
+                  avtag=f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{esc2(avatar)}" alt=""></a>' if avatar else '<div style="width:26px;height:26px"></div>'
                   name_html=f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{name}</strong></a></span>' if prof else f'<span class="ss3k-name"><strong>{name}</strong></span>'
                   tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{name}">')
                   tf.write(avtag); tf.write('<div class="ss3k-body">')
-                  tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
-                  tf.write(f'<div class="ss3k-text">{esc(g["text"])}</div></div></div>\\n')
+                  tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts2(g["start_rel"])}</time>–<time>{fmt_ts2(g["end_rel"])}</time></div>')
+                  tf.write(f'<div class="ss3k-text">{esc2(g["text"])}</div></div></div>\\n')
               tf.write('</div>\\n'); tf.write(js)
-          from datetime import datetime, timezone
-          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-          open(os.path.join(artdir,f"{base}.start.txt"),"w",encoding="utf-8").write(start_iso + "\n")
+          # write diagnostics (do NOT overwrite SPACE_STARTED_AT)
+          with open(os.path.join(artdir,f"{base}.caption_offset_seconds.txt"),"w",encoding="utf-8") as f:
+              f.write(str(cap_offset)+"\n")
           PYCODE
-          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SPACE_STARTED_AT="${SPACE_STARTED_AT:-}" python3 "${WORKDIR}/gen_vtt.py"
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}.start.txt" ] && echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV" || true
+          if [ -s "${ARTDIR}/${BASE}.caption_offset_seconds.txt" ]; then
+            echo "CAPTION_OFFSET_SECONDS=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.caption_offset_seconds.txt")" >> "$GITHUB_ENV"
+          else
+            echo "CAPTION_OFFSET_SECONDS=0" >> "$GITHUB_ENV"
+          fi
           fi
 
       - name: Notify WP — processing audio
@@ -509,6 +525,49 @@ jobs:
           fi
           echo "MP3_PATH=${ARTDIR}/${BASE}.mp3" >> "$GITHUB_ENV"
 
+      - name: Fill early gap with ASR (Deepgram) & merge with crawler VTT (if captions were late)
+        id: merge_gap
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Conditions: have crawler VTT, have MP3, Deepgram enabled, and a sizeable gap
+          GAP="${CAPTION_OFFSET_SECONDS:-0}"
+          if [ "${IN_MODE:-}" = "attendees_only" ] || [ -z "${VTT_PATH:-}" ] || [ -z "${MP3_PATH:-}" ]; then
+            echo "Skip merge gap: wrong mode or missing VTT/MP3"
+            exit 0
+          fi
+          if [ "${IN_DO_TRANSCRIPT}" != "true" ] || [ -z "${DEEPGRAM_API_KEY:-}" ]; then
+            echo "Skip merge gap: Deepgram disabled"
+            exit 0
+          fi
+          if [ "$GAP" -lt 600 ]; then
+            echo "Caption offset small (${GAP}s); no ASR gap fill"
+            exit 0
+          fi
+          echo "Gap is ${GAP}s — generating ASR for head segment"
+          HEAD_MP3="${WORKDIR}/head_${GAP}.mp3"
+          ffmpeg -hide_banner -y -t "${GAP}" -i "${MP3_PATH}" -c copy "${HEAD_MP3}"
+          HEAD_VTT="${WORKDIR}/head_${GAP}.vtt"
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${HEAD_MP3}" \
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&format=vtt" \
+            -o "${HEAD_VTT}" || true
+          if [ ! -s "${HEAD_VTT}" ]; then
+            echo "Deepgram head VTT not produced; skipping merge"
+            exit 0
+          fi
+          MERGED="${ARTDIR}/${BASE}.vtt"
+          {
+            echo "WEBVTT"; echo
+            # head vtt without its header
+            awk 'NR>1{print}' "${HEAD_VTT}"
+            # crawler vtt without header (already aligned to real start)
+            awk 'NR>1{print}' "${VTT_PATH}"
+          } > "${MERGED}"
+          echo "VTT_PATH=${MERGED}" >> "$GITHUB_ENV"
+
       - name: Upload MP3 to GCS
         id: upload_mp3
         shell: bash
@@ -529,14 +588,14 @@ jobs:
           echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Prefer crawler captions if present
+      - name: Prefer crawler/merged captions if present
         id: crawl_cc
         shell: bash
         run: |
           set -euxo pipefail
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
 
-      - name: VTT via Deepgram (fallback)
+      - name: VTT via Deepgram (fallback for all)
         id: deepgram
         shell: bash
         run: |
@@ -546,11 +605,11 @@ jobs:
             exit 0
           fi
           if [ -n "${VTT_PATH:-}" ]; then
-            echo "Already have VTT"
+            echo "Already have VTT (crawler/merged)"
             exit 0
           fi
           if [ "${IN_DO_TRANSCRIPT}" != "true" ] || [ -z "${MP3_PATH:-}" ] || [ -z "${DEEPGRAM_API_KEY:-}" ]; then
-            echo "Skipping Deepgram"
+            echo "Skipping Deepgram fallback"
             exit 0
           fi
           curl -sS -X POST \
@@ -704,14 +763,6 @@ jobs:
                   if getattr(m,"type",None)=="photo" and getattr(m,"media_url_https",None):
                       parts.append(f'<img class="reply-media" src="{esc(m.media_url_https)}" alt="">')
               return ("\n        " + "\n        ".join(parts)) if parts else ""
-          domain_links=defaultdict(list)
-          def collect(t):
-              for u in (t.urls or []):
-                  href=u.expanded_url or u.url
-                  if not href: continue
-                  dom=tldextract.extract(href); host=dom.registered_domain or href
-                  if href not in domain_links[host]: domain_links[host].append(href)
-          for t in [root]+all_replies: collect(t)
           def render(n,level=1):
               t=n["tweet"]; sn=t.user.screen_name if t.user else "user"; name=t.user.name if t.user else sn
               prof=f"https://x.com/{esc(sn)}"; tw=f"https://x.com/{esc(sn)}/status/{t.id}"
@@ -770,6 +821,18 @@ jobs:
           </script>
           <div class="ss3k-replies">'''; html_bottom="\n</div>\n"
           replies_html = html_top + "\n" + render(node[root.id]) + "\n" + html_bottom
+          # Extract and group unique links by registered domain
+          domain_links=defaultdict(list)
+          def collect_links(t):
+              for u in (t.urls or []):
+                  href=u.expanded_url or u.url
+                  if not href: continue
+                  d=tldextract.extract(href); host=d.registered_domain or href
+                  if href not in domain_links[host]: domain_links[host].append(href)
+          for n in node.values():
+              collect_links(n["tweet"])
+              for c in n["children"]:
+                  collect_links(c["tweet"])
           parts=[]
           for dom in sorted(domain_links):
               links="\n".join(f'  <li><a href="{html.escape(u, True)}" target="_blank" rel="noopener">{html.escape(u, True)}</a></li>' for u in domain_links[dom])
@@ -821,9 +884,9 @@ jobs:
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
-             + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
-             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
+             + (if ($rep|gsub("\\s";"")|length)>0 then {replies_html:$rep} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {links_html:$lnk} else {} end)
+             + (if ($started|length)>0 then {space_date:$started} else {} end)
             ' > "$REQ"
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
@@ -873,6 +936,7 @@ jobs:
             echo "- Post ID   ${IN_POST_ID:-}"
             if [ -n "${SPACE_TITLE:-}" ]; then echo "- Space title: ${SPACE_TITLE}"; fi
             if [ -n "${SPACE_STARTED_AT:-}" ]; then echo "- Space start (UTC): ${SPACE_STARTED_AT}"; fi
+            echo "- Caption offset (s): ${CAPTION_OFFSET_SECONDS:-0}"
             if [ -n "${{ steps.upload_mp3.outputs.audio_proxy }}" ]; then
               echo "- Audio     ${{ steps.upload_mp3.outputs.audio_proxy }}"
             elif [ -n "${{ steps.upload_mp3.outputs.audio_raw }}" ]; then
@@ -911,7 +975,7 @@ jobs:
             find "${ARTDIR}" -type f -printf '%P\t%TY-%Tm-%Td %TH:%TM:%TS\t%k KB\n' | sort || true
           } > "$MAN"
           mkdir -p "${ARTDIR}/debug"
-          for f in "${WORKDIR}/pass1.log" "${WORKDIR}/loudnorm1.json" "${WORKDIR}/wp_register_body.json"; do
+          for f in "${WORKDIR}/pass1.log" "${WORKDIR}/loudnorm1.json" "${WORKDIR}/wp_register_body.json" "${ARTDIR}/${BASE}.caption_offset_seconds.txt"; do
             [ -s "$f" ] && cp -f "$f" "${ARTDIR}/debug/" || true
           done
 
