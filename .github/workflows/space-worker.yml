@@ -235,29 +235,62 @@ jobs:
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
-      - name: Extract Space title & start from crawler metadata
-        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' }}
+      - name: Extract Space title & start (robust)
         shell: bash
         run: |
           set -euo pipefail
           J="${ARTDIR}/_as_line.json"
-          if [ -s "$J" ]; then
-            TITLE="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
-            if [ -n "$TITLE" ] && [ "$TITLE" != "null" ]; then
-              echo "SPACE_TITLE=${TITLE}" >> "$GITHUB_ENV"
-            fi
-            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // empty)' "$J")"
-            if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
-              if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
-                SEC=$((START_RAW/1000)); DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ')"
-              else
-                DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-              fi
-              [ -n "$DATE_GMT" ] && echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
+          RAW_TXT="${ARTDIR}/_as_line_after_pipe.txt"
+
+          TITLE=""
+          START_RAW=""
+
+          # 1) Try proper JSON if it’s actually valid
+          if [ -s "$J" ] && jq -e . "$J" >/dev/null 2>&1; then
+            TITLE="$(jq -r '(.audioSpace // .) | (.metadata.title // empty)' "$J" || true)"
+            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // empty)' "$J" || true)"
+          fi
+
+          # 2) If jq failed (masked logs), pull via regex from the raw text
+          if [ -z "$TITLE" ] && [ -s "$RAW_TXT" ]; then
+            TITLE="$(grep -oE '"title":"[^"]+"' "$RAW_TXT" | head -n1 | sed -E 's/^"title":"(.*)"$/\1/')" || true
+          fi
+          if [ -z "$START_RAW" ] && [ -s "$RAW_TXT" ]; then
+            START_RAW="$(grep -oE '"started_at":[0-9"]+' "$RAW_TXT" | head -n1 | sed -E 's/^"started_at"://; s/"//g')" || true
+            [ -z "$START_RAW" ] && START_RAW="$(grep -oE '"startedAt":"[^"]+"' "$RAW_TXT" | head -n1 | sed -E 's/^"startedAt":"(.*)"/\1/')" || true
+          fi
+
+          # 3) Final fallback: parse the audio filename
+          if [ -z "$TITLE" ] && [ -n "${INPUT_FILE:-}" ]; then
+            BN="$(basename "$INPUT_FILE")"
+            # Pattern: [user][code] Title (ID).ext
+            TITLE="$(printf '%s' "$BN" | sed -E 's/^\[[^]]+\]\s*\[[^]]+\]\s*//; s/\s*\([^)]+\)\.[^.]+$//; s/_/ /g')" || true
+          fi
+
+          # Export title if found
+          if [ -n "$TITLE" ] && [ "$TITLE" != "null" ]; then
+            echo "SPACE_TITLE=$TITLE" >> "$GITHUB_ENV"
+          fi
+
+          # Normalize started_at to ISO8601Z if we have it
+          DATE_GMT=""
+          if [ -n "${START_RAW:-}" ] && [ "${START_RAW}" != "null" ]; then
+            if [[ "$START_RAW" =~ ^[0-9]{13,}$ ]]; then
+              SEC=$((START_RAW/1000))
+              DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+            elif [[ "$START_RAW" =~ ^[0-9]{10}$ ]]; then
+              DATE_GMT="$(date -u -d "@$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+            else
+              DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
             fi
           fi
+          [ -n "$DATE_GMT" ] && echo "SPACE_STARTED_AT=$DATE_GMT" >> "$GITHUB_ENV" || true
+
+          # Decide final title
           TTL="${SPACE_TITLE:-${{ github.event.inputs.title }}}"
-          echo "TTL_FINAL=${TTL}" >> "$GITHUB_ENV"
+          if [ -z "$TTL" ] && [ -n "$TITLE" ]; then TTL="$TITLE"; fi
+          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
+
 
       - name: Build VTT & syncable grouped transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
