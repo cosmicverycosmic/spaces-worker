@@ -231,7 +231,11 @@ jobs:
           fi
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
-            printf '%s\n' "$RAW" | awk -F'\\| ' '{print $NF}' > "${ARTDIR}/_as_line_after_pipe.txt" || true
+            printf '%s\n' "$RAW" | awk -f <(cat <<'AWK'
+            BEGIN{FS="\\| "}
+            {print $NF}
+AWK
+            ) > "${ARTDIR}/_as_line_after_pipe.txt" || true
             [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
           fi
           echo "crawler_exit=${RC}"
@@ -277,14 +281,57 @@ jobs:
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
           cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
-          <PYTHON GENERATOR CONTENT UNCHANGED FOR BREVITY>
-          PYCODE
+import os, json, html
+from datetime import timedelta
+
+CC_JSONL = os.environ.get("CC_JSONL","")
+ARTDIR   = os.environ.get("ARTDIR",".")
+BASE     = os.environ.get("BASE","space")
+
+def ts(sec: float) -> str:
+    td = timedelta(seconds=float(sec))
+    s  = str(td)
+    if '.' not in s: s += '.000000'
+    h, m, rest = s.split(':')
+    sec, ms = rest.split('.')
+    return f"{int(h):02d}:{int(m):02d}:{int(sec):02d}.{ms[:3]}"
+
+segs=[]
+with open(CC_JSONL, 'r', encoding='utf-8') as f:
+    for line in f:
+        line=line.strip()
+        if not line: continue
+        try:
+            j=json.loads(line)
+        except Exception:
+            continue
+        # common twspace-crawler caption keys
+        start = j.get('start') or j.get('start_ms',0)/1000.0
+        end   = j.get('end')   or j.get('end_ms',0)/1000.0
+        text  = j.get('text')  or j.get('content') or ""
+        spk   = j.get('speaker') or j.get('user') or j.get('handle') or ""
+        if start is None or end is None or not text: continue
+        segs.append((float(start), float(end), str(text), str(spk)))
+
+segs.sort(key=lambda x: x[0])
+
+# write VTT
+vtt_path=os.path.join(ARTDIR, f"{BASE}.vtt")
+with open(vtt_path,'w',encoding='utf-8') as v:
+    v.write("WEBVTT\n\n")
+    for i,(s,e,t,_) in enumerate(segs,1):
+        v.write(f"{i}\n{ts(s)} --> {ts(e)}\n{t}\n\n")
+
+# write simple syncable transcript
+html_path=os.path.join(ARTDIR, f"{BASE}_transcript.html")
+with open(html_path,'w',encoding='utf-8') as h:
+    for s,e,t,spk in segs:
+        meta = f'<div class="ss3k-meta">{html.escape(spk) if spk else ""} {ts(s)}–{ts(e)}</div>' if spk else f'<div class="ss3k-meta">{ts(s)}–{ts(e)}</div>'
+        h.write(f'<div class="ss3k-seg" data-start="{s:.3f}" data-end="{e:.3f}">{meta}<div class="txt">{html.escape(t)}</div></div>\n')
+PYCODE
           CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-          if [ -z "${SPACE_STARTED_AT:-}" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-            echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
-          fi
           fi
 
       - name: Notify WP — processing audio
@@ -504,7 +551,7 @@ jobs:
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk, links_html:$lnk} else {} end)
              + (if ($started|length)>0 then {space_started_at:$started} else {} end)
             ' > "$REQ"
 
@@ -554,7 +601,7 @@ jobs:
         run: |
           set -euxo pipefail
           # Run the checked-in scraper. It gracefully no-ops (exit 0) if creds/inputs are missing.
-          python3 scripts/replies.py
+          python3 .github/workflows/scripts/replies.py
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
 
@@ -579,7 +626,7 @@ jobs:
                progress: 100
              }
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {ss3k_shared_links_html:$lnk, shared_links_html:$lnk} else {} end)
+             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk, links_html:$lnk} else {} end)
              + (if ($purple|length)>0 then {purple_tweet_url:$purple} else {} end)
             ' > "$REQ"
 
@@ -589,7 +636,6 @@ jobs:
             --data-binary @"$REQ" | jq -r .
 
       # --------------- SUMMARY ---------------
-
       - name: Summary
         shell: bash
         env:
