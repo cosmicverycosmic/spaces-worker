@@ -1,436 +1,232 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-replies.py — Build nested replies HTML for one or more root tweets.
+import os, re, json, html, time
+from collections import defaultdict
+import requests, tldextract
 
-Usage (single URL):
-  python3 replies.py --url "https://twitter.com/<SCREEN_NAME>/status/<ID>"
-
-Usage (file, one URL per line like twitter-scraper.py):
-  python3 replies.py --file tweet.list
-  python3 replies.py --file tweet.list --short   # CSV to stdout for diffing
-
-Env (picked up automatically if flags not passed):
-  ARTDIR, BASE
-  PURPLE_URL or TWEET_URL
-  TW_API_CONSUMER_KEY, TW_API_CONSUMER_SECRET, TW_API_ACCESS_TOKEN, TW_API_ACCESS_TOKEN_SECRET
-
-Outputs:
-  {ARTDIR}/{BASE}_replies.html
-  {ARTDIR}/{BASE}_links.html
-  (stdout CSV if --short)
-"""
-
-import os, re, sys, json, html, argparse, traceback
-from collections import defaultdict, deque
-from typing import List, Tuple, Dict
-
-# ---- 3rd party (install via pip): python-twitter, tldextract ----
-try:
-    import twitter  # python-twitter (v1.1)
-    import tldextract
-except Exception:
-    print("Missing deps: install with `pip install python-twitter tldextract`", file=sys.stderr)
-    sys.exit(0)
-
-# ------------ Config / defaults ------------
 ARTDIR = os.environ.get("ARTDIR", ".")
 BASE   = os.environ.get("BASE", "space")
+PURPLE = os.environ.get("PURPLE_TWEET_URL", "").strip()
+SPACE_ID = os.environ.get("SPACE_ID", "").strip()
 
-CK  = os.environ.get("TW_API_CONSUMER_KEY") or ""
-CS  = os.environ.get("TW_API_CONSUMER_SECRET") or ""
-AT  = os.environ.get("TW_API_ACCESS_TOKEN") or ""
-ATS = os.environ.get("TW_API_ACCESS_TOKEN_SECRET") or ""
+# Optional v1.1 keys (if present we'll use python-twitter; otherwise cookie/bearer fallback)
+TW_API_CONSUMER_KEY        = os.environ.get("TW_API_CONSUMER_KEY", "")
+TW_API_CONSUMER_SECRET     = os.environ.get("TW_API_CONSUMER_SECRET", "")
+TW_API_ACCESS_TOKEN        = os.environ.get("TW_API_ACCESS_TOKEN", "")
+TW_API_ACCESS_TOKEN_SECRET = os.environ.get("TW_API_ACCESS_TOKEN_SECRET", "")
 
-COUNT_PER_PAGE     = 100
-MAX_PAGES_SEARCH   = 25
-DEPTH_LIMIT        = 4
-MAX_TWEETS_TOTAL   = 8000  # global cap across roots (defensive)
+AUTH = os.environ.get("TWITTER_AUTHORIZATION", "")
+AUTH_TOKEN = os.environ.get("TWITTER_AUTH_TOKEN", "")
+CSRF = os.environ.get("TWITTER_CSRF_TOKEN", "")
 
-# ------------ Helpers ------------
-def esc(s: str) -> str:
-    return html.escape(s or "", quote=True)
+def esc(s): return html.escape(s or "", quote=True)
 
-TWEET_URL_RE = re.compile(
-    r"^https?://(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/([0-9]+)",
-    re.IGNORECASE
-)
+def ensure_dirs():
+    os.makedirs(ARTDIR, exist_ok=True)
 
-def parse_tweet_url(url: str) -> Tuple[str, int]:
-    m = TWEET_URL_RE.search(url.strip())
-    if not m:
-        raise ValueError(f"Invalid tweet URL: {url}")
-    screen_name, sid = m.group(1), int(m.group(2))
-    return screen_name, sid
+def write_empty_and_exit():
+    open(os.path.join(ARTDIR, f"{BASE}_replies.html"), "w", encoding="utf-8").write("")
+    open(os.path.join(ARTDIR, f"{BASE}_links.html"),   "w", encoding="utf-8").write("")
+    raise SystemExit(0)
 
-def create_api() -> twitter.Api:
-    if not (CK and CS and AT and ATS):
-        print("Replies disabled — missing Twitter credentials.", file=sys.stderr)
-        sys.exit(0)
-    return twitter.Api(
-        consumer_key=CK, consumer_secret=CS,
-        access_token_key=AT, access_token_secret=ATS,
-        sleep_on_rate_limit=True, tweet_mode="extended"
-    )
+def extract_tweet_id(url):
+    m = re.search(r"/status/(\d+)", url)
+    return m.group(1) if m else ""
 
-def get_status_by_id(api: twitter.Api, sid: int) -> twitter.Status:
+def fetch_syndication(id_or_url):
+    url = "https://cdn.syndication.twimg.com/tweet-result"
+    params = {"id": id_or_url} if id_or_url.isdigit() else {"url": id_or_url}
     try:
-        return api.GetStatus(status_id=sid, include_my_retweet=False, trim_user=False)
-    except Exception as e:
-        print(f"GetStatus({sid}) error: {e}", file=sys.stderr)
-        return None
+        r = requests.get(url, params=params, timeout=20)
+        if r.ok: return r.json()
+    except Exception:
+        pass
+    return {}
 
-def do_search(api: twitter.Api, term: str, since_id: int = None,
-              max_pages: int = 5, cap: int = 2000) -> List[twitter.Status]:
-    out, max_id, pages = [], None, 0
-    while pages < max_pages and len(out) < cap:
-        try:
-            batch = api.GetSearch(
-                term=term, count=COUNT_PER_PAGE, include_entities=True,
-                max_id=max_id, since_id=since_id, result_type="recent"
-            )
-        except Exception as e:
-            print(f"Search error for '{term}': {e}", file=sys.stderr)
-            break
-        if not batch:
-            break
-        out.extend(batch)
-        max_id = min(t.id for t in batch) - 1
+def cookie_headers():
+    return {
+        "authorization": AUTH,
+        "x-twitter-active-user": "yes",
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-csrf-token": CSRF,
+        "user-agent": "Mozilla/5.0",
+        "accept": "application/json"
+    }, {"auth_token": AUTH_TOKEN, "ct0": CSRF}
+
+def call_search_adaptive(q, cursor=None):
+    headers, cookies = cookie_headers()
+    params = {
+        "q": q,
+        "count": "100",
+        "tweet_mode": "extended",
+        "query_source": "typed_query",
+        "pc": "1",
+        "spelling_corrections": "1",
+    }
+    if cursor: params["cursor"] = cursor
+    url = "https://api.twitter.com/2/search/adaptive.json"
+    r = requests.get(url, headers=headers, cookies=cookies, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def collect_conversation_with_cookie(root_id, screen_name):
+    tweets, users = {}, {}
+    cursor = None
+    pages = 0
+    # Query focuses on this conversation; adding `to:screen_name` narrows noise
+    q = f"conversation_id:{root_id}" + (f" to:{screen_name}" if screen_name else "")
+    while pages < 12:
+        data = call_search_adaptive(q, cursor)
         pages += 1
-    return out
+        go = data.get("globalObjects") or {}
+        tweets.update(go.get("tweets") or {})
+        users.update(go.get("users") or {})
+        # find next cursor (Bottom)
+        cursor = None
+        tl = data.get("timeline") or {}
+        for instr in tl.get("instructions", []):
+            ae = instr.get("addEntries", {})
+            if ae:
+                for e in ae.get("entries", []):
+                    cur = e.get("content", {}).get("operation", {}).get("cursor", {})
+                    if cur.get("cursorType") == "Bottom":
+                        cursor = cur.get("value")
+            re_ = instr.get("replaceEntry", {})
+            if re_:
+                e = re_.get("entry", {})
+                cur = e.get("content", {}).get("operation", {}).get("cursor", {})
+                if cur.get("cursorType") == "Bottom":
+                    cursor = cur.get("value")
+        if not cursor:
+            break
+        time.sleep(0.7)
+    return tweets, users
 
-def avatar_for(user) -> str:
-    if not user: return ""
-    return getattr(user, "profile_image_url_https", None) \
-        or getattr(user, "profile_image_url", None) \
-        or f"https://unavatar.io/x/{esc(getattr(user, 'screen_name', '') or '')}"
+def build_and_write_html(root_id, tweets, users):
+    # Only tweets in this conversation (skip the root in the list)
+    conv = {tid:t for tid,t in tweets.items() if t.get("conversation_id_str")==root_id and tid != root_id}
 
-def expand_text(status: twitter.Status) -> str:
-    txt = getattr(status, "full_text", None) or getattr(status, "text", "") or ""
-    for u in (getattr(status, "urls", None) or []):
-        try:
-            if u.expanded_url and u.url:
-                txt = txt.replace(u.url, u.expanded_url)
-        except Exception:
-            pass
-    return esc(txt)
+    # parent -> children list
+    by_parent = defaultdict(list)
+    for tid, t in conv.items():
+        pid = t.get("in_reply_to_status_id_str") or root_id
+        by_parent[pid].append(tid)
+    for lst in by_parent.values():
+        lst.sort(key=lambda tid: tweets[tid].get("id_str"))
 
-def media_block(status: twitter.Status) -> str:
-    media = getattr(status, "media", None) or []
-    parts = []
-    for m in media:
-        try:
-            if getattr(m, "type", None) == "photo" and getattr(m, "media_url_https", None):
-                parts.append(f'<img class="reply-media" src="{esc(m.media_url_https)}" alt="">')
-        except Exception:
-            pass
-    return ("\n        " + "\n        ".join(parts)) if parts else ""
+    def user_of(t):
+        uid = t.get("user_id_str") or ""
+        return users.get(uid) or {}
 
-def link_chips(status: twitter.Status) -> str:
-    chips, seen = [], set()
-    for u in (getattr(status, "urls", None) or []):
-        try:
-            href = u.expanded_url or u.url
-            if not href or href in seen: 
-                continue
+    def links_and_media(t):
+        chips=[]; seen=set()
+        ents = (t.get("entities") or {})
+        for u in ents.get("urls", []):
+            href = u.get("expanded_url") or u.get("url") or ""
+            if not href or href in seen: continue
             seen.add(href)
             dom = tldextract.extract(href)
             host = dom.registered_domain or href
             chips.append(f'<a class="ss3k-link-card" href="{esc(href)}" target="_blank" rel="noopener">{esc(host)}</a>')
-        except Exception:
-            pass
-    return ('\n        <div class="ss3k-link-cards">' + "\n          " + "\n          ".join(chips) + "\n        </div>") if chips else ""
+        media_html=""
+        ents2=(t.get("extended_entities") or {})
+        for m in ents2.get("media", []):
+            if m.get("type")=="photo" and m.get("media_url_https"):
+                media_html += f'\n        <img class="reply-media" src="{esc(m["media_url_https"])}" alt="">'
+        return (('\n        <div class="ss3k-link-cards">'+"\n          "+"\n          ".join(chips)+"\n        </div>") if chips else ""), media_html
 
-def collect_links(status: twitter.Status, bucket: Dict[str, List[str]]):
-    for u in (getattr(status, "urls", None) or []):
-        try:
-            href = u.expanded_url or u.url
-            if not href: 
-                continue
-            dom = tldextract.extract(href)
-            host = dom.registered_domain or href
-            if href not in bucket[host]:
-                bucket[host].append(href)
-        except Exception:
-            pass
-
-def ts_iso(status: twitter.Status) -> str:
-    try:
-        t = status.created_at_in_seconds or 0
-        from datetime import datetime, timezone
-        return datetime.fromtimestamp(t, tz=timezone.utc).isoformat(timespec="seconds")
-    except Exception:
-        return ""
-
-# ------------ Core: build a tree for one root tweet ------------
-def build_thread_for_root(api: twitter.Api, root: twitter.Status,
-                          depth_limit: int = DEPTH_LIMIT) -> Tuple[Dict[int, dict], Dict[str, List[str]]]:
-    """
-    Build a reply tree for 'root' using BFS over 'to:@user filter:replies' searches with since_id=root.id.
-    Attach only tweets whose in_reply_to_status_id is already a known node (keeps us inside the thread).
-    """
-    node: Dict[int, dict] = {}  # id -> {"tweet": status, "children": []}
-    def make_node(t): return {"tweet": t, "children": []}
-    node[root.id] = make_node(root)
-
-    known_ids = set([root.id])
-    queue = deque()
-
-    root_user = getattr(root, "user", None)
-    root_sn = (getattr(root_user, "screen_name", None) or "").lower()
-    if root_sn:
-        queue.append((root_sn, 0))
-
-    total_collected = 1
-    domain_links = defaultdict(list)
-    collect_links(root, domain_links)
-
-    processed_keys = set()  # (screen_name, depth)
-
-    while queue and total_collected < MAX_TWEETS_TOTAL:
-        sn, depth = queue.popleft()
-        if depth > depth_limit or not sn:
-            continue
-        key = (sn, depth)
-        if key in processed_keys:
-            continue
-        processed_keys.add(key)
-
-        term = f"to:{sn} filter:replies"
-        replies = do_search(api, term, since_id=root.id, max_pages=MAX_PAGES_SEARCH, cap=3000)
-
-        attached = 0
-        for t in replies:
-            pid = getattr(t, "in_reply_to_status_id", None)
-            if not pid or pid not in node:
-                continue  # not attached to something we already have
-            if t.id in node:
-                continue
-            node[t.id] = make_node(t)
-            node[pid]["children"].append(node[t.id])
-            known_ids.add(t.id)
-            attached += 1
-            total_collected += 1
-            collect_links(t, domain_links)
-
-        # sort children by time
-        for n in node.values():
-            if n["children"]:
-                n["children"].sort(key=lambda x: x["tweet"].created_at_in_seconds or 0)
-
-        # enqueue next authors
-        if attached and depth + 1 <= depth_limit:
-            new_users = set()
-            for nid, n in node.items():
-                t = n["tweet"]
-                pid = getattr(t, "in_reply_to_status_id", None)
-                if pid and pid in node:
-                    u = getattr(t, "user", None)
-                    sn2 = (getattr(u, "screen_name", None) or "").lower()
-                    if sn2:
-                        new_users.add(sn2)
-            for sn2 in new_users:
-                queue.append((sn2, depth + 1))
-
-    return node, domain_links
-
-# ------------ Rendering ------------
-def render_tree(node_map: Dict[int, dict], root_id: int) -> str:
-    def render(n, level=1):
-        t = n["tweet"]
-        user = getattr(t, "user", None)
-        sn = getattr(user, "screen_name", None) or "user"
-        name = getattr(user, "name", None) or sn
-        prof = f"https://x.com/{esc(sn)}"
-        tw   = f"https://x.com/{esc(sn)}/status/{t.id}"
-        iso  = ts_iso(t)
-        av   = avatar_for(user)
-        content = expand_text(t)
-        links   = link_chips(t)
-        media   = media_block(t)
-
-        child = ""
-        if n["children"]:
-            cid = f"children-{t.id}"
-            btn = f"Show {len(n['children'])} reply" + ("" if len(n["children"]) == 1 else "ies")
-            child = (
-                f'\n      <button class="ss3k-toggle" data-label="{esc(btn)}" data-hide="Hide replies" '
-                f'onclick="ss3kToggleReplies(\'{cid}\', this)">{esc(btn)}</button>\n'
-                f'      <div class="ss3k-children" id="{cid}">\n'
-                + "\n".join(render(c, level+1) for c in n["children"]) +
-                "\n      </div>"
-            )
-
-        return f'''
-      <div class="ss3k-reply-card" id="{t.id}" data-level="{level}">
+    def render(pid):
+        out=[]
+        for tid in by_parent.get(pid, []):
+            t = tweets[tid]
+            u = user_of(t)
+            sn = u.get("screen_name") or ""
+            nm = u.get("name") or sn
+            prof = f"https://x.com/{esc(sn)}" if sn else "#"
+            twurl = f"https://x.com/{esc(sn)}/status/{tid}" if sn else f"https://x.com/i/status/{tid}"
+            av = u.get("profile_image_url_https") or (f"https://unavatar.io/x/{esc(sn)}" if sn else "")
+            txt = t.get("full_text") or t.get("text") or ""
+            ents = (t.get("entities") or {})
+            for uo in ents.get("urls", []):
+                if uo.get("url") and uo.get("expanded_url"):
+                    txt = txt.replace(uo["url"], uo["expanded_url"])
+            links, media = links_and_media(t)
+            created = t.get("created_at") or ""
+            card = f'''
+      <div class="ss3k-reply-card" id="{tid}">
         <div class="ss3k-reply-head">
-          <a href="{prof}" target="_blank" rel="noopener">
-            <img class="avatar" src="{esc(av)}" alt="">
-          </a>
+          <a href="{prof}" target="_blank" rel="noopener"><img class="avatar" src="{esc(av)}" alt=""></a>
           <div>
-            <div>
-              <a href="{prof}" target="_blank" rel="noopener"><strong>{esc(name)}</strong></a>
-              <span style="color:#64748b">@{esc(sn)}</span>
-            </div>
-            <div class="ss3k-reply-meta">
-              <a href="{tw}" target="_blank" rel="noopener">
-                <time datetime="{iso}">{esc(iso.replace('T',' '))} UTC</time>
-              </a>
-            </div>
+            <div><a href="{prof}" target="_blank" rel="noopener"><strong>{esc(nm)}</strong></a> <span style="color:#64748b">@{esc(sn)}</span></div>
+            <div class="ss3k-reply-meta"><a href="{twurl}" target="_blank" rel="noopener">{esc(created)}</a></div>
           </div>
         </div>
-        <div class="ss3k-reply-content">{content}</div>{media}{links}{child}
+        <div class="ss3k-reply-content">{esc(txt)}</div>{media}{links}
       </div>'''.rstrip()
+            out.append(card)
+            out.extend(render(tid))
+        return out
 
-    html_top = '''<style>
-    .ss3k-replies{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-    .ss3k-reply-card{border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:10px 0;background:#fff;box-shadow:0 1px 1px rgba(0,0,0,.03)}
-    .ss3k-reply-head{display:flex;align-items:center;gap:8px}
-    .ss3k-reply-head img.avatar{width:28px;height:28px;border-radius:50%}
-    .ss3k-reply-meta{color:#64748b;font-size:12px;margin-top:4px}
-    .ss3k-reply-content{margin-top:8px;white-space:pre-wrap;word-break:break-word}
-    .ss3k-link-cards{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
-    .ss3k-link-card{border:1px solid #cbd5e1;padding:4px 8px;border-radius:8px;background:#f8fafc;font-size:12px}
-    .ss3k-children{margin-left:16px;display:none}
-    .ss3k-toggle{margin-top:6px;font-size:12px;color:#2563eb;background:none;border:none;padding:0;cursor:pointer}
-    .reply-media{max-width:100%;border-radius:10px;margin-top:8px}
-    </style>
-    <script>
-    function ss3kToggleReplies(id,btn){
-      const el=document.getElementById(id); if(!el) return;
-      const open=(el.style.display==='block'); el.style.display=open?'none':'block';
-      if(btn){ btn.textContent=open?(btn.dataset.label||'Show replies'):(btn.dataset.hide||'Hide replies'); }
-    }
-    </script>
-    <div class="ss3k-replies">'''
-    html_bottom = "\n</div>\n"
-    return html_top + "\n" + render(node_map[root_id]) + "\n" + html_bottom
+    style = '''<style>
+.ss3k-replies{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+.ss3k-reply-card{border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:10px 0;background:#fff;box-shadow:0 1px 1px rgba(0,0,0,.03)}
+.ss3k-reply-head{display:flex;align-items:center;gap:8px}
+.ss3k-reply-head img.avatar{width:28px;height:28px;border-radius:50%}
+.ss3k-reply-meta{color:#64748b;font-size:12px;margin-top:4px}
+.ss3k-reply-content{margin-top:8px;white-space:pre-wrap;word-break:break-word}
+.ss3k-link-cards{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
+.ss3k-link-card{border:1px solid #cbd5e1;padding:4px 8px;border-radius:8px;background:#f8fafc;font-size:12px}
+.reply-media{max-width:100%;border-radius:10px;margin-top:8px}
+</style>
+<div class="ss3k-replies">
+'''
+    root_link = f"https://x.com/i/status/{root_id}"
+    html_out = style + f'<div class="ss3k-reply-meta">Thread: <a href="{esc(root_link)}" target="_blank" rel="noopener">{esc(root_link)}</a></div>\n'
+    html_out += "\n".join(render(root_id)) + "\n</div>\n"
+    open(os.path.join(ARTDIR, f"{BASE}_replies.html"), "w", encoding="utf-8").write(html_out)
 
-def write_links_html(domain_links: Dict[str, List[str]], out_path: str):
-    parts = []
-    for dom in sorted(domain_links):
-        links = "\n".join(
-            f'  <li><a href="{esc(u)}" target="_blank" rel="noopener">{esc(u)}</a></li>'
-            for u in domain_links[dom]
-        )
-        parts.append(f"<h4>{esc(dom)}</h4>\n<ul>\n{links}\n</ul>")
-    open(out_path, "w", encoding="utf-8").write("\n\n".join(parts))
+    # Shared links by domain
+    domain_links=defaultdict(list)
+    for t in conv.values():
+        for uo in (t.get("entities") or {}).get("urls", []):
+            href = uo.get("expanded_url") or uo.get("url") or ""
+            if not href: continue
+            dom = tldextract.extract(href)
+            host = dom.registered_domain or href
+            if href not in domain_links[host]:
+                domain_links[host].append(href)
+    parts=[]
+    for dom, urls in sorted(domain_links.items()):
+        parts.append("<h4>"+esc(dom)+"</h4>\n<ul>\n" + "\n".join(f'  <li><a href="{esc(u)}" target="_blank" rel="noopener">{esc(u)}</a></li>' for u in urls) + "\n</ul>")
+    open(os.path.join(ARTDIR, f"{BASE}_links.html"), "w", encoding="utf-8").write("\n\n".join(parts))
 
-# ------------ Short (CSV) output ------------
-def print_csv(node_map: Dict[int, dict], root_id: int):
-    """
-    Print CSV: date,reply_url,parent_url (breadth-first).
-    """
-    from collections import deque
-    print("date,reply,parent_thread")
-    q = deque([node_map[root_id]])
-    while q:
-        n = q.popleft()
-        t = n["tweet"]
-        iso = ts_iso(t).replace("T", " ")
-        user = getattr(t, "user", None)
-        sn = getattr(user, "screen_name", None) or "user"
-        url = f"https://twitter.com/{sn}/status/{t.id}"
-        # parent:
-        pid = getattr(t, "in_reply_to_status_id", None)
-        purl = ""
-        if pid and pid in node_map:
-            p = node_map[pid]["tweet"]
-            psn = getattr(getattr(p, "user", None), "screen_name", None) or "user"
-            purl = f"https://twitter.com/{psn}/status/{p.id}"
-        print(f"{iso},{url},{purl}")
-        for c in n["children"]:
-            q.append(c)
-
-# ------------ Main ------------
 def main():
-    parser = argparse.ArgumentParser(description="Build nested replies from a Purple Pill tweet URL (or list).")
-    parser.add_argument("-u","--url", help="Single tweet URL (https://twitter.com/<screen_name>/status/<id>)")
-    parser.add_argument("-f","--file", help="File with tweet URLs (one per line)")
-    parser.add_argument("-s","--short", action="store_true", help="CSV to stdout (date,reply,parent)")
-    args = parser.parse_args()
+    ensure_dirs()
 
-    # Resolve inputs
-    urls = []
-    if args.url:
-        urls = [args.url.strip()]
-    elif args.file:
-        with open(args.file, "r", encoding="utf-8", errors="ignore") as fh:
-            urls = [ln.strip() for ln in fh if ln.strip()]
-    else:
-        # env fallbacks
-        env_url = os.environ.get("PURPLE_URL") or os.environ.get("TWEET_URL") or ""
-        if env_url.strip():
-            urls = [env_url.strip()]
-        else:
-            # also support default tweet.list in ARTDIR if present
-            cand = os.path.join(ARTDIR, "tweet.list")
-            if os.path.exists(cand):
-                with open(cand, "r", encoding="utf-8", errors="ignore") as fh:
-                    urls = [ln.strip() for ln in fh if ln.strip()]
+    # We need at least a purple tweet URL (best) or a space id (not implemented for root discovery here).
+    root_id = extract_tweet_id(PURPLE) if PURPLE else ""
+    if not root_id:
+        write_empty_and_exit()
 
-    if not urls:
-        print("No tweet URL(s) provided. Use --url, --file, PURPLE_URL/TWEET_URL env, or ARTDIR/tweet.list.", file=sys.stderr)
-        sys.exit(0)
+    # Try v1.1 first if keys exist
+    if all([TW_API_CONSUMER_KEY, TW_API_CONSUMER_SECRET, TW_API_ACCESS_TOKEN, TW_API_ACCESS_TOKEN_SECRET]):
+        # Defer to the previous v1.1 implementation if you still keep it around,
+        # otherwise just fall through to cookie scraping for simplicity.
+        pass  # we’ll use cookie flow below for consistency
+    # Cookie/bearer fallback
+    if not (AUTH.startswith("Bearer ") and AUTH_TOKEN and CSRF):
+        write_empty_and_exit()
 
-    api = create_api()
-    os.makedirs(ARTDIR, exist_ok=True)
+    # Resolve screen_name cheaply via syndication (unauthenticated)
+    screen_name = ""
+    syn = fetch_syndication(root_id) or fetch_syndication(PURPLE)
+    if syn:
+        screen_name = (syn.get("user") or {}).get("screen_name") or ""
 
-    # Aggregate outputs across all roots
-    all_html_blocks = []
-    all_links = defaultdict(list)
-    total_nodes = 0
+    tweets, users = collect_conversation_with_cookie(root_id, screen_name)
+    if not tweets:
+        write_empty_and_exit()
 
-    for u in urls:
-        try:
-            sn, sid = parse_tweet_url(u)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            continue
-
-        root = get_status_by_id(api, sid)
-        if not root:
-            continue
-
-        try:
-            node_map, links = build_thread_for_root(api, root, depth_limit=DEPTH_LIMIT)
-        except Exception as e:
-            print(f"Error building thread for {u}: {e}", file=sys.stderr)
-            traceback.print_exc()
-            continue
-
-        total_nodes += len(node_map)
-
-        # Merge links
-        for dom, hrefs in links.items():
-            for h in hrefs:
-                if h not in all_links[dom]:
-                    all_links[dom].append(h)
-
-        # Render per-root block (keeps tree separated if multiple roots)
-        all_html_blocks.append(render_tree(node_map, root.id))
-
-        # Optional CSV
-        if args.short:
-            print_csv(node_map, root.id)
-
-    # Write combined HTML files
-    OUT_REPLIES = os.path.join(ARTDIR, f"{BASE}_replies.html")
-    OUT_LINKS   = os.path.join(ARTDIR, f"{BASE}_links.html")
-
-    if all_html_blocks:
-        # Wrap multiple blocks
-        page = "\n<hr>\n".join(all_html_blocks)
-        open(OUT_REPLIES, "w", encoding="utf-8").write(page)
-    else:
-        # still write an empty shell to avoid 404 in downstream steps
-        open(OUT_REPLIES, "w", encoding="utf-8").write("<div class=\"ss3k-replies\"></div>\n")
-
-    write_links_html(all_links, OUT_LINKS)
-
-    print(f"Wrote replies HTML → {OUT_REPLIES}")
-    print(f"Wrote links HTML   → {OUT_LINKS}")
-    print(f"Tweets captured    → {total_nodes}")
+    build_and_write_html(root_id, tweets, users)
 
 if __name__ == "__main__":
     main()
