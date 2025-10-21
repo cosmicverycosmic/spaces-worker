@@ -36,13 +36,13 @@ on:
         options: ["true","false"]
         default: "true"
       mode:
-        description: Limit processing to a specific area ('' = full)
+        description: "Limit processing to a specific area ('' = full)"
         required: false
         type: choice
         options: ["", "transcript_only", "attendees_only", "replies_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript_only: URL to existing MP3
+        description: "For transcript_only: URL to existing MP3"
         required: false
         type: string
         default: ""
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: space-worker-${{ github.ref }}-${{ github.event.inputs.post_id || github.run_id }}
+      group: ${{ format('space-worker-{0}-{1}', github.ref, github.event.inputs.post_id != '' && github.event.inputs.post_id || github.run_id) }}
       cancel-in-progress: false
 
     steps:
@@ -237,15 +237,177 @@ jobs:
       - name: Build VTT & transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
         shell: bash
-        run: |2
+        run: |
           set -euxo pipefail
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
-          if [ -z "${CC_JSONL:-}" ]; then exit 0; fi
-          cat > "${WORKDIR}/gen_vtt.py" <<'PYCODE'
-          # (same generator you already vetted; omitted here for brevity)
-          # Keep this file inlined to avoid adding another repo script.
-          # It writes ${BASE}.vtt and ${BASE}_transcript.html into $ARTDIR.
-          # ... full code from your previous working generator ...
+          if [ -z "${CC_JSONL:-}" ]; then
+            exit 0
+          fi
+          cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
+          import json, os, re, html
+          from datetime import datetime, timezone
+
+          artdir = os.environ.get("ARTDIR")
+          base   = os.environ.get("BASE")
+          src    = os.environ.get("CC_JSONL") or ""
+          if not src:
+              raise SystemExit(0)
+
+          def parse_time_iso(s):
+              if not s: return None
+              s = s.strip()
+              if s.endswith('Z'): s = s[:-1] + '+00:00'
+              if re.search(r'[+-]\d{4}$', s): s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+              try:
+                  dt = datetime.fromisoformat(s)
+                  if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.timestamp()
+              except Exception:
+                  return None
+
+          def fmt_ts(t):
+              if t < 0: t = 0.0
+              h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+              return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+          def clean_name(s):
+              s = (s or "")
+              s = re.sub(r'[<>&]', '', s)
+              s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
+              s = s.strip()
+              return s or "Speaker"
+
+          def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+          utt = []
+          with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line: continue
+                  try: outer = json.loads(line)
+                  except Exception: continue
+                  payload_raw = outer.get("payload")
+                  if not payload_raw: continue
+                  try: payload = json.loads(payload_raw)
+                  except Exception: continue
+                  body_raw = payload.get("body")
+                  if not body_raw: continue
+                  try: inner = json.loads(body_raw)
+                  except Exception: continue
+                  if inner.get("type") != 45:  # captions/messages
+                      continue
+                  text = (inner.get("body") or "").strip()
+                  if not text: continue
+                  if "final" in inner and not inner.get("final"):
+                      continue
+                  name     = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
+                             or inner.get("username") or inner.get("user_id") or "Speaker"
+                  username = inner.get("username") or payload.get("sender", {}).get("screen_name") or ""
+                  avatar   = payload.get("sender", {}).get("profile_image_url_https") \
+                             or payload.get("sender", {}).get("profile_image_url") or ""
+                  ts = parse_time_iso(inner.get("programDateTime"))
+                  if ts is None:
+                      try: ts = int(inner.get("timestamp")) / 1000.0
+                      except Exception: ts = None
+                  if ts is None: continue
+                  utt.append({"ts": ts, "name": clean_name(name), "username": username, "avatar": avatar, "text": text})
+
+          utt.sort(key=lambda x: x["ts"])
+          if not utt: raise SystemExit(0)
+
+          t0_abs = utt[0]["ts"]
+          for i,u in enumerate(utt):
+              u["start_rel"] = u["ts"] - t0_abs
+              if i+1 < len(utt):
+                  nxt = utt[i+1]["ts"] - t0_abs
+                  u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
+              else:
+                  words = max(1, len(u["text"].split()))
+                  dur = min(6.0, max(1.2, 0.35*words + 0.8))
+                  u["end_rel"] = u["start_rel"] + dur
+
+          groups = []
+          GAP_MAX = 4.0
+          cur = None
+          for u in utt:
+              if (cur is not None and u["name"] == cur["name"] and u["username"] == cur["username"] and
+                  (u["start_rel"] - cur["end_rel"]) <= GAP_MAX):
+                  sep = "" if cur["text"].endswith(('.', '!', '?')) else " "
+                  cur["text"] = (cur["text"] + sep + u["text"]).strip()
+                  cur["end_rel"] = max(cur["end_rel"], u["end_rel"])
+                  cur["_last_ts"] = u["ts"]
+              else:
+                  cur = {
+                      "name": u["name"], "username": u["username"], "avatar": u["avatar"],
+                      "start_rel": u["start_rel"], "end_rel": u["end_rel"], "text": u["text"], "_last_ts": u["ts"]
+                  }
+                  groups.append(cur)
+
+          vtt_path = os.path.join(artdir, f"{base}.vtt")
+          with open(vtt_path, "w", encoding="utf-8") as vf:
+              vf.write("WEBVTT\n\n")
+              for idx, g in enumerate(groups, 1):
+                  vf.write(f"{idx}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
+                  vf.write(f"<b>{esc(g['name'])}</b>: {esc(g['text'])}\n\n")
+
+          tr_path = os.path.join(artdir, f"{base}_transcript.html")
+          css = '''
+          <style>
+          .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+          .ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
+          .ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
+          .ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px}
+          .ss3k-meta{font-size:12px;color:#64748b;margin-bottom:2px}
+          .ss3k-name a{color:#0f172a;text-decoration:none}
+          .ss3k-text{white-space:pre-wrap;word-break:break-word;cursor:pointer}
+          </style>
+          '''
+          js = '''
+          <script>
+          (function(){
+            function time(s){return parseFloat(s||'0')||0}
+            function within(t,seg){return t>=time(seg.dataset.start) && t<time(seg.dataset.end)}
+            function bind(){
+              var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
+              var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
+              var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg'));
+              function tick(){
+                var t=audio.currentTime||0, found=null;
+                for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
+                segs.forEach(s=>s.classList.toggle('active', s===found));
+              }
+              audio.addEventListener('timeupdate', tick);
+              segs.forEach(function(s){
+                s.addEventListener('click', function(){ if(audio){ audio.currentTime=time(s.dataset.start)+0.05; audio.play().catch(()=>{}); }});
+              });
+              tick();
+            }
+            if(document.readyState!=='loading') bind(); else document.addEventListener('DOMContentLoaded', bind);
+          })();
+          </script>
+          '''
+          with open(tr_path, "w", encoding="utf-8") as tf:
+              tf.write(css)
+              tf.write('<div class="ss3k-transcript">\\n')
+              for i,g in enumerate(groups,1):
+                  name = esc(g["name"])
+                  uname= (g.get("username") or "").strip()
+                  prof = f"https://x.com/{html.escape(uname, True)}" if uname else ""
+                  avatar = g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
+                  avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{esc(avatar)}" alt=""></a>' if avatar else ''
+                  name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{name}</strong></a></span>' if prof else f'<span class="ss3k-name"><strong>{name}</strong></span>'
+                  tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{name}">')
+                  tf.write(avtag or '<div style="width:26px;height:26px"></div>')
+                  tf.write('<div class="ss3k-body">')
+                  tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
+                  tf.write(f'<div class="ss3k-text">{esc(g["text"])}</div>')
+                  tf.write('</div></div>\\n')
+              tf.write('</div>\\n')
+              tf.write(js)
+
+          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
+              sf.write(start_iso + "\\n")
           PYCODE
           CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
           [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
@@ -420,7 +582,7 @@ jobs:
             fi
           fi
 
-      # ----- Replies scrape (always uses repo script) -----
+      # ----- Replies scrape (uses repo script) -----
 
       - name: Scrape replies/links (Purple or Space)
         id: replies
