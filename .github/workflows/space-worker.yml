@@ -32,19 +32,27 @@ on:
         description: "Make uploaded artifacts public"
         required: false
         type: choice
-        options: ["true","false"]
+        options:
+          - "true"
+          - "false"
         default: "true"
       do_transcript:
         description: "Generate transcript with Deepgram if crawler captions unavailable"
         required: false
         type: choice
-        options: ["true","false"]
+        options:
+          - "true"
+          - "false"
         default: "true"
       mode:
         description: "Limit processing to a specific area ('' = full)"
         required: false
         type: choice
-        options: ["","transcript_only","attendees_only","replies_only"]
+        options:
+          - ""
+          - "transcript_only"
+          - "attendees_only"
+          - "replies_only"
         default: ""
       existing_mp3_url:
         description: "For transcript_only, provide URL to existing MP3"
@@ -75,9 +83,6 @@ env:
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
   TW_API_ACCESS_TOKEN_SECRET: ${{ secrets.TW_API_ACCESS_TOKEN_SECRET || vars.TW_API_ACCESS_TOKEN_SECRET }}
 
-  # Optional: public CDN/proxy base (e.g. https://media.example.com). If unset, raw GCS URLs are used.
-  MEDIA_BASE_URL: ${{ secrets.MEDIA_BASE_URL || vars.MEDIA_BASE_URL }}
-
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
 
@@ -87,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: ${{ format('space-worker-{0}-{1}', github.ref, (github.event.inputs.post_id != '' && github.event.inputs.post_id) || github.run_id) }}
+      group: ${{ format('space-worker-{0}-{1}', github.ref, github.event.inputs.post_id != '' && github.event.inputs.post_id || github.run_id) }}
       cancel-in-progress: false
 
     steps:
@@ -123,9 +128,9 @@ jobs:
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
           mkdir -p "$WORKDIR" "$ARTDIR" "$ARTDIR/logs"
 
-      - name: Validate config and prefixes (skip for replies_only/attendees_only)
+      - name: Validate config and prefixes (skip for replies_only)
         id: cfg
-        if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -154,8 +159,8 @@ jobs:
           echo "space_id=${SID}" >> "$GITHUB_OUTPUT"
           echo "base=${BASE}"    >> "$GITHUB_OUTPUT"
 
-      - name: GCP auth (skip for replies_only/attendees_only)
-        if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
+      - name: GCP auth (skip for replies_only)
+        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -226,11 +231,8 @@ jobs:
           fi
           if [ -n "$RAW" ]; then
             printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
-            printf '%s\n' "$RAW" | awk -f <(cat <<'AWK'
-            BEGIN{FS="\\| "}
-            {print $NF}
-AWK
-            ) > "${ARTDIR}/_as_line_after_pipe.txt" || true
+            # keep only the portion after the final " | "
+            printf '%s\n' "$RAW" | sed -E 's/^[^|]*\|\s*//' > "${ARTDIR}/_as_line_after_pipe.txt" || true
             [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
           fi
           echo "crawler_exit=${RC}"
@@ -268,7 +270,7 @@ AWK
       - name: Build VTT & syncable grouped transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
         shell: bash
-        run: |2
+        run: |
           set -euxo pipefail
           CC_JSONL="${CRAWLER_CC:-}"
           if [ -z "${CC_JSONL}" ]; then
@@ -300,6 +302,7 @@ with open(CC_JSONL, 'r', encoding='utf-8') as f:
             j=json.loads(line)
         except Exception:
             continue
+        # common twspace-crawler caption keys
         start = j.get('start') or j.get('start_ms',0)/1000.0
         end   = j.get('end')   or j.get('end_ms',0)/1000.0
         text  = j.get('text')  or j.get('content') or ""
@@ -309,12 +312,14 @@ with open(CC_JSONL, 'r', encoding='utf-8') as f:
 
 segs.sort(key=lambda x: x[0])
 
+# write VTT
 vtt_path=os.path.join(ARTDIR, f"{BASE}.vtt")
 with open(vtt_path,'w',encoding='utf-8') as v:
     v.write("WEBVTT\n\n")
     for i,(s,e,t,_) in enumerate(segs,1):
         v.write(f"{i}\n{ts(s)} --> {ts(e)}\n{t}\n\n")
 
+# write simple syncable transcript
 html_path=os.path.join(ARTDIR, f"{BASE}_transcript.html")
 with open(html_path,'w',encoding='utf-8') as h:
     for s,e,t,spk in segs:
@@ -404,11 +409,7 @@ PYCODE
           set -euxo pipefail
           DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
           RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
-          if [ -n "${MEDIA_BASE_URL:-}" ]; then
-            PROXY="${MEDIA_BASE_URL%/}/${PREFIX}/${BASE}.mp3"
-          else
-            PROXY="$RAW"
-          fi
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
           gsutil -m cp "${MP3_PATH}" "$DEST"
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
@@ -446,11 +447,7 @@ PYCODE
           set -euxo pipefail
           DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
           RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.vtt"
-          if [ -n "${MEDIA_BASE_URL:-}" ]; then
-            PROXY="${MEDIA_BASE_URL%/}/${PREFIX}/${BASE}.vtt"
-          else
-            PROXY="$RAW"
-          fi
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.vtt"
           gsutil -m cp "${VTT_PATH}" "$DEST"
           if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
             (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
@@ -600,6 +597,7 @@ PYCODE
           PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euxo pipefail
+          # Run the checked-in scraper. It gracefully no-ops (exit 0) if creds/inputs are missing.
           python3 .github/workflows/scripts/replies.py
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
