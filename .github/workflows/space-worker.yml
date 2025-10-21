@@ -32,27 +32,19 @@ on:
         description: "Make uploaded artifacts public"
         required: false
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true","false"]
         default: "true"
       do_transcript:
         description: "Generate transcript with Deepgram if crawler captions unavailable"
         required: false
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true","false"]
         default: "true"
       mode:
         description: "Limit processing to a specific area ('' = full)"
         required: false
         type: choice
-        options:
-          - ""
-          - "transcript_only"
-          - "attendees_only"
-          - "replies_only"
+        options: ["","transcript_only","attendees_only","replies_only"]
         default: ""
       existing_mp3_url:
         description: "For transcript_only, provide URL to existing MP3"
@@ -277,58 +269,58 @@ jobs:
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-          cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
-import os, json, html
-from datetime import timedelta
-
-CC_JSONL = os.environ.get("CC_JSONL","")
-ARTDIR   = os.environ.get("ARTDIR",".")
-BASE     = os.environ.get("BASE","space")
-
-def ts(sec: float) -> str:
-    td = timedelta(seconds=float(sec))
-    s  = str(td)
-    if '.' not in s: s += '.000000'
-    h, m, rest = s.split(':')
-    sec, ms = rest.split('.')
-    return f"{int(h):02d}:{int(m):02d}:{int(sec):02d}.{ms[:3]}"
-
-segs=[]
-with open(CC_JSONL, 'r', encoding='utf-8') as f:
-    for line in f:
-        line=line.strip()
-        if not line: continue
-        try:
-            j=json.loads(line)
-        except Exception:
-            continue
-        # common twspace-crawler caption keys
-        start = j.get('start') or j.get('start_ms',0)/1000.0
-        end   = j.get('end')   or j.get('end_ms',0)/1000.0
-        text  = j.get('text')  or j.get('content') or ""
-        spk   = j.get('speaker') or j.get('user') or j.get('handle') or ""
-        if start is None or end is None or not text: continue
-        segs.append((float(start), float(end), str(text), str(spk)))
-
-segs.sort(key=lambda x: x[0])
-
-# write VTT
-vtt_path=os.path.join(ARTDIR, f"{BASE}.vtt")
-with open(vtt_path,'w',encoding='utf-8') as v:
-    v.write("WEBVTT\n\n")
-    for i,(s,e,t,_) in enumerate(segs,1):
-        v.write(f"{i}\n{ts(s)} --> {ts(e)}\n{t}\n\n")
-
-# write simple syncable transcript
-html_path=os.path.join(ARTDIR, f"{BASE}_transcript.html")
-with open(html_path,'w',encoding='utf-8') as h:
-    for s,e,t,spk in segs:
-        meta = f'<div class="ss3k-meta">{html.escape(spk) if spk else ""} {ts(s)}–{ts(e)}</div>' if spk else f'<div class="ss3k-meta">{ts(s)}–{ts(e)}</div>'
-        h.write(f'<div class="ss3k-seg" data-start="{s:.3f}" data-end="{e:.3f}">{meta}<div class="txt">{html.escape(t)}</div></div>\n')
+            # Write Python file via sentinel-prefixed heredoc, then strip the sentinel
+            cat <<'PYCODE' | sed 's/^PY>//' > "${WORKDIR}/gen_vtt.py"
+PY>import os, json, html
+PY>from datetime import timedelta
+PY>
+PY>CC_JSONL = os.environ.get("CC_JSONL","")
+PY>ARTDIR   = os.environ.get("ARTDIR",".")
+PY>BASE     = os.environ.get("BASE","space")
+PY>
+PY>def ts(sec: float) -> str:
+PY>    td = timedelta(seconds=float(sec))
+PY>    s  = str(td)
+PY>    if '.' not in s: s += '.000000'
+PY>    h, m, rest = s.split(':')
+PY>    sec, ms = rest.split('.')
+PY>    return f"{int(h):02d}:{int(m):02d}:{int(sec):02d}.{ms[:3]}"
+PY>
+PY>segs=[]
+PY>with open(CC_JSONL, 'r', encoding='utf-8') as f:
+PY>    for line in f:
+PY>        line=line.strip()
+PY>        if not line: continue
+PY>        try:
+PY>            j=json.loads(line)
+PY>        except Exception:
+PY>            continue
+PY>        start = j.get('start') or j.get('start_ms',0)/1000.0
+PY>        end   = j.get('end')   or j.get('end_ms',0)/1000.0
+PY>        text  = j.get('text')  or j.get('content') or ""
+PY>        spk   = j.get('speaker') or j.get('user') or j.get('handle') or ""
+PY>        if start is None or end is None or not text: continue
+PY>        segs.append((float(start), float(end), str(text), str(spk)))
+PY>
+PY>segs.sort(key=lambda x: x[0])
+PY>
+PY># write VTT
+PY>vtt_path=os.path.join(ARTDIR, f"{BASE}.vtt")
+PY>with open(vtt_path,'w',encoding='utf-8') as v:
+PY>    v.write("WEBVTT\n\n")
+PY>    for i,(s,e,t,_) in enumerate(segs,1):
+PY>        v.write(f"{i}\n{ts(s)} --> {ts(e)}\n{t}\n\n")
+PY>
+PY># write simple syncable transcript
+PY>html_path=os.path.join(ARTDIR, f"{BASE}_transcript.html")
+PY>with open(html_path,'w',encoding='utf-8') as h:
+PY>    for s,e,t,spk in segs:
+PY>        meta = f'<div class="ss3k-meta">{html.escape(spk) if spk else ""} {ts(s)}–{ts(e)}</div>' if spk else f'<div class="ss3k-meta">{ts(s)}–{ts(e)}</div>'
+PY>        h.write(f'<div class="ss3k-seg" data-start="{s:.3f}" data-end="{e:.3f}">{meta}<div class="txt">{html.escape(t)}</div></div>\n')
 PYCODE
-          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
-          [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-          [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
           fi
 
       - name: Notify WP — processing audio
@@ -386,7 +378,7 @@ PYCODE
           PASS1_JSON="${WORKDIR}/loudnorm1.json"
           ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
           awk '/^{/{f=1} f{print} /}/{f=0}' "${WORKDIR}/pass1.log" > "$PASS1_JSON" || true
-          if jq -e . "$PASS1_JSON" >/dev/null 2>&1; then
+          if jq -e . "$PASS1_JSON" >/dev/null 21; then
             I=$(jq -r '.input_i // "-16"'  "$PASS1_JSON")
             TP=$(jq -r '.input_tp // "-1.5"' "$PASS1_JSON")
             LRA=$(jq -r '.input_lra // "11"' "$PASS1_JSON")
@@ -507,12 +499,18 @@ PYCODE
         if: ${{ github.event.inputs.mode != 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
         shell: bash
         env:
-          PID:  ${{ github.event.inputs.post_id }}
-          AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
-          VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
+          PID:        ${{ github.event.inputs.post_id }}
+          AUD_PROXY:  ${{ steps.upload_mp3.outputs.audio_proxy }}
+          AUD_RAW:    ${{ steps.upload_mp3.outputs.audio_raw }}
+          VTT_PROXY:  ${{ steps.upload_vtt.outputs.vtt_proxy }}
+          VTT_RAW:    ${{ steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${{ github.event.inputs.title }}}"
+
+          # choose preferred URLs
+          AUD="${AUD_PROXY:-${AUD_RAW:-}}"
+          VTTU="${VTT_PROXY:-${VTT_RAW:-}}"
 
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
@@ -589,7 +587,6 @@ PYCODE
             -d "$BODY" | jq -r .
 
       # --------------- REPLIES-ONLY FLOW ---------------
-
       - name: Scrape Space tweet replies (replies_only)
         if: ${{ github.event.inputs.mode == 'replies_only' }}
         shell: bash
