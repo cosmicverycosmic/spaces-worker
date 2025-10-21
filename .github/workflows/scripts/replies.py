@@ -1,463 +1,344 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Adapted from Giovanni Merlos Mellini's twitter-scraper example.
+.github/workflows/scripts/replies.py
 
-This script is tailored for the CHBMP Space Worker "replies_only" mode.
-It expects environment variables (supplied by the GitHub workflow):
+Scrape replies + shared links for a given “Purple Pill” tweet and emit two HTML
+artifacts into $ARTDIR:
 
-Required for v1.1 API (python-twitter):
+  - $BASE_replies.html  (threaded replies)
+  - $BASE_links.html    (unique URLs shared across the thread)
+
+Design goals:
+  • Graceful no-op when inputs/creds are missing (exit 0; do not fail the job).
+  • Prefer python-twitter (v1.1 search; 7-day limit) if TW_API_* keys are set.
+  • Flat, dependency-light. No web scraping of x.com HTML (it’s JS-rendered).
+
+ENV expected (workflow sets these):
+  PURPLE_TWEET_URL   e.g. https://x.com/username/status/1234567890
+  WORKDIR            work area (default: ./work)
+  ARTDIR             artifacts out dir (default: ./out)
+  BASE               prefix for artifact filenames (default uses UTC date)
+
+Optional creds (python-twitter):
   TW_API_CONSUMER_KEY
   TW_API_CONSUMER_SECRET
   TW_API_ACCESS_TOKEN
   TW_API_ACCESS_TOKEN_SECRET
-
-Inputs / context:
-  PURPLE_TWEET_URL   - canonical tweet URL announcing the Space
-  SPACE_ID           - optional; used as fallback (searches i/spaces/<id>)
-  ARTDIR             - output directory (defaults to ./out)
-  BASE               - base filename prefix (defaults to "thread")
-  LOCAL_TIMEZONE     - optional tz string for display; default "UTC"
-
-Outputs (placed in ARTDIR):
-  <BASE>_replies.html
-  <BASE>_links.html
 """
 
 import os
 import re
 import sys
 import html
-import json
 import time
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 
-try:
-    import tldextract
-except Exception:
-    tldextract = None
+# ---------------------------------------------------------------------------
+# env / paths
+# ---------------------------------------------------------------------------
+WORKDIR = os.environ.get("WORKDIR", os.path.join(os.getcwd(), "work"))
+ARTDIR  = os.environ.get("ARTDIR",  os.path.join(os.getcwd(), "out"))
+BASE    = os.environ.get("BASE",    f"space-{datetime.now(timezone.utc):%m-%d-%Y}-unknown")
+PURPLE  = (os.environ.get("PURPLE_TWEET_URL") or "").strip()
 
-try:
-    import twitter  # python-twitter
-except ImportError as e:
-    print(f"[replies.py] python-twitter not installed: {e}", file=sys.stderr)
-    sys.exit(0)
+TW_CK = os.environ.get("TW_API_CONSUMER_KEY", "")
+TW_CS = os.environ.get("TW_API_CONSUMER_SECRET", "")
+TW_AT = os.environ.get("TW_API_ACCESS_TOKEN", "")
+TW_AS = os.environ.get("TW_API_ACCESS_TOKEN_SECRET", "")
 
+os.makedirs(WORKDIR, exist_ok=True)
+os.makedirs(ARTDIR,  exist_ok=True)
 
-# ----------------------------
-# Utilities
-# ----------------------------
-
-def esc(s: str) -> str:
-    return html.escape(s or "", quote=True)
-
-
-def getenv(name: str, default: str = "") -> str:
-    v = os.environ.get(name)
-    return v if v is not None else default
+REPLIES_PATH = os.path.join(ARTDIR, f"{BASE}_replies.html")
+LINKS_PATH   = os.path.join(ARTDIR, f"{BASE}_links.html")
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# utilities
+# ---------------------------------------------------------------------------
 def parse_tweet_url(u: str):
     """
-    Accepts twitter.com or x.com status URLs. Returns (screen_name, tweet_id) or (None, None).
+    Accepts https://x.com/<user>/status/<id> or https://twitter.com/<user>/status/<id>
+    Returns (screen_name, tweet_id:int) or (None, None) if not parseable.
     """
     if not u:
         return None, None
-    u = u.strip()
-    # Normalize mobile links, remove query/fragment
-    u = re.sub(r'^https?://(mobile\.)?(twitter|x)\.com/', 'https://twitter.com/', u)
-    u = u.split('?')[0].split('#')[0]
-    m = re.search(r'https?://twitter\.com/([A-Za-z0-9_]+)/status/(\d+)$', u)
-    if m:
-        return m.group(1), m.group(2)
-    return None, None
+    m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", u)
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
 
 
-def build_api_from_env():
-    ck  = getenv("TW_API_CONSUMER_KEY")
-    cs  = getenv("TW_API_CONSUMER_SECRET")
-    at  = getenv("TW_API_ACCESS_TOKEN")
-    ats = getenv("TW_API_ACCESS_TOKEN_SECRET")
-    missing = [k for k,v in {
-        "TW_API_CONSUMER_KEY": ck, "TW_API_CONSUMER_SECRET": cs,
-        "TW_API_ACCESS_TOKEN": at, "TW_API_ACCESS_TOKEN_SECRET": ats
-    }.items() if not v]
-    if missing:
-        print(f"[replies.py] Missing Twitter v1.1 credentials: {', '.join(missing)}", file=sys.stderr)
-        return None
-    return twitter.Api(
-        consumer_key=ck,
-        consumer_secret=cs,
-        access_token_key=at,
-        access_token_secret=ats,
+def safe_created_at(s: str) -> str:
+    """
+    python-twitter created_at looks like: 'Mon Oct 21 15:21:14 +0000 2025'
+    Make a compact ISO-like string in UTC; fall back to the original on parse error.
+    """
+    if not s:
+        return ""
+    try:
+        # Try with timezone first
+        dt = datetime.strptime(s, "%a %b %d %H:%M:%S %z %Y")
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        try:
+            # Fallback without %z (just in case)
+            dt = datetime.strptime(s, "%a %b %d %H:%M:%S %Y")
+            return dt.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            return s
+
+
+def extract_urls(text: str):
+    if not text:
+        return []
+    # Rough URL matcher; good enough for artifacting.
+    return re.findall(r"https?://[^\s)>\]]+", text)
+
+
+# ---------------------------------------------------------------------------
+# python-twitter path (v1.1 search)
+# ---------------------------------------------------------------------------
+def collect_replies_with_python_twitter(root_sn: str, root_id: int):
+    """
+    Strategy:
+      1) Search for tweets "to:root_sn" since root_id, paging until exhausted.
+      2) Build a map: parent_id -> [child_tweet, ...]
+      3) DFS from root_id to produce a threaded list of replies (with depth).
+    Returns:
+      replies: list of dicts {id, user, screen_name, text, created_at, url, depth}
+      links:   list of (url, context_snippet)
+    """
+    try:
+        import twitter  # pip install python-twitter
+    except Exception:
+        log("[replies] python-twitter not installed; skipping.")
+        return [], []
+
+    if not (TW_CK and TW_CS and TW_AT and TW_AS):
+        log("[replies] No TW_API_* keys configured; skipping python-twitter mode.")
+        return [], []
+
+    api = twitter.Api(
+        consumer_key=TW_CK,
+        consumer_secret=TW_CS,
+        access_token_key=TW_AT,
+        access_token_secret=TW_AS,
         sleep_on_rate_limit=True,
-        tweet_mode='extended'  # ensure full_text
     )
 
+    term = f"to:{root_sn}"
+    log(f"[replies] v1.1 search term={term} since_id={root_id}")
 
-def iso_utc(ts: int | float) -> str:
-    try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
-    except Exception:
-        return ""
-
-
-def expand_urls_in_text(status) -> str:
-    """
-    Prefer full_text when available. Replace t.co with expanded_url for readability.
-    """
-    txt = getattr(status, "full_text", None) or getattr(status, "text", "") or ""
-    try:
-        urls = status.urls or []
-        for u in urls:
-            short = u.url or ""
-            longu = u.expanded_url or short
-            if short and longu and short in txt:
-                txt = txt.replace(short, longu)
-    except Exception:
-        pass
-    return txt
-
-
-def collect_links_from_status(status, bucket: dict):
-    """
-    bucket: dict[domain] -> list[urls]
-    """
-    try:
-        urls = status.urls or []
-        for u in urls:
-            href = (u.expanded_url or u.url or "").strip()
-            if not href:
-                continue
-            if tldextract:
-                dom = tldextract.extract(href)
-                host = dom.registered_domain or href
-            else:
-                # naive fallback
-                m = re.match(r'https?://([^/]+)', href)
-                host = m.group(1) if m else href
-            if href not in bucket[host]:
-                bucket[host].append(href)
-    except Exception:
-        pass
-
-
-# ----------------------------
-# Core scraping
-# ----------------------------
-
-def fetch_status(api, tweet_id: str):
-    try:
-        return api.GetStatus(status_id=int(tweet_id), include_entities=True)
-    except twitter.error.TwitterError as e:
-        print(f"[replies.py] GetStatus failed for {tweet_id}: {e}", file=sys.stderr)
-        return None
-
-
-def search_root_by_space_id(api, space_id: str):
-    """
-    Best-effort fallback: find a tweet that links to i/spaces/<space_id>.
-    Limited to last 7 days by API.
-    """
-    if not space_id:
-        return None
-    term = f"i/spaces/{space_id}"
-    print(f"[replies.py] PURPLE_TWEET_URL not provided; searching for '{term}' ...", file=sys.stderr)
-    try:
-        # Pull a few pages and pick the oldest (first announcement) or newest; take newest by default.
-        max_id = None
-        candidates = []
-        for _ in range(5):
-            batch = api.GetSearch(term=term, count=100, include_entities=True, max_id=max_id, result_type="recent")
-            if not batch:
-                break
-            candidates.extend(batch)
-            max_id = min(t.id for t in batch) - 1
-        if not candidates:
-            print("[replies.py] No tweets referencing the Space ID were found in the last 7 days.", file=sys.stderr)
-            return None
-        tgt = sorted(candidates, key=lambda t: t.created_at_in_seconds or 0)[-1]
-        return tgt
-    except twitter.error.TwitterError as e:
-        print(f"[replies.py] Search by space id failed: {e}", file=sys.stderr)
-        return None
-
-
-def get_direct_replies(api, tweet):
-    """
-    Return list of statuses that directly reply to `tweet` (in_reply_to_status_id == tweet.id).
-    Uses search term 'to:<screen_name>' and filters by parent id.
-    """
-    parent_id = tweet.id
-    screen = tweet.user.screen_name if tweet.user else None
-    if not screen:
-        return []
-
-    results = []
+    # 1) fetch all candidate tweets
+    parent_map = {}  # pid -> [status, ...]
+    seen_ids = set()
     max_id = None
-    pages = 0
+    total = 0
+
     while True:
-        pages += 1
         try:
-            batch = api.GetSearch(
-                term=f"to:{screen}",
-                since_id=parent_id,
-                max_id=max_id,
-                count=100,
-                include_entities=True,
-                result_type="recent",
-            )
-        except twitter.error.TwitterError as e:
-            # back off and continue; don't fail the entire run
-            print(f"[replies.py] Search error (page {pages}), backing off: {e}", file=sys.stderr)
-            time.sleep(10)
-            continue
+            batch = api.GetSearch(term=term, since_id=root_id, max_id=max_id, count=100)
+        except Exception as e:
+            log(f"[replies] twitter API error, stopping: {e}")
+            break
 
         if not batch:
             break
 
         for st in batch:
-            # Only keep messages that are direct replies to parent
             try:
-                if int(st.in_reply_to_status_id or 0) == int(parent_id):
-                    results.append(st)
-            except Exception:
-                pass
+                d = st.AsDict()
+                tid = int(d.get("id"))
+                if tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
 
-        max_id = min(t.id for t in batch) - 1
-        if len(batch) < 100 or pages >= 25:
+                pid = d.get("in_reply_to_status_id")
+                if pid is None:
+                    continue
+                try:
+                    pid = int(pid)
+                except Exception:
+                    continue
+
+                parent_map.setdefault(pid, []).append(st)
+                total += 1
+            except Exception:
+                continue
+
+        # prepare next page
+        try:
+            max_id = min(int(s.id) for s in batch) - 1
+        except Exception:
             break
 
-    # Sort chronologically
-    results.sort(key=lambda s: s.created_at_in_seconds or 0)
-    return results
+        # stop if we’re clearly done
+        if len(batch) < 100:
+            break
+
+        # be polite
+        time.sleep(0.5)
+
+    log(f"[replies] gathered {total} candidate tweets; building thread…")
+
+    # 2) DFS to build threaded order
+    replies = []
+    links_seen = {}
+    links = []
+
+    def dfs(parent_id: int, depth: int = 0):
+        children = parent_map.get(parent_id, [])
+        # chronological order:
+        try:
+            children.sort(key=lambda s: datetime.strptime(s.created_at, "%a %b %d %H:%M:%S %z %Y"))
+        except Exception:
+            # fallback: ids ascending
+            children.sort(key=lambda s: int(getattr(s, "id", 0)))
+
+        for st in children:
+            d = st.AsDict()
+            rid = int(d.get("id"))
+            u = d.get("user") or {}
+            sn = (u.get("screen_name") or "").strip()
+            name = (u.get("name") or "").strip()
+            txt = d.get("text") or ""
+            cat = safe_created_at(d.get("created_at") or "")
+            url = f"https://x.com/{sn}/status/{rid}"
+
+            replies.append({
+                "id": rid,
+                "user": name,
+                "screen_name": sn,
+                "text": txt,
+                "created_at": cat,
+                "url": url,
+                "depth": depth,
+            })
+
+            # gather links
+            for uurl in extract_urls(txt):
+                if uurl not in links_seen:
+                    links_seen[uurl] = txt
+                    links.append((uurl, txt))
+
+            # recurse into deeper branches
+            dfs(rid, depth + 1)
+
+    dfs(root_id, 0)
+    log(f"[replies] threaded replies: {len(replies)}; unique links: {len(links)}")
+    return replies, links
 
 
-def build_thread_tree(api, root):
-    """
-    BFS over replies to collect a full reply tree (limited by 7-day search & rate limits).
-    Returns a dict: id -> {"tweet": status, "children": [nodes...]}
-    """
-    nodes = {}
-    def wrap(st):
-        return {"tweet": st, "children": []}
+# ---------------------------------------------------------------------------
+# artifact writers
+# ---------------------------------------------------------------------------
+def write_replies_html(path: str, replies):
+    if not replies:
+        return
 
-    nodes[root.id] = wrap(root)
-    q = deque([root])
-    visited = set([root.id])
-
-    while q:
-        current = q.popleft()
-        replies = get_direct_replies(api, current)
-        for r in replies:
-            if r.id not in nodes:
-                nodes[r.id] = wrap(r)
-            # attach to parent
-            nodes[current.id]["children"].append(nodes[r.id])
-            if r.id not in visited:
-                visited.add(r.id)
-                q.append(r)
-
-    # Sort children by time
-    for n in nodes.values():
-        n["children"].sort(key=lambda ch: ch["tweet"].created_at_in_seconds or 0)
-    return nodes
-
-
-# ----------------------------
-# Rendering
-# ----------------------------
-
-CSS = """<style>
-.ss3k-replies{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-.ss3k-reply-card{border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:10px 0;background:#fff;box-shadow:0 1px 1px rgba(0,0,0,.03)}
-.ss3k-reply-head{display:flex;align-items:center;gap:8px}
-.ss3k-reply-head img.avatar{width:28px;height:28px;border-radius:50%}
-.ss3k-reply-meta{color:#64748b;font-size:12px;margin-top:4px}
-.ss3k-reply-content{margin-top:8px;white-space:pre-wrap;word-break:break-word}
-.ss3k-link-cards{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
-.ss3k-link-card{border:1px solid #cbd5e1;padding:4px 8px;border-radius:8px;background:#f8fafc;font-size:12px}
-.ss3k-children{margin-left:16px;display:none}
-.ss3k-toggle{margin-top:6px;font-size:12px;color:#2563eb;background:none;border:none;padding:0;cursor:pointer}
-.reply-media{max-width:100%;border-radius:10px;margin-top:8px}
+    head = """<!doctype html>
+<meta charset="utf-8">
+<title>Replies</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:14px}
+ul{list-style: none;padding-left:0}
+li{margin:.5em 0}
+.meta{color:#555;font-size:.9em;margin-bottom:2px}
+.bubble{background:#fff;border:1px solid #e6e8ef;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.indent-0{margin-left:0}
+.indent-1{margin-left:18px}
+.indent-2{margin-left:36px}
+.indent-3{margin-left:54px}
+.indent-4{margin-left:72px}
 </style>
-<script>
-function ss3kToggleReplies(id,btn){
-  const el=document.getElementById(id); if(!el) return;
-  const open=(el.style.display==='block'); el.style.display=open?'none':'block';
-  if(btn){ btn.textContent=open?(btn.dataset.label||'Show replies'):(btn.dataset.hide||'Hide replies'); }
-}
-</script>"""
+<ul>"""
+    parts = [head]
 
-def avatar_url(user) -> str:
-    if not user:
-        return ""
-    return getattr(user, "profile_image_url_https", None) or getattr(user, "profile_image_url", "") or (f"https://unavatar.io/x/{esc(user.screen_name)}" if getattr(user, "screen_name", None) else "")
+    for r in replies:
+        indent_class = f"indent-{min(4, int(r.get('depth') or 0))}"
+        name = html.escape(r.get("user") or "")
+        sn = html.escape(r.get("screen_name") or "")
+        created = html.escape(r.get("created_at") or "")
+        url = html.escape(r.get("url") or "")
+        txt = html.escape(r.get("text") or "")
 
-
-def link_chips(status):
-    chips = []
-    seen = set()
-    try:
-        for u in (status.urls or []):
-            href = (u.expanded_url or u.url or "").strip()
-            if not href or href in seen:
-                continue
-            seen.add(href)
-            if tldextract:
-                dom = tldextract.extract(href)
-                host = dom.registered_domain or href
-            else:
-                m = re.match(r'https?://([^/]+)', href)
-                host = m.group(1) if m else href
-            chips.append(f'<a class="ss3k-link-card" href="{esc(href)}" target="_blank" rel="noopener">{esc(host)}</a>')
-    except Exception:
-        pass
-    if chips:
-        return '\n        <div class="ss3k-link-cards">\n          ' + "\n          ".join(chips) + "\n        </div>"
-    return ""
-
-
-def media_block(status):
-    parts = []
-    try:
-        for m in getattr(status, "media", []) or []:
-            if getattr(m, "type", None) == "photo" and getattr(m, "media_url_https", None):
-                parts.append(f'<img class="reply-media" src="{esc(m.media_url_https)}" alt="">')
-    except Exception:
-        pass
-    return ("\n        " + "\n        ".join(parts)) if parts else ""
-
-
-def render_node(node, level=0):
-    t = node["tweet"]
-    sn = t.user.screen_name if t.user else "user"
-    name = t.user.name if t.user else sn
-    prof = f"https://x.com/{esc(sn)}"
-    tw   = f"https://x.com/{esc(sn)}/status/{t.id}"
-    dt   = t.created_at_in_seconds or 0
-    iso  = iso_utc(dt)
-    av   = avatar_url(t.user)
-    txt  = esc(expand_urls_in_text(t))
-    links = link_chips(t)
-    media = media_block(t)
-
-    children_html = ""
-    if node["children"]:
-        cid = f"children-{t.id}"
-        count = len(node["children"])
-        btn_label = f"Show {count} repl" + ("y" if count == 1 else "ies")
-        children_html = (
-            f'\n      <button class="ss3k-toggle" data-label="{esc(btn_label)}" data-hide="Hide replies" '
-            f'onclick="ss3kToggleReplies(\'{cid}\', this)">{esc(btn_label)}</button>\n'
-            f'      <div class="ss3k-children" id="{cid}">\n' +
-            "\n".join(render_node(c, level + 1) for c in node["children"]) +
-            "\n      </div>"
+        parts.append(
+            f"<li class='{indent_class}'>"
+            f"  <div class='meta'><strong>{name}</strong> (@{sn}) — {created} — "
+            f"    <a href='{url}' target='_blank' rel='noopener'>open</a></div>"
+            f"  <div class='bubble'>{txt}</div>"
+            f"</li>"
         )
 
-    return f"""
-      <div class="ss3k-reply-card" id="{t.id}" data-level="{level}">
-        <div class="ss3k-reply-head">
-          <a href="{prof}" target="_blank" rel="noopener">
-            <img class="avatar" src="{esc(av)}" alt="">
-          </a>
-          <div>
-            <div>
-              <a href="{prof}" target="_blank" rel="noopener"><strong>{esc(name)}</strong></a>
-              <span style="color:#64748b">@{esc(sn)}</span>
-            </div>
-            <div class="ss3k-reply-meta">
-              <a href="{tw}" target="_blank" rel="noopener"><time datetime="{iso}">{iso.replace('T',' ')} UTC</time></a>
-            </div>
-          </div>
-        </div>
-        <div class="ss3k-reply-content">{txt}</div>{media}{links}{children_html}
-      </div>""".rstrip()
+    parts.append("</ul>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+    log(f"[replies] wrote {path}")
 
 
-def render_thread_html(root_node):
-    html_top = CSS + "\n<div class=\"ss3k-replies\">"
-    html_bottom = "\n</div>\n"
-    return html_top + "\n" + render_node(root_node) + "\n" + html_bottom
+def write_links_html(path: str, links):
+    if not links:
+        return
+
+    head = """<!doctype html>
+<meta charset="utf-8">
+<title>Links</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:14px}
+li{margin:.5em 0}
+.ctx{color:#555;font-size:.9em;margin-top:2px}
+</style>
+<ul>"""
+    parts = [head]
+
+    for url, ctx in links:
+        parts.append(
+            f"<li><a href='{html.escape(url)}' target='_blank' rel='noopener'>"
+            f"{html.escape(url)}</a>"
+            f"<div class='ctx'>{html.escape(ctx)}</div></li>"
+        )
+
+    parts.append("</ul>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+    log(f"[replies] wrote {path}")
 
 
-def render_links_html(domain_links: dict):
-    parts = []
-    for dom in sorted(domain_links):
-        links = "\n".join(f'  <li><a href="{esc(u)}" target="_blank" rel="noopener">{esc(u)}</a></li>' for u in domain_links[dom])
-        parts.append(f"<h4>{esc(dom)}</h4>\n<ul>\n{links}\n</ul>")
-    return "\n\n".join(parts)
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    if not PURPLE:
+        log("[replies] No PURPLE_TWEET_URL provided; skipping (exit 0).")
+        return 0
 
+    screen_name, tweet_id = parse_tweet_url(PURPLE)
+    if not tweet_id:
+        log(f"[replies] Could not parse tweet id from URL: {PURPLE}; skipping (exit 0).")
+        return 0
 
-# ----------------------------
-# Main
-# ----------------------------
+    # Try python-twitter path if creds exist
+    replies, links = [], []
+    if TW_CK and TW_CS and TW_AT and TW_AS:
+        replies, links = collect_replies_with_python_twitter(screen_name or "", tweet_id)
+    else:
+        log("[replies] No TW_API_* keys set; replies scrape skipped (exit 0).")
+        return 0
 
-def main():
-    artdir = getenv("ARTDIR", os.path.join(os.getcwd(), "out"))
-    base   = getenv("BASE", "thread")
-    os.makedirs(artdir, exist_ok=True)
+    if replies:
+        write_replies_html(REPLIES_PATH, replies)
+    if links:
+        write_links_html(LINKS_PATH, links)
 
-    purple_url = getenv("PURPLE_TWEET_URL", "").strip()
-    space_id   = getenv("SPACE_ID", "").strip()
-
-    api = build_api_from_env()
-    if api is None:
-        # Graceful no-op so the workflow can continue and skip WP patch
-        sys.exit(0)
-
-    root_status = None
-    root_screen = None
-    root_id     = None
-
-    # Prefer explicit tweet URL
-    if purple_url:
-        root_screen, root_id = parse_tweet_url(purple_url)
-        if not (root_screen and root_id):
-            print(f"[replies.py] PURPLE_TWEET_URL looks invalid: {purple_url}", file=sys.stderr)
-        else:
-            root_status = fetch_status(api, root_id)
-
-    # Fallback: try to find a tweet that references the Space ID
-    if root_status is None and space_id:
-        root_status = search_root_by_space_id(api, space_id)
-        if root_status:
-            root_screen = root_status.user.screen_name if root_status.user else root_screen
-            root_id     = str(root_status.id)
-
-    if root_status is None:
-        print("[replies.py] No root tweet could be determined; nothing to do.", file=sys.stderr)
-        sys.exit(0)
-
-    # Build tree
-    nodes = build_thread_tree(api, root_status)
-    root_node = nodes[root_status.id]
-
-    # Collect link domains
-    domain_links: dict[str, list[str]] = defaultdict(list)
-    for n in nodes.values():
-        collect_links_from_status(n["tweet"], domain_links)
-
-    # Render outputs
-    replies_html = render_thread_html(root_node)
-    links_html   = render_links_html(domain_links) if any(domain_links.values()) else ""
-
-    out_replies = os.path.join(artdir, f"{base}_replies.html")
-    out_links   = os.path.join(artdir, f"{base}_links.html")
-
-    with open(out_replies, "w", encoding="utf-8") as f:
-        f.write(replies_html)
-    if links_html:
-        with open(out_links, "w", encoding="utf-8") as f:
-            f.write(links_html)
-
-    print(f"[replies.py] Wrote: {out_replies}")
-    if links_html:
-        print(f"[replies.py] Wrote: {out_links}")
+    log(f"[replies] done. replies={len(replies)} links={len(links)}")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+    sys.exit(main())
