@@ -56,6 +56,11 @@ on:
         required: false
         type: number
         default: 170
+      purple_tweet_url:                    # <-- NEW (aligns with WP plugin)
+        description: Purple Pill tweet URL for replies/links scraping (optional)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -73,6 +78,8 @@ env:
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
+  PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}   # <-- NEW
+
 
 jobs:
   process:
