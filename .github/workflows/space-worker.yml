@@ -57,23 +57,26 @@ permissions:
   packages: read
 
 env:
-  GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY       || vars.GCP_SA_KEY }}
-  GCS_BUCKET:       ${{ secrets.GCS_BUCKET       || vars.GCS_BUCKET }}
-  WP_BASE_URL:      ${{ secrets.WP_BASE_URL      || secrets.WP_URL || vars.WP_BASE_URL || vars.WP_URL }}
-  WP_USER:          ${{ secrets.WP_USER          || vars.WP_USER }}
-  WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
-  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
+  # ---- Required core creds (match your repo secrets) ----
+  GCP_SA_KEY:       ${{ secrets.GCP_SA_KEY }}
+  GCS_BUCKET:       ${{ secrets.GCS_BUCKET }}
+  WP_BASE_URL:      ${{ secrets.WP_BASE_URL || secrets.WP_URL }}
+  WP_USER:          ${{ secrets.WP_USER }}
+  WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
 
-  # twspace-crawler auth (cookie and/or bearer)
-  TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
-  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
-  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
+  # Deepgram (handle either API or your current APT typo)
+  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || secrets.DEEPGRAM_APT_KEY }}
 
-  # Optional: twitter API v1.1 (for replies_only scraper)
-  TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
-  TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
-  TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
-  TW_API_ACCESS_TOKEN_SECRET: ${{ secrets.TW_API_ACCESS_TOKEN_SECRET || vars.TW_API_ACCESS_TOKEN_SECRET }}
+  # twspace-crawler auth (cookie and/or bearer) — you have these
+  TWITTER_AUTHORIZATION: ${{ secrets.X_BEARER }}
+  TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN || secrets.X_AUTH_TOKEN }}
+  TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN || secrets.X_CSRF }}
+
+  # Optional: legacy Twitter API v1.1 for replies scraper (not in your list; fine if empty)
+  TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY }}
+  TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET }}
+  TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN }}
+  TW_API_ACCESS_TOKEN_SECRET: ${{ secrets.TW_API_ACCESS_TOKEN_SECRET }}
 
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
@@ -217,95 +220,63 @@ jobs:
             echo "audio_file=${AUDIO_FILE}" >> "$GITHUB_OUTPUT"
           fi
 
-          RAW="$(grep -hF 'getAudioSpaceById |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
-          if [ -z "$RAW" ]; then
-            RAW="$(grep -hF 'getAudioSpaceByRestId |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
-          fi
+          # Try to capture an API line with JSON and strip everything before the final " | "
+          RAW="$(grep -hE 'getAudioSpaceBy(Id|RestId) \|' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
+          [ -z "$RAW" ] && RAW="$(grep -hF 'Space info |' "$LOG_STD" "$LOG_ERR" | tail -n1 || true)"
           if [ -n "$RAW" ]; then
-            printf '%s\n' "$RAW" > "${ARTDIR}/_as_line.txt"
-            # keep only the portion after the final " | "
-            printf '%s\n' "$RAW" | sed -E 's/^[^|]*\|\s*//' > "${ARTDIR}/_as_line_after_pipe.txt" || true
-            [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && cp "${ARTDIR}/_as_line_after_pipe.txt" "${ARTDIR}/_as_line.json" || true
+            echo "$RAW" > "${ARTDIR}/_as_line.txt"
+            printf '%s\n' "$RAW" | sed -E 's#^.*\| ##' > "${ARTDIR}/_as_line.json" || true
           fi
           echo "crawler_exit=${RC}"
-          [ -s "${ARTDIR}/_as_line_after_pipe.txt" ] && echo "as_line=${ARTDIR}/_as_line_after_pipe.txt" >> "$GITHUB_OUTPUT" || true
+          [ -s "${ARTDIR}/_as_line.json" ] && echo "as_line=${ARTDIR}/_as_line.json" >> "$GITHUB_OUTPUT" || true
 
           CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -print | head -n1 || true)"
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
 
-      - name: Extract Space title & start (robust)
+      - name: Extract Space title & start from crawler metadata
+        if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           J="${ARTDIR}/_as_line.json"
-          RAW_TXT="${ARTDIR}/_as_line_after_pipe.txt"
-
-          TITLE=""
-          START_RAW=""
-
-          # 1) Try proper JSON if it’s actually valid
-          if [ -s "$J" ] && jq -e . "$J" >/dev/null 2>&1; then
-            TITLE="$(jq -r '(.audioSpace // .) | (.metadata.title // empty)' "$J" || true)"
-            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // empty)' "$J" || true)"
-          fi
-
-          # 2) If jq failed (masked logs), pull via regex from the raw text
-          if [ -z "$TITLE" ] && [ -s "$RAW_TXT" ]; then
-            TITLE="$(grep -oE '"title":"[^"]+"' "$RAW_TXT" | head -n1 | sed -E 's/^"title":"(.*)"$/\1/')" || true
-          fi
-          if [ -z "$START_RAW" ] && [ -s "$RAW_TXT" ]; then
-            START_RAW="$(grep -oE '"started_at":[0-9"]+' "$RAW_TXT" | head -n1 | sed -E 's/^"started_at"://; s/"//g')" || true
-            [ -z "$START_RAW" ] && START_RAW="$(grep -oE '"startedAt":"[^"]+"' "$RAW_TXT" | head -n1 | sed -E 's/^"startedAt":"(.*)"/\1/')" || true
-          fi
-
-          # 3) Final fallback: parse the audio filename
-          if [ -z "$TITLE" ] && [ -n "${INPUT_FILE:-}" ]; then
-            BN="$(basename "$INPUT_FILE")"
-            # Pattern: [user][code] Title (ID).ext
-            TITLE="$(printf '%s' "$BN" | sed -E 's/^\[[^]]+\]\s*\[[^]]+\]\s*//; s/\s*\([^)]+\)\.[^.]+$//; s/_/ /g')" || true
-          fi
-
-          # Export title if found
-          if [ -n "$TITLE" ] && [ "$TITLE" != "null" ]; then
-            echo "SPACE_TITLE=$TITLE" >> "$GITHUB_ENV"
-          fi
-
-          # Normalize started_at to ISO8601Z if we have it
-          DATE_GMT=""
-          if [ -n "${START_RAW:-}" ] && [ "${START_RAW}" != "null" ]; then
-            if [[ "$START_RAW" =~ ^[0-9]{13,}$ ]]; then
-              SEC=$((START_RAW/1000))
-              DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-            elif [[ "$START_RAW" =~ ^[0-9]{10}$ ]]; then
-              DATE_GMT="$(date -u -d "@$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-            else
-              DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+          if [ -s "$J" ]; then
+            TITLE="$(jq -r '(.audioSpace // .) | .metadata.title // empty' "$J")"
+            if [ -n "$TITLE" ] && [ "$TITLE" != "null" ]; then
+              echo "SPACE_TITLE=${TITLE}" >> "$GITHUB_ENV"
+            fi
+            START_RAW="$(jq -r '(.audioSpace // .) | (.metadata.started_at // .metadata.startedAt // empty)' "$J")"
+            if [ -n "$START_RAW" ] && [ "$START_RAW" != "null" ]; then
+              if [[ "$START_RAW" =~ ^[0-9]+$ ]]; then
+                SEC=$((START_RAW/1000)); DATE_GMT="$(date -u -d "@$SEC" '+%Y-%m-%dT%H:%M:%SZ')"
+              else
+                DATE_GMT="$(date -u -d "$START_RAW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+              fi
+              [ -n "$DATE_GMT" ] && echo "SPACE_STARTED_AT=${DATE_GMT}" >> "$GITHUB_ENV"
             fi
           fi
-          [ -n "$DATE_GMT" ] && echo "SPACE_STARTED_AT=$DATE_GMT" >> "$GITHUB_ENV" || true
-
-          # Decide final title
           TTL="${SPACE_TITLE:-${{ github.event.inputs.title }}}"
-          if [ -z "$TTL" ] && [ -n "$TITLE" ]; then TTL="$TITLE"; fi
-          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
-
+          echo "TTL_FINAL=${TTL}" >> "$GITHUB_ENV"
 
       - name: Build VTT & syncable grouped transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'replies_only' && github.event.inputs.mode != 'attendees_only' }}
         shell: bash
         run: |
           set -euxo pipefail
+          # Prefer crawler-produced captions jsonl if any
           CC_JSONL="${CRAWLER_CC:-}"
           if [ -z "${CC_JSONL}" ]; then
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" \
-              python3 .github/workflows/scripts/gen_vtt.py
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+            if [ -f ".github/workflows/scripts/gen_vtt.py" ]; then
+              CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 ".github/workflows/scripts/gen_vtt.py" || true
+              [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+              [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
+            else
+              echo "gen_vtt.py not found; skipping VTT build"
+            fi
           fi
 
       - name: Notify WP — processing audio
@@ -484,18 +455,12 @@ jobs:
         if: ${{ github.event.inputs.mode != 'replies_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
         shell: bash
         env:
-          PID:        ${{ github.event.inputs.post_id }}
-          AUD_PROXY:  ${{ steps.upload_mp3.outputs.audio_proxy }}
-          AUD_RAW:    ${{ steps.upload_mp3.outputs.audio_raw }}
-          VTT_PROXY:  ${{ steps.upload_vtt.outputs.vtt_proxy }}
-          VTT_RAW:    ${{ steps.upload_vtt.outputs.vtt_raw }}
+          PID:  ${{ github.event.inputs.post_id }}
+          AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
+          VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${{ github.event.inputs.title }}}"
-
-          # choose preferred URLs
-          AUD="${AUD_PROXY:-${AUD_RAW:-}}"
-          VTTU="${VTT_PROXY:-${VTT_RAW:-}}"
 
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
@@ -572,6 +537,7 @@ jobs:
             -d "$BODY" | jq -r .
 
       # --------------- REPLIES-ONLY FLOW ---------------
+
       - name: Scrape Space tweet replies (replies_only)
         if: ${{ github.event.inputs.mode == 'replies_only' }}
         shell: bash
@@ -579,7 +545,7 @@ jobs:
           PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euxo pipefail
-          # checked-in script should exist in repo
+          # Checked-in script should exist; it no-ops (exit 0) if creds/inputs missing.
           python3 .github/workflows/scripts/replies.py
           [ -s "${ARTDIR}/${BASE}_replies.html" ] && echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV" || true
           [ -s "${ARTDIR}/${BASE}_links.html" ] && echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV" || true
