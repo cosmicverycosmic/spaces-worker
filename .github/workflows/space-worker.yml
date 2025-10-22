@@ -1,3 +1,5 @@
+does this version rely on external scripts?
+
 name: Space Worker
 
 on:
@@ -109,8 +111,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
           python3 -m pip install --upgrade pip
-          # tools: audio, crawler fallback, replies (snscrape), HTTP for link expansion
-          python3 -m pip install --no-cache-dir yt-dlp snscrape requests
+          python3 -m pip install --no-cache-dir yt-dlp
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
@@ -241,145 +242,145 @@ jobs:
       - name: Build VTT & diarized transcript from crawler JSONL
         if: ${{ github.event.inputs.mode != 'attendees_only' }}
         shell: bash
-        run: |
+        run: |2
           set -euxo pipefail
           CC_JSONL="${CRAWLER_CC:-}"
           if [ -z "${CC_JSONL}" ]; then
             CC_JSONL="$(find "${ARTDIR}" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
           fi
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL:-}" ]; then
-            cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
-            import json, os, re
-            from datetime import datetime, timezone
+          cat <<'PYCODE' > "${WORKDIR}/gen_vtt.py"
+          import json, os, re
+          from datetime import datetime, timezone
 
-            artdir = os.environ.get("ARTDIR")
-            base   = os.environ.get("BASE")
-            src    = os.environ.get("CC_JSONL") or ""
-            if not src:
-                raise SystemExit(0)
+          artdir = os.environ.get("ARTDIR")
+          base   = os.environ.get("BASE")
+          src    = os.environ.get("CC_JSONL") or ""
+          if not src:
+              raise SystemExit(0)
 
-            def parse_time_iso(s):
-                if not s:
-                    return None
-                s = s.strip()
-                if s.endswith('Z'):
-                    s = s[:-1] + '+00:00'
-                if re.search(r'[+-]\d{4}$', s):
-                    s = s[:-5] + s[-5:-2] + ':' + s[-2:]
-                try:
-                    dt = datetime.fromisoformat(s)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    return dt.timestamp()
-                except Exception:
-                    return None
+          def parse_time_iso(s):
+              if not s:
+                  return None
+              s = s.strip()
+              if s.endswith('Z'):
+                  s = s[:-1] + '+00:00'
+              if re.search(r'[+-]\d{4}$', s):
+                  s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+              try:
+                  dt = datetime.fromisoformat(s)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.timestamp()
+              except Exception:
+                  return None
 
-            def fmt_ts(t):
-                if t < 0: t = 0.0
-                h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-                return f"{h:02d}:{m:02d}:{s:06.3f}"
+          def fmt_ts(t):
+              if t < 0: t = 0.0
+              h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+              return f"{h:02d}:{m:02d}:{s:06.3f}"
 
-            def strip_emoji_for_vtt(s):
-                s = re.sub(r'[<>&]', '', s)  # avoid breaking WebVTT
-                # strip surrogate + PUA emoji that can break some players
-                s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
-                s = s.strip()
-                return s or "Speaker"
+          def strip_emoji_for_vtt(s):
+              s = re.sub(r'[<>&]', '', s)  # avoid breaking WebVTT
+              # strip surrogate + PUA emoji that can break some players
+              s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
+              s = s.strip()
+              return s or "Speaker"
 
-            def html_escape(s):
-                return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+          def html_escape(s):
+              return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
-            utterances = []
-            with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        outer = json.loads(line)
-                    except Exception:
-                        continue
-                    payload_raw = outer.get("payload")
-                    if not payload_raw:
-                        continue
-                    try:
-                        payload = json.loads(payload_raw)
-                    except Exception:
-                        continue
-                    body_raw = payload.get("body")
-                    if not body_raw:
-                        continue
-                    try:
-                        inner = json.loads(body_raw)
-                    except Exception:
-                        continue
-                    # type 45 = caption/utterance messages
-                    if inner.get("type") != 45:
-                        continue
-                    text = (inner.get("body") or "").strip()
-                    if not text:
-                        continue
-                    if "final" in inner and not inner.get("final"):
-                        continue
-                    name = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
-                           or inner.get("username") or inner.get("user_id") or "Speaker"
-                    ts = parse_time_iso(inner.get("programDateTime"))
-                    if ts is None:
-                        try:
-                            ts = int(inner.get("timestamp")) / 1000.0
-                        except Exception:
-                            ts = None
-                    if ts is None:
-                        continue
-                    utterances.append({"ts": ts, "name": name, "text": text})
+          utterances = []
+          with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      outer = json.loads(line)
+                  except Exception:
+                      continue
+                  payload_raw = outer.get("payload")
+                  if not payload_raw:
+                      continue
+                  try:
+                      payload = json.loads(payload_raw)
+                  except Exception:
+                      continue
+                  body_raw = payload.get("body")
+                  if not body_raw:
+                      continue
+                  try:
+                      inner = json.loads(body_raw)
+                  except Exception:
+                      continue
+                  # type 45 = caption/utterance messages
+                  if inner.get("type") != 45:
+                      continue
+                  text = (inner.get("body") or "").strip()
+                  if not text:
+                      continue
+                  if "final" in inner and not inner.get("final"):
+                      continue
+                  name = inner.get("displayName") or payload.get("sender", {}).get("display_name") \
+                         or inner.get("username") or inner.get("user_id") or "Speaker"
+                  ts = parse_time_iso(inner.get("programDateTime"))
+                  if ts is None:
+                      try:
+                          ts = int(inner.get("timestamp")) / 1000.0
+                      except Exception:
+                          ts = None
+                  if ts is None:
+                      continue
+                  utterances.append({"ts": ts, "name": name, "text": text})
 
-            utterances.sort(key=lambda x: x["ts"])
-            if not utterances:
-                raise SystemExit(0)
+          utterances.sort(key=lambda x: x["ts"])
+          if not utterances:
+              raise SystemExit(0)
 
-            t0_abs = utterances[0]["ts"]
+          t0_abs = utterances[0]["ts"]
 
-            for i, u in enumerate(utterances):
-                u["start_rel"] = u["ts"] - t0_abs
-                if i + 1 < len(utterances):
-                    nxt = utterances[i + 1]["ts"] - t0_abs
-                    u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
-                else:
-                    words = max(1, len(u["text"].split()))
-                    dur = min(6.0, max(1.2, 0.35 * words + 0.8))
-                    u["end_rel"] = u["start_rel"] + dur
+          for i, u in enumerate(utterances):
+              u["start_rel"] = u["ts"] - t0_abs
+              if i + 1 < len(utterances):
+                  nxt = utterances[i + 1]["ts"] - t0_abs
+                  u["end_rel"] = max(u["start_rel"] + 0.6, nxt - 0.1)
+              else:
+                  words = max(1, len(u["text"].split()))
+                  dur = min(6.0, max(1.2, 0.35 * words + 0.8))
+                  u["end_rel"] = u["start_rel"] + dur
 
-            # WEBVTT with bold speaker names
-            vtt_path = os.path.join(artdir, f"{base}.vtt")
-            with open(vtt_path, "w", encoding="utf-8") as vf:
-                vf.write("WEBVTT\n\n")
-                for idx, u in enumerate(utterances, 1):
-                    vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
-                    vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
+          # WEBVTT with bold speaker names
+          vtt_path = os.path.join(artdir, f"{base}.vtt")
+          with open(vtt_path, "w", encoding="utf-8") as vf:
+              vf.write("WEBVTT\n\n")
+              for idx, u in enumerate(utterances, 1):
+                  vf.write(f"{idx}\n{fmt_ts(u['start_rel'])} --> {fmt_ts(u['end_rel'])}\n")
+                  vf.write(f"<b>{strip_emoji_for_vtt(u['name'])}</b>: {u['text']}\n\n")
 
-            # HTML transcript with bold names
-            tr_path = os.path.join(artdir, f"{base}_transcript.html")
-            with open(tr_path, "w", encoding="utf-8") as tf:
-                tf.write('<div class="transcript">\n')
-                for u in utterances:
-                    tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
-                tf.write("</div>\n")
+          # HTML transcript with bold names
+          tr_path = os.path.join(artdir, f"{base}_transcript.html")
+          with open(tr_path, "w", encoding="utf-8") as tf:
+              tf.write('<div class="transcript">\n')
+              for u in utterances:
+                  tf.write(f"<p><time>{fmt_ts(u['start_rel'])}</time> <strong>{html_escape(u['name'])}</strong>: {html_escape(u['text'])}</p>\n")
+              tf.write("</div>\n")
 
-            # Earliest absolute timestamp → used later to set WP post date
-            start_iso = datetime.utcfromtimestamp(t0_abs).replace(tzinfo=timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-            with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
-                sf.write(start_iso + "\n")
-            PYCODE
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
-            if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
-              echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
-            fi
-            if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
-              echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
-            fi
-            if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-              echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
-            fi
+          # Earliest absolute timestamp → used later to set WP post date
+          start_iso = datetime.fromtimestamp(t0_abs, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+          with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
+              sf.write(start_iso + "\n")
+          PYCODE
+          CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" python3 "${WORKDIR}/gen_vtt.py"
+          if [ -s "${ARTDIR}/${BASE}.vtt" ]; then
+            echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}_transcript.html" ]; then
+            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV"
+          fi
+          if [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+            echo "SPACE_STARTED_AT=$(tr -d '\r\n' < "${ARTDIR}/${BASE}.start.txt")" >> "$GITHUB_ENV"
+          fi
           fi
 
       - name: Notify WP — processing audio
@@ -503,153 +504,6 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      # ---------- NEW: Find purple-pill tweet (for replies) ----------
-      - name: Identify host handle and purple-pill tweet
-        id: purple
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          AS="${ARTDIR}/_as_line.json"
-          HANDLE="$(jq -r '.audioSpace.metadata.creator_results.result.legacy.screen_name // .metadata.creator_results.result.legacy.screen_name // empty' "$AS" 2>/dev/null || true)"
-          if [ -z "${HANDLE:-}" ]; then
-            # Fallback: try username field or first watch user
-            HANDLE="$(jq -r '.audioSpace.username // empty' "$AS" 2>/dev/null || true)"
-            [ -z "${HANDLE:-}" ] && HANDLE="${{ github.event.inputs.watch_users }}" && HANDLE="${HANDLE%%,*}"
-          fi
-          echo "CREATOR_HANDLE=${HANDLE}" >> "$GITHUB_ENV"
-
-          # Use snscrape to find the purple-pill tweet that links to this Space
-          python3 - <<'PY'
-import os, sys, json, shlex, subprocess
-handle = os.environ.get("CREATOR_HANDLE","").strip()
-sid    = os.environ.get("SPACE_ID","").strip()
-work   = os.environ.get("WORKDIR",".")
-tweet_url = ""
-
-if handle and sid:
-    q = f'from:{handle} url:"/i/spaces/{sid}"'
-    cmd = f"snscrape --jsonl twitter-search {shlex.quote(q)}"
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if p.stdout.strip():
-        try:
-            j = json.loads(p.stdout.splitlines()[0])
-            tweet_url = j.get("url","")
-        except Exception:
-            pass
-
-dest = os.path.join(work, "tweet.list")
-with open(dest, "w", encoding="utf-8") as f:
-    if tweet_url:
-        f.write(tweet_url + "\n")
-
-print(tweet_url)
-PY
-          TWEET_URL="$(cat "${WORKDIR}/tweet.list" 2>/dev/null || true)"
-          echo "TWEET_URL=${TWEET_URL}" >> "$GITHUB_ENV"
-
-      # ---------- NEW: Scrape replies & build HTML + links ----------
-      - name: Build replies HTML + links (snscrape)
-        if: ${{ github.event.inputs.mode != 'attendees_only' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          [ -z "${TWEET_URL:-}" ] && exit 0
-          cat <<'PYCODE' > "${WORKDIR}/build_replies.py"
-import os, re, json, html, subprocess, shlex, requests
-from urllib.parse import urlparse
-
-artdir = os.environ.get("ARTDIR",".")
-base   = os.environ.get("BASE","space")
-tweet  = os.environ.get("TWEET_URL","").strip()
-if not tweet:
-    raise SystemExit(0)
-
-# Extract tweet id
-m = re.search(r"/status/(\\d+)", tweet)
-if not m:
-    raise SystemExit(0)
-tid = m.group(1)
-
-# Pull conversation (includes root + all replies)
-cmd = f"snscrape --jsonl twitter-search {shlex.quote('conversation_id:'+tid)}"
-p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-lines = [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
-if not lines:
-    raise SystemExit(0)
-
-# index by id, build tree via inReplyToTweetId
-nodes = {}
-children = {}
-for j in lines:
-    id_  = str(j.get("id"))
-    pid  = str(j.get("inReplyToTweetId")) if j.get("inReplyToTweetId") is not None else None
-    nodes[id_] = j
-    if pid:
-        children.setdefault(pid, []).append(id_)
-
-def topo(root_id):
-    # DFS for ordering
-    stack = [(root_id,0)]
-    order = []
-    while stack:
-        nid, lvl = stack.pop()
-        order.append((nid,lvl))
-        for ch in reversed(children.get(nid, [])):  # maintain natural order
-            stack.append((ch, lvl+1))
-    return order
-
-order = topo(tid)
-
-# Collect & expand links
-def expand(url):
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=10)
-        return r.url
-    except Exception:
-        return url
-
-linkset = set()
-
-# HTML render
-html_out = ['<div class="space-replies">']
-for nid, lvl in order[1:]:  # skip the root itself (purple-pill content)
-    j = nodes.get(nid, {})
-    user = j.get("user", {})
-    dname = user.get("displayname") or ""
-    uname = user.get("username") or ""
-    txt = j.get("renderedContent") or j.get("content") or ""
-    # autolink and capture urls
-    urls = set(re.findall(r'https?://\\S+', txt))
-    for u in urls:
-        linkset.add(expand(u))
-    safe = html.escape(txt)
-    for u in urls:
-        safe = safe.replace(html.escape(u), f'<a href="{u}">{html.escape(u)}</a>')
-    prefix = "&nbsp;"*2*lvl
-    who = f"<strong>{html.escape(dname)} (@{html.escape(uname)})</strong>"
-    html_out.append(f'<p class="reply" data-level="{lvl}" style="margin-left:{lvl}em">{prefix}{who}: {safe}</p>')
-html_out.append('</div>')
-
-rep_path = os.path.join(artdir, f"{base}_replies.html")
-with open(rep_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(html_out))
-
-# Links list (external only; de-dupe; drop twitter/x links)
-links = sorted([u for u in linkset if urlparse(u).netloc and ("twitter.com" not in u and "x.com" not in u)])
-links_html = ["<ul class=\"space-links\">"] + [f'<li><a href="{html.escape(u)}">{html.escape(u)}</a></li>' for u in links] + ["</ul>"]
-lnk_path = os.path.join(artdir, f"{base}_links.html")
-with open(lnk_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(links_html))
-PYCODE
-          ARTDIR="${ARTDIR}" BASE="${BASE}" TWEET_URL="${TWEET_URL}" python3 "${WORKDIR}/build_replies.py" || true
-          if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
-            echo "REPLIES_HTML_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
-          fi
-          if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
-            echo "LINKS_HTML_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
-          fi
-
       - name: Build attendees JSON & HTML (from crawler)
         id: attendees
         if: ${{ steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
@@ -708,14 +562,13 @@ PYCODE
           TTL:  ${{ github.event.inputs.title }}
         run: |
           set -euo pipefail
-          AT_HTML=""
+
+          # Fallback files for rawfile ingestion
+          ATH_FILE="${WORKDIR}/empty_attendees.html"
+          : > "$ATH_FILE"
           if [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ]; then
-            AT_HTML="$(cat "${ATTN_HTML}")"
+            ATH_FILE="${ATTN_HTML}"
           fi
-          REPLIES_HTML=""
-          [ -n "${REPLIES_HTML_PATH:-}" ] && [ -s "${REPLIES_HTML_PATH}" ] && REPLIES_HTML="$(cat "${REPLIES_HTML_PATH}")" || true
-          LINKS_HTML=""
-          [ -n "${LINKS_HTML_PATH:-}" ] && [ -s "${LINKS_HTML_PATH}" ] && LINKS_HTML="$(cat "${LINKS_HTML_PATH}")" || true
 
           TR_FILE="${WORKDIR}/empty_transcript.txt"
           : > "$TR_FILE"
@@ -723,39 +576,32 @@ PYCODE
             TR_FILE="${TRANSCRIPT_PATH}"
           fi
 
-          BODY="$(jq -n \
+          REQ="${WORKDIR}/wp_register_body.json"
+          jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
             --arg pid   "${PID}" \
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
-            --arg ath   "${AT_HTML}" \
-            --arg rep   "${REPLIES_HTML}" \
-            --arg lnk   "${LINKS_HTML}" \
-            --rawfile tr "${TR_FILE}" \
+            --rawfile ath "${ATH_FILE}" \
+            --rawfile tr  "${TR_FILE}" \
             --arg started "${SPACE_STARTED_AT:-}" \
             '{
-              gcs_url: $gcs,
-              mime:    $mime,
-              post_id: ($pid|tonumber),
-              title:   $ttl
-            }
-            + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
-            + (if ($ath|length)>0 then {attendees_html:$ath} else {} end)
-            + (if ($rep|length)>0 then {replies_html:$rep} else {} end)
-            + (if ($lnk|length)>0 then {links_html:$lnk} else {} end)
-            + (if (($tr|gsub("\\s";"")|length) > 0) then {transcript: $tr, has_transcript:true} else {} end)
-            + (if ($started|length)>0 then {space_started_at:$started} else {} end)
-          ')"
-
-          # Write to file to avoid "Argument list too long"
-          PAYLOAD="${WORKDIR}/register_payload.json"
-          printf '%s' "${BODY}" > "${PAYLOAD}"
+               gcs_url: $gcs,
+               mime:    $mime,
+               post_id: ($pid|tonumber),
+               title:   $ttl
+             }
+             + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+             + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
+             + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
+             + (if ($started|length)>0 then {space_started_at:$started} else {} end)
+            ' > "$REQ"
 
           curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            --data @"${PAYLOAD}" | jq -r .
+            --data-binary @"$REQ" | jq -r .
 
       - name: Set WP post date to Space start (optional)
         if: ${{ env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && env.SPACE_STARTED_AT != '' && github.event.inputs.post_id != '' }}
@@ -817,12 +663,6 @@ PYCODE
               echo "- Transcript embedded to WP"
             else
               echo "- Transcript not generated"
-            fi
-            if [ -n "${REPLIES_HTML_PATH:-}" ] && [ -s "${REPLIES_HTML_PATH}" ]; then
-              echo "- Replies scraped and embedded"
-            fi
-            if [ -n "${LINKS_HTML_PATH:-}" ] && [ -s "${LINKS_HTML_PATH}" ]; then
-              echo "- Links list embedded"
             fi
             if [ "${ATTENDEES_OK:-0}" = "1" ]; then
               echo "- Attendees saved to WP (HTML)"
