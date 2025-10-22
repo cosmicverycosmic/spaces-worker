@@ -46,16 +46,6 @@ on:
         required: false
         type: string
         default: ""
-      watch_users:
-        description: Comma-separated X usernames to monitor (mode=watch)
-        required: false
-        type: string
-        default: ""
-      watch_duration_minutes:
-        description: Minutes to monitor in watch mode (<= job timeout)
-        required: false
-        type: number
-        default: 170
       purple_tweet_url:                    # <-- NEW (aligns with WP plugin)
         description: Purple Pill tweet URL for replies/links scraping (optional)
         required: false
