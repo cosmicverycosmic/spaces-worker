@@ -1,344 +1,163 @@
+# file: .github/workflows/scripts/replies_web.py
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-.github/workflows/scripts/replies.py
+import os, re, json, html, time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from collections import defaultdict
 
-Scrape replies + shared links for a given “Purple Pill” tweet and emit two HTML
-artifacts into $ARTDIR:
+ARTDIR = os.environ.get("ARTDIR",".")
+BASE   = os.environ.get("BASE","space")
+PURPLE = os.environ.get("PURPLE_TWEET_URL","").strip()
 
-  - $BASE_replies.html  (threaded replies)
-  - $BASE_links.html    (unique URLs shared across the thread)
+OUT_REPLIES = os.path.join(ARTDIR, f"{BASE}_replies.html")
+OUT_LINKS   = os.path.join(ARTDIR, f"{BASE}_links.html")
 
-Design goals:
-  • Graceful no-op when inputs/creds are missing (exit 0; do not fail the job).
-  • Prefer python-twitter (v1.1 search; 7-day limit) if TW_API_* keys are set.
-  • Flat, dependency-light. No web scraping of x.com HTML (it’s JS-rendered).
+AUTH = os.environ.get("TWITTER_AUTHORIZATION","").strip()  # must start with "Bearer "
+AUTH_COOKIE = os.environ.get("TWITTER_AUTH_TOKEN","").strip()  # auth_token cookie
+CSRF = os.environ.get("TWITTER_CSRF_TOKEN","").strip()         # ct0 cookie
 
-ENV expected (workflow sets these):
-  PURPLE_TWEET_URL   e.g. https://x.com/username/status/1234567890
-  WORKDIR            work area (default: ./work)
-  ARTDIR             artifacts out dir (default: ./out)
-  BASE               prefix for artifact filenames (default uses UTC date)
+def write_empty():
+    open(OUT_REPLIES, "w").write("")
+    open(OUT_LINKS, "w").write("")
 
-Optional creds (python-twitter):
-  TW_API_CONSUMER_KEY
-  TW_API_CONSUMER_SECRET
-  TW_API_ACCESS_TOKEN
-  TW_API_ACCESS_TOKEN_SECRET
-"""
+m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", PURPLE)
+if not m:
+    write_empty(); raise SystemExit(0)
 
-import os
-import re
-import sys
-import html
-import time
-from datetime import datetime, timezone
+screen_name, root_id = m.group(1), m.group(2)
+if not (AUTH.startswith("Bearer ") and AUTH_COOKIE and CSRF):
+    write_empty(); raise SystemExit(0)
 
-# ---------------------------------------------------------------------------
-# env / paths
-# ---------------------------------------------------------------------------
-WORKDIR = os.environ.get("WORKDIR", os.path.join(os.getcwd(), "work"))
-ARTDIR  = os.environ.get("ARTDIR",  os.path.join(os.getcwd(), "out"))
-BASE    = os.environ.get("BASE",    f"space-{datetime.now(timezone.utc):%m-%d-%Y}-unknown")
-PURPLE  = (os.environ.get("PURPLE_TWEET_URL") or "").strip()
+def headers():
+    ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}"
+    return {
+        "Authorization": AUTH,
+        "x-csrf-token": CSRF,
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://x.com/{screen_name}/status/{root_id}",
+        "Cookie": ck,
+    }
 
-TW_CK = os.environ.get("TW_API_CONSUMER_KEY", "")
-TW_CS = os.environ.get("TW_API_CONSUMER_SECRET", "")
-TW_AT = os.environ.get("TW_API_ACCESS_TOKEN", "")
-TW_AS = os.environ.get("TW_API_ACCESS_TOKEN_SECRET", "")
+BASE_URL = "https://twitter.com/i/api/2/search/adaptive.json"
+Q = f"conversation_id:{root_id}"
 
-os.makedirs(WORKDIR, exist_ok=True)
-os.makedirs(ARTDIR,  exist_ok=True)
-
-REPLIES_PATH = os.path.join(ARTDIR, f"{BASE}_replies.html")
-LINKS_PATH   = os.path.join(ARTDIR, f"{BASE}_links.html")
-
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# utilities
-# ---------------------------------------------------------------------------
-def parse_tweet_url(u: str):
-    """
-    Accepts https://x.com/<user>/status/<id> or https://twitter.com/<user>/status/<id>
-    Returns (screen_name, tweet_id:int) or (None, None) if not parseable.
-    """
-    if not u:
-        return None, None
-    m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", u)
-    if not m:
-        return None, None
-    return m.group(1), int(m.group(2))
-
-
-def safe_created_at(s: str) -> str:
-    """
-    python-twitter created_at looks like: 'Mon Oct 21 15:21:14 +0000 2025'
-    Make a compact ISO-like string in UTC; fall back to the original on parse error.
-    """
-    if not s:
-        return ""
+def fetch_page(cursor=None, retries=2):
+    params = {
+        "q": Q,
+        "count": 100,
+        "tweet_search_mode": "live",
+        "query_source": "typed_query",
+        "tweet_mode": "extended",
+        "pc": "ContextualServices",
+        "spelling_corrections": "1",
+        "include_quote_count": "true",
+        "include_reply_count": "true",
+        "ext": "mediaStats,highlightedLabel,hashtags,antispam_media_platform,voiceInfo,superFollowMetadata,unmentionInfo,editControl,emoji_reaction"
+    }
+    if cursor: params["cursor"] = cursor
+    url = BASE_URL + "?" + urlencode(params)
+    req = Request(url, headers=headers())
     try:
-        # Try with timezone first
-        dt = datetime.strptime(s, "%a %b %d %H:%M:%S %z %Y")
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
-        try:
-            # Fallback without %z (just in case)
-            dt = datetime.strptime(s, "%a %b %d %H:%M:%S %Y")
-            return dt.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        except Exception:
-            return s
+        with urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except HTTPError as e:
+        if e.code in (429, 403) and retries>0:
+            time.sleep(3); return fetch_page(cursor, retries-1)
+        return None
+    except URLError:
+        return None
 
+def bottom_cursor(obj):
+    if isinstance(obj, dict):
+        if obj.get("cursorType") == "Bottom" and "value" in obj:
+            return obj["value"]
+        for v in obj.values():
+            c = bottom_cursor(v)
+            if c: return c
+    elif isinstance(obj, list):
+        for it in obj:
+            c = bottom_cursor(it)
+            if c: return c
+    return None
 
-def extract_urls(text: str):
-    if not text:
-        return []
-    # Rough URL matcher; good enough for artifacting.
-    return re.findall(r"https?://[^\s)>\]]+", text)
+def collect():
+    tweets, users = {}, {}
+    cursor, pages = None, 0
+    while pages < 40:
+        data = fetch_page(cursor)
+        if not data: break
+        pages += 1
+        for k, v in (data.get("globalObjects", {}).get("tweets") or {}).items():
+            tweets[k] = v
+        for k, v in (data.get("globalObjects", {}).get("users") or {}).items():
+            users[k] = v
+        nxt = bottom_cursor(data.get("timeline") or data)
+        if not nxt or nxt == cursor: break
+        cursor = nxt
+        time.sleep(0.6)
+    return tweets, users
 
+tweets, users = collect()
 
-# ---------------------------------------------------------------------------
-# python-twitter path (v1.1 search)
-# ---------------------------------------------------------------------------
-def collect_replies_with_python_twitter(root_sn: str, root_id: int):
-    """
-    Strategy:
-      1) Search for tweets "to:root_sn" since root_id, paging until exhausted.
-      2) Build a map: parent_id -> [child_tweet, ...]
-      3) DFS from root_id to produce a threaded list of replies (with depth).
-    Returns:
-      replies: list of dicts {id, user, screen_name, text, created_at, url, depth}
-      links:   list of (url, context_snippet)
-    """
+replies = []
+for tid, t in tweets.items():
+    if str(t.get("conversation_id_str") or t.get("conversation_id")) != str(root_id):
+        continue
+    if str(t.get("id_str") or t.get("id")) == str(root_id):
+        continue
+    replies.append(t)
+
+def tstamp(t):
     try:
-        import twitter  # pip install python-twitter
+        import time as _t
+        return _t.mktime(_t.strptime(t.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
     except Exception:
-        log("[replies] python-twitter not installed; skipping.")
-        return [], []
+        return 0
+replies.sort(key=tstamp)
 
-    if not (TW_CK and TW_CS and TW_AT and TW_AS):
-        log("[replies] No TW_API_* keys configured; skipping python-twitter mode.")
-        return [], []
-
-    api = twitter.Api(
-        consumer_key=TW_CK,
-        consumer_secret=TW_CS,
-        access_token_key=TW_AT,
-        access_token_secret=TW_AS,
-        sleep_on_rate_limit=True,
+blocks = []
+for t in replies:
+    uid = str(t.get("user_id_str") or t.get("user_id") or "")
+    u = users.get(uid, {})
+    name = u.get("name") or "User"
+    handle = u.get("screen_name") or ""
+    avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
+    url = f"https://x.com/{handle}/status/{t.get('id_str') or t.get('id')}"
+    text = html.escape(t.get("full_text") or t.get("text") or "")
+    imgtag = f'<img class="ss3k-ravatar" src="{html.escape(avatar)}" alt="">' if avatar else '<div class="ss3k-ravatar" style="width:32px;height:32px;border-radius:50%;background:#eee"></div>'
+    who = html.escape(f"{name} (@{handle})") if handle else html.escape(name)
+    blocks.append(
+        f'<div class="ss3k-reply"><a href="{url}" target="_blank" rel="noopener">{imgtag}</a>'
+        f'<div class="ss3k-rcontent"><div class="ss3k-rname">{who}</div>'
+        f'<div class="ss3k-rtext">{text}</div></div></div>'
     )
+open(OUT_REPLIES,"w").write("\n".join(blocks))
 
-    term = f"to:{root_sn}"
-    log(f"[replies] v1.1 search term={term} since_id={root_id}")
+doms = defaultdict(set)
+def add_urls_from(t):
+    ent = t.get("entities") or {}
+    for u in (ent.get("urls") or []):
+        u2 = u.get("expanded_url") or u.get("url")
+        if not u2: continue
+        m = re.search(r"https?://([^/]+)/?", u2)
+        dom = m.group(1) if m else "links"
+        doms[dom].add(u2)
 
-    # 1) fetch all candidate tweets
-    parent_map = {}  # pid -> [status, ...]
-    seen_ids = set()
-    max_id = None
-    total = 0
+for t in replies:
+    add_urls_from(t)
 
-    while True:
-        try:
-            batch = api.GetSearch(term=term, since_id=root_id, max_id=max_id, count=100)
-        except Exception as e:
-            log(f"[replies] twitter API error, stopping: {e}")
-            break
-
-        if not batch:
-            break
-
-        for st in batch:
-            try:
-                d = st.AsDict()
-                tid = int(d.get("id"))
-                if tid in seen_ids:
-                    continue
-                seen_ids.add(tid)
-
-                pid = d.get("in_reply_to_status_id")
-                if pid is None:
-                    continue
-                try:
-                    pid = int(pid)
-                except Exception:
-                    continue
-
-                parent_map.setdefault(pid, []).append(st)
-                total += 1
-            except Exception:
-                continue
-
-        # prepare next page
-        try:
-            max_id = min(int(s.id) for s in batch) - 1
-        except Exception:
-            break
-
-        # stop if we’re clearly done
-        if len(batch) < 100:
-            break
-
-        # be polite
-        time.sleep(0.5)
-
-    log(f"[replies] gathered {total} candidate tweets; building thread…")
-
-    # 2) DFS to build threaded order
-    replies = []
-    links_seen = {}
-    links = []
-
-    def dfs(parent_id: int, depth: int = 0):
-        children = parent_map.get(parent_id, [])
-        # chronological order:
-        try:
-            children.sort(key=lambda s: datetime.strptime(s.created_at, "%a %b %d %H:%M:%S %z %Y"))
-        except Exception:
-            # fallback: ids ascending
-            children.sort(key=lambda s: int(getattr(s, "id", 0)))
-
-        for st in children:
-            d = st.AsDict()
-            rid = int(d.get("id"))
-            u = d.get("user") or {}
-            sn = (u.get("screen_name") or "").strip()
-            name = (u.get("name") or "").strip()
-            txt = d.get("text") or ""
-            cat = safe_created_at(d.get("created_at") or "")
-            url = f"https://x.com/{sn}/status/{rid}"
-
-            replies.append({
-                "id": rid,
-                "user": name,
-                "screen_name": sn,
-                "text": txt,
-                "created_at": cat,
-                "url": url,
-                "depth": depth,
-            })
-
-            # gather links
-            for uurl in extract_urls(txt):
-                if uurl not in links_seen:
-                    links_seen[uurl] = txt
-                    links.append((uurl, txt))
-
-            # recurse into deeper branches
-            dfs(rid, depth + 1)
-
-    dfs(root_id, 0)
-    log(f"[replies] threaded replies: {len(replies)}; unique links: {len(links)}")
-    return replies, links
-
-
-# ---------------------------------------------------------------------------
-# artifact writers
-# ---------------------------------------------------------------------------
-def write_replies_html(path: str, replies):
-    if not replies:
-        return
-
-    head = """<!doctype html>
-<meta charset="utf-8">
-<title>Replies</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:14px}
-ul{list-style: none;padding-left:0}
-li{margin:.5em 0}
-.meta{color:#555;font-size:.9em;margin-bottom:2px}
-.bubble{background:#fff;border:1px solid #e6e8ef;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
-.indent-0{margin-left:0}
-.indent-1{margin-left:18px}
-.indent-2{margin-left:36px}
-.indent-3{margin-left:54px}
-.indent-4{margin-left:72px}
-</style>
-<ul>"""
-    parts = [head]
-
-    for r in replies:
-        indent_class = f"indent-{min(4, int(r.get('depth') or 0))}"
-        name = html.escape(r.get("user") or "")
-        sn = html.escape(r.get("screen_name") or "")
-        created = html.escape(r.get("created_at") or "")
-        url = html.escape(r.get("url") or "")
-        txt = html.escape(r.get("text") or "")
-
-        parts.append(
-            f"<li class='{indent_class}'>"
-            f"  <div class='meta'><strong>{name}</strong> (@{sn}) — {created} — "
-            f"    <a href='{url}' target='_blank' rel='noopener'>open</a></div>"
-            f"  <div class='bubble'>{txt}</div>"
-            f"</li>"
-        )
-
-    parts.append("</ul>")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts))
-    log(f"[replies] wrote {path}")
-
-
-def write_links_html(path: str, links):
-    if not links:
-        return
-
-    head = """<!doctype html>
-<meta charset="utf-8">
-<title>Links</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:14px}
-li{margin:.5em 0}
-.ctx{color:#555;font-size:.9em;margin-top:2px}
-</style>
-<ul>"""
-    parts = [head]
-
-    for url, ctx in links:
-        parts.append(
-            f"<li><a href='{html.escape(url)}' target='_blank' rel='noopener'>"
-            f"{html.escape(url)}</a>"
-            f"<div class='ctx'>{html.escape(ctx)}</div></li>"
-        )
-
-    parts.append("</ul>")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts))
-    log(f"[replies] wrote {path}")
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def main() -> int:
-    if not PURPLE:
-        log("[replies] No PURPLE_TWEET_URL provided; skipping (exit 0).")
-        return 0
-
-    screen_name, tweet_id = parse_tweet_url(PURPLE)
-    if not tweet_id:
-        log(f"[replies] Could not parse tweet id from URL: {PURPLE}; skipping (exit 0).")
-        return 0
-
-    # Try python-twitter path if creds exist
-    replies, links = [], []
-    if TW_CK and TW_CS and TW_AT and TW_AS:
-        replies, links = collect_replies_with_python_twitter(screen_name or "", tweet_id)
-    else:
-        log("[replies] No TW_API_* keys set; replies scrape skipped (exit 0).")
-        return 0
-
-    if replies:
-        write_replies_html(REPLIES_PATH, replies)
-    if links:
-        write_links_html(LINKS_PATH, links)
-
-    log(f"[replies] done. replies={len(replies)} links={len(links)}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+lines = []
+for dom in sorted(doms):
+    lines.append(f"<h4>{html.escape(dom)}</h4>")
+    lines.append("<ul>")
+    for u in sorted(doms[dom]):
+        e = html.escape(u)
+        lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
+    lines.append("</ul>")
+open(OUT_LINKS,"w").write("\n".join(lines))
