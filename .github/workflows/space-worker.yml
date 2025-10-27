@@ -71,12 +71,10 @@ env:
   WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD  || vars.WP_APP_PASSWORD }}
   DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
 
-  # Same creds you already use for the crawler (Bearer + cookies)
   TWITTER_AUTHORIZATION: ${{ secrets.TWITTER_AUTHORIZATION || secrets.X_BEARER     || vars.TWITTER_AUTHORIZATION || vars.X_BEARER }}
   TWITTER_AUTH_TOKEN:    ${{ secrets.TWITTER_AUTH_TOKEN    || secrets.X_AUTH_TOKEN || vars.TWITTER_AUTH_TOKEN    || vars.X_AUTH_TOKEN }}
   TWITTER_CSRF_TOKEN:    ${{ secrets.TWITTER_CSRF_TOKEN    || secrets.X_CSRF       || vars.TWITTER_CSRF_TOKEN    || vars.X_CSRF }}
 
-  # Legacy API keys (not required for web replies, but kept for compatibility)
   TW_API_CONSUMER_KEY:        ${{ secrets.TW_API_CONSUMER_KEY        || vars.TW_API_CONSUMER_KEY }}
   TW_API_CONSUMER_SECRET:     ${{ secrets.TW_API_CONSUMER_SECRET     || vars.TW_API_CONSUMER_SECRET }}
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
@@ -267,7 +265,6 @@ jobs:
         run: |
           set -euxo pipefail
           TRIM_WAV="${WORKDIR}/trim_${{ github.run_id }}.wav"
-          # RF64 avoids >4GB WAV header issues on very long Spaces
           ffmpeg -hide_banner -y -i "$INPUT_FILE" \
             -af "silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_silence=1:start_threshold=-45dB:detection=peak,areverse" \
             -rf64 always -c:a pcm_s16le "$TRIM_WAV"
@@ -297,11 +294,9 @@ jobs:
           SR="${SRC_SR:-48000}"
 
           if [ "${PROF}" = "transparent" ]; then
-            # Preserve tone; no denoise/EQ/comp; transparent VBR
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -map a:0 -c:a libmp3lame -q:a 0 -ar "$SR" -ac "$CH" "$OUT"
 
           elif [ "${PROF}" = "radio" ]; then
-            # Clean & even loudness (two-pass loudnorm), no hollow/echo
             PRE="highpass=f=60,lowpass=f=14000,afftdn=nr=4:nf=-28,deesser=i=0.12,acompressor=threshold=-18dB:ratio=2:attack=12:release=220:makeup=2"
             PASS1_JSON="${WORKDIR}/loudnorm1.json"
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
@@ -321,7 +316,6 @@ jobs:
             fi
 
           else
-            # aggressive profile: optional RNNoise + stronger comp + two-pass loudnorm
             PRE="highpass=f=70,lowpass=f=11500,afftdn=nr=8:nf=-25,deesser=i=0.2,acompressor=threshold=-18dB:ratio=2.8:attack=8:release=200:makeup=3"
             if [ "${{ github.event.inputs.aggressive_denoise }}" = "true" ]; then
               M="${WORKDIR}/rnnoise.rnnn"
@@ -382,6 +376,7 @@ jobs:
           if not (artdir and base and src and os.path.isfile(src)):
               os.makedirs(artdir, exist_ok=True)
               open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
+              open(os.path.join(artdir,f"{base}_emoji.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
               open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
               sys.exit(0)
 
@@ -498,6 +493,7 @@ jobs:
           if not raw_utts:
               os.makedirs(artdir, exist_ok=True)
               open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
+              open(os.path.join(artdir,f"{base}_emoji.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
               open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
               sys.exit(0)
 
@@ -548,11 +544,12 @@ jobs:
 
           prev=0.0
           for g in groups:
-              if g["start_rel"]<prev+GUARD: g["start_rel"]=prev+GUARD
+              if g["start_rel"]<prev+0.02: g["start_rel"]=prev+0.02
               if g["end_rel"]<g["start_rel"]+MIN_DUR: g["end_rel"]=g["start_rel"]+MIN_DUR
               prev=g["end_rel"]
 
           os.makedirs(artdir, exist_ok=True)
+          # full captions VTT
           vtt_path=os.path.join(artdir,f"{base}.vtt")
           with open(vtt_path,"w",encoding="utf-8") as vf:
               vf.write("WEBVTT\n\n")
@@ -560,6 +557,37 @@ jobs:
                   vf.write(f"{i}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
                   vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
 
+          # emoji-only VTT
+          EMOJI_RE = re.compile(
+              "["                       # broad emoji blocks
+              "\\U0001F1E6-\\U0001F1FF" # flags
+              "\\U0001F300-\\U0001FAD6" # misc pictographs
+              "\\U0001FAE0-\\U0001FAFF" # newer emoji
+              "\\U00002700-\\U000027BF" # dingbats
+              "\\U00002600-\\U000026FF" # misc symbols
+              "\\U0001F900-\\U0001F9FF" # supplemental
+              "\\U0001F680-\\U0001F6FF" # transport/map
+              "\\U0001F100-\\U0001F5FF" # enclosed alphanum/symbols
+              "\\U0001FA70-\\U0001FAFF" # more symbols
+              "\\U00002300-\\U000023FF" # misc tech
+              "]+", flags=re.UNICODE
+          )
+          def only_emoji(s:str)->str:
+              if not s: return ""
+              return "".join(EMOJI_RE.findall(s))
+
+          evtt_path=os.path.join(artdir,f"{base}_emoji.vtt")
+          with open(evtt_path,"w",encoding="utf-8") as ef:
+              ef.write("WEBVTT\n\n")
+              j=1
+              for g in groups:
+                  em=only_emoji(g["text"])
+                  if not em: continue
+                  ef.write(f"{j}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
+                  ef.write(f"{em}\n\n")
+                  j+=1
+
+          # rich transcript HTML (avatars + names)
           css='''
           <style>
           .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
@@ -646,18 +674,12 @@ jobs:
           cat > ".github/workflows/scripts/polish_transcript.py" << 'PY'
           #!/usr/bin/env python3
           import os, re, html
-          from typing import List, Tuple
+          from typing import List
 
           ARTDIR = os.environ.get("ARTDIR",".")
           BASE   = os.environ.get("BASE","space")
           INP    = os.path.join(ARTDIR, f"{BASE}_transcript.html")
           OUT    = os.path.join(ARTDIR, f"{BASE}_transcript_polished.html")
-
-          USE_GEC = os.environ.get("TRANSCRIPT_GEC", "true").lower() in ("1","true","yes","on")
-          GEC_MODEL = os.environ.get("TRANSCRIPT_GEC_MODEL", "prithivida/grammar_error_correcter_v1")
-          GEC_MAX_LINES = int(os.environ.get("TRANSCRIPT_GEC_MAX_LINES", "10"))
-          GEC_BATCH_SIZE = int(os.environ.get("TRANSCRIPT_GEC_BATCH", "4"))
-          GEC_SELECT = os.environ.get("TRANSCRIPT_GEC_SELECT", "auto")
 
           if not os.path.exists(INP) or os.path.getsize(INP) == 0:
               raise SystemExit(0)
@@ -690,135 +712,27 @@ jobs:
                   return t + "."
               return s
 
-          def match_case(repl: str, orig: str) -> str:
-              if orig.isupper(): return repl.upper()
-              if orig.islower(): return repl.lower()
-              if orig[:1].isupper() and orig[1:].islower(): return repl.capitalize()
-              return repl
-
-          EGGCORNS = [
-              (r"\byouth\s*[- ]\s*in\s*[- ]\s*asia\b", "euthanasia"),
-              (r"\bcould\s+of\b", "could have"), (r"\bshould\s+of\b", "should have"), (r"\bwould\s+of\b", "would have"),
-              (r"\bmute\s+point\b", "moot point"), (r"\bfor\s+all\s+intensive\s+purposes\b", "for all intents and purposes"),
-              (r"\bcase\s+and\s+point\b", "case in point"), (r"\bdeep\s+seeded\b", "deep-seated"),
-              (r"\bslight\s+of\s+hand\b", "sleight of hand"), (r"\bescape\s+goat\b", "scapegoat"),
-              (r"\bbaited\s+breath\b", "bated breath"), (r"\bpeaked\s+my\s+interest\b", "piqued my interest"),
-              (r"\bwet\s+your\s+appetite\b", "whet your appetite"), (r"\btounge\b", "tongue"),
-              (r"\btow\s+the\s+line\b", "toe the line"), (r"\bplay\s+it\s+by\s+year\b", "play it by ear"),
-              (r"\bfree\s+reign\b", "free rein"), (r"\bold\s*[- ]?\s*timer'?s\s+disease\b", "Alzheimer's disease"),
-              (r"\bwreckless\s+driving\b", "reckless driving"), (r"\bminus\s+well\b", "might as well"),
-              (r"\bfirst\s+come\s*,?\s*first\s+serve\b", "first come, first served"), (r"\bnip\s+it\s+in\s+the\s+butt\b", "nip it in the bud"),
-              (r"\bhome\s+in\s+on\b", "home in on"), (r"\bhone\s+in\s+on\b", "home in on"),
-              (r"\bchest\s*[- ]\s*of\s*[- ]\s*drawers\b", "chest of drawers"),
-          ]
-          EGG_REPLACERS = [(re.compile(p, re.I), r) for p, r in EGGCORNS]
-
-          def apply_eggcorns(s: str) -> str:
-              def sub_with_case(rx, rep, txt):
-                  return rx.sub(lambda m: match_case(rep, m.group(0)), txt)
-              for rx, rep in EGG_REPLACERS:
-                  s = sub_with_case(rx, rep, s)
-              return s
-
-          def protect_urls(s: str):
-              urls = []
-              def stash(m):
-                  urls.append(m.group(0))
-                  return f"<<<URL{len(urls)-1}>>>"
-              return URL_RE.sub(stash, s), urls
-
-          def restore_urls(s: str, urls):
-              for i,u in enumerate(urls):
-                  s = s.replace(f"<<<URL{i}>>>", u)
-              return s
-
-          def clean_text(txt: str) -> str:
+          def apply_rules(txt: str) -> str:
               if not txt.strip(): return txt
-              txt, urls = protect_urls(txt)
               txt = FILLERS_RE.sub("", txt)
               txt = STUTTER_RE.sub(lambda m: m.group(1), txt)
               txt = REPEAT_RE.sub(lambda m: m.group(1), txt)
-              txt = re.sub(r"\\s{2,}", " ", txt).strip()
-              txt = re.sub(r"\\bi\\b", "I", txt)
-              txt = re.sub(r"\\s+([,.;:!?])", r"\\1", txt)
-              txt = re.sub(r"([,;:])([^\\s])", r"\\1 \\2", txt)
-              txt = apply_eggcorns(txt)
+              txt = re.sub(r"\s{2,}", " ", txt).strip()
+              txt = re.sub(r"\bi\b", "I", txt)
+              txt = re.sub(r"\s+([,.;:!?])", r"\1", txt)
+              txt = re.sub(r"([,;:])([^\s])", r"\1 \2", txt)
               txt = sentence_case(txt)
               txt = ensure_end_punct(txt)
-              txt = restore_urls(txt, urls)
               txt = txt.replace("<","&lt;").replace(">","&gt;")
               return txt
 
-          spans: List[str] = []
+          spans = []
           def _collect(m):
               spans.append(m.group(2))
               return m.group(0)
           TEXT_NODE.sub(_collect, raw_html)
 
-          cleaned = [clean_text(t) for t in spans]
-
-          def quality_score(s: str) -> float:
-              plain = html.unescape(s)
-              longness = min(len(plain), 2000) / 10.0
-              no_punct = 15.0 if not re.search(r"[.!?]", plain) else 0.0
-              mostly_lower = 12.0 if (re.sub(r"[^A-Za-z]+","",plain).islower() and len(plain) > 20) else 0.0
-              many_commas = -3.0 if plain.count(",") >= 3 else 0.0
-              return longness + no_punct + mostly_lower + many_commas
-
-          indices = list(range(len(cleaned)))
-          if GEC_SELECT == "first":
-              candidate_idxs = indices[:GEC_MAX_LINES]
-          else:
-              scored = sorted(indices,
-                              key=(lambda i: len(cleaned[i])) if GEC_SELECT=="longest" else (lambda i: quality_score(cleaned[i])),
-                              reverse=True)
-              candidate_idxs = scored[:max(0, min(GEC_MAX_LINES, len(scored)))]
-
-          def apply_gec(lines: List[str]) -> List[str]:
-              try:
-                  from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-                  import torch
-              except Exception:
-                  return lines
-              try:
-                  tok = AutoTokenizer.from_pretrained(GEC_MODEL)
-                  mdl = AutoModelForSeq2SeqLM.from_pretrained(GEC_MODEL)
-                  mdl.eval(); mdl.to("cpu")
-              except Exception:
-                  return lines
-
-              out, buf, url_buckets = [], [], []
-              def flush():
-                  nonlocal out, buf, url_buckets
-                  if not buf: return
-                  inputs = [("gec: " + b) for b in buf]
-                  enc = tok(inputs, return_tensors="pt", padding=True, truncation=True, max_length=512)
-                  with torch.no_grad():
-                      gen = mdl.generate(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
-                                         max_new_tokens=96, num_beams=4, length_penalty=1.0, early_stopping=True)
-                  outs = tok.batch_decode(gen, skip_special_tokens=True)
-                  for i, o in enumerate(outs):
-                      o = o.strip()
-                      o = restore_urls(o, url_buckets[i])
-                      o = o.replace("<","&lt;").replace(">","&gt;")
-                      o = apply_eggcorns(o)
-                      o = ensure_end_punct(sentence_case(o))
-                      out.append(o)
-                  buf, url_buckets = [], []
-
-              for line in lines:
-                  pl, urls = protect_urls(html.unescape(line))
-                  url_buckets.append(urls); buf.append(pl)
-                  if len(buf) >= GEC_BATCH_SIZE: flush()
-              flush()
-              return out
-
-          if USE_GEC and candidate_idxs:
-              selected = [cleaned[i] for i in candidate_idxs]
-              corrected = apply_gec(selected)
-              for pos, idx in enumerate(candidate_idxs):
-                  cleaned[idx] = corrected[pos]
-
+          cleaned = [apply_rules(t) for t in spans]
           it = iter(cleaned)
           def _replace(m):
               open_tag, _, close_tag = m.group(1), m.group(2), m.group(3)
@@ -850,15 +764,15 @@ jobs:
           OUT_REPLIES = os.path.join(ARTDIR, f"{BASE}_replies.html")
           OUT_LINKS   = os.path.join(ARTDIR, f"{BASE}_links.html")
 
-          AUTH = os.environ.get("TWITTER_AUTHORIZATION","").strip()  # must start with "Bearer "
-          AUTH_COOKIE = os.environ.get("TWITTER_AUTH_TOKEN","").strip()  # auth_token cookie
-          CSRF = os.environ.get("TWITTER_CSRF_TOKEN","").strip()         # ct0 cookie
+          AUTH = os.environ.get("TWITTER_AUTHORIZATION","").strip()
+          AUTH_COOKIE = os.environ.get("TWITTER_AUTH_TOKEN","").strip()
+          CSRF = os.environ.get("TWITTER_CSRF_TOKEN","").strip()
 
           def write_empty():
               open(OUT_REPLIES, "w").write("")
               open(OUT_LINKS, "w").write("")
 
-          m = re.search(r"https?://(?:x|twitter)\\.com/([^/]+)/status/(\\d+)", PURPLE)
+          m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", PURPLE)
           if not m:
               write_empty(); raise SystemExit(0)
 
@@ -952,7 +866,8 @@ jobs:
 
           def tstamp(t):
               try:
-                  return time.mktime(time.strptime(t.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
+                  import time as _t
+                  return _t.mktime(_t.strptime(t.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
               except Exception:
                   return 0
           replies.sort(key=tstamp)
@@ -975,7 +890,8 @@ jobs:
               )
           open(OUT_REPLIES,"w").write("\n".join(blocks))
 
-          doms = defaultdict(set)
+          from collections import defaultdict as _dd
+          doms = _dd(set)
           def add_urls_from(t):
               ent = t.get("entities") or {}
               for u in (ent.get("urls") or []):
@@ -1000,7 +916,7 @@ jobs:
           PY
           chmod +x ".github/workflows/scripts/"*.py
 
-      - name: Build VTT and transcript after trim
+      - name: Build VTT (full & emoji) + rich transcript
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         env:
@@ -1012,31 +928,7 @@ jobs:
             CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
               python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-          fi
-
-      - name: Polish transcript (optional)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.TRANSCRIPT_PATH != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 ".github/workflows/scripts/polish_transcript.py" || true
-          if [ -s "${ARTDIR}/${BASE}_transcript_polished.html" ]; then
-            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build VTT and transcript after trim
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
-        shell: bash
-        env:
-          CC_JSONL: ${{ env.CRAWLER_CC }}
-          SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
-        run: |
-          set -euxo pipefail
-          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
-              python3 ".github/workflows/scripts/gen_vtt.py"
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
+            [ -s "${ARTDIR}/${BASE}_emoji.vtt" ] && echo "EMOJI_VTT_PATH=${ARTDIR}/${BASE}_emoji.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
           fi
 
@@ -1079,6 +971,22 @@ jobs:
           fi
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Emoji VTT to GCS
+        id: upload_emoji_vtt
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.EMOJI_VTT_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}_emoji.vtt"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}_emoji.vtt"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}_emoji.vtt"
+          gsutil -m cp "${EMOJI_VTT_PATH}" "$DEST"
+          if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "emoji_vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "emoji_vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Build attendees HTML
         id: attendees
@@ -1153,7 +1061,6 @@ jobs:
           if [ -z "$TTL" ]; then TTL="${BASE}"; fi
           echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
 
-          # Start time from crawler metadata in ms (preferred) or transcript start.txt
           START_ISO=""
           if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
             MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
@@ -1177,6 +1084,7 @@ jobs:
           PID:  ${{ github.event.inputs.post_id }}
           AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
+          EVTT: ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy || steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${BASE}}"
@@ -1185,9 +1093,9 @@ jobs:
           TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
           [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ] && TR_FILE="${TRANSCRIPT_PATH}"
           REP_FILE="${WORKDIR}/empty_replies.html"; : > "$REP_FILE"
-          [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH}" ] && REP_FILE="${REPLIES_PATH}"
+          [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && REP_FILE="${REPLIES_PATH}"
           LNK_FILE="${WORKDIR}/empty_links.html"; : > "$LNK_FILE"
-          [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH}" ] && LNK_FILE="${LINKS_PATH}"
+          [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && LNK_FILE="${LINKS_PATH}"
 
           REQ="${WORKDIR}/wp_register_body.json"
           jq -n \
@@ -1196,6 +1104,7 @@ jobs:
             --arg pid   "${PID}" \
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
+            --arg evtt  "${EVTT}" \
             --arg when  "${START_ISO:-}" \
             --rawfile ath "${ATH_FILE}" \
             --rawfile tr  "${TR_FILE}" \
@@ -1209,6 +1118,7 @@ jobs:
              }
              + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
+             + (if ($evtt|length)>0 then {emoji_vtt_url:$evtt} else {} end)
              + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
              + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
              + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
@@ -1270,5 +1180,10 @@ jobs:
               echo "- VTT ${{ steps.upload_vtt.outputs.vtt_proxy }}"
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT ${{ steps.upload_vtt.outputs.vtt_raw }}"
+            fi
+            if [ -n "${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy }}" ]; then
+              echo "- Emoji VTT ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy }}"
+            elif [ -n "${{ steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}" ]; then
+              echo "- Emoji VTT ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
