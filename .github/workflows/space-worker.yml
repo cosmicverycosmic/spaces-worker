@@ -37,7 +37,7 @@ on:
         options: ["","transcript_only","attendees_only","replies_only"]
         default: ""
       existing_mp3_url:
-        description: For transcript only provide URL to existing MP3
+        description: For transcript_only provide URL to existing MP3
         required: false
         type: string
         default: ""
@@ -131,7 +131,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg
+          sudo apt-get install -y --no-install-recommends ffmpeg jq python3 python3-pip ca-certificates gnupg curl
           python3 -m pip install --upgrade pip
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
@@ -195,9 +195,25 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
+      # NEW: allow transcript_only from an existing MP3 URL (no crawler needed)
+      - name: Use existing MP3 if provided
+        id: use_existing
+        if: ${{ github.event.inputs.mode == 'transcript_only' && github.event.inputs.existing_mp3_url != '' }}
+        shell: bash
+        env:
+          URL: ${{ github.event.inputs.existing_mp3_url }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "${WORKDIR}"
+          OUT="${WORKDIR}/input_existing.mp3"
+          curl -fL --retry 3 --retry-delay 2 -o "${OUT}" "${URL}"
+          test -s "${OUT}" || { echo "Existing MP3 download failed or empty"; exit 1; }
+          echo "INPUT_FILE=${OUT}" >> "$GITHUB_ENV"
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+
       - name: Run crawler
         id: crawl
-        if: ${{ github.event.inputs.mode != 'replies_only' && steps.x_preflight.outputs.ok == '1' }}
+        if: ${{ github.event.inputs.mode != 'replies_only' && (steps.use_existing.outputs.ok != '1') && steps.x_preflight.outputs.ok == '1' }}
         shell: bash
         env:
           SID: ${{ steps.ids.outputs.space_id }}
@@ -236,8 +252,6 @@ jobs:
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
-
-      # No yt-dlp fallback; crawler must provide audio if needed.
 
       - name: Detect lead silence seconds
         id: detect
@@ -374,8 +388,6 @@ jobs:
           if [ -s "${ARTDIR}/${BASE}_transcript_polished.html" ]; then
             echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
           fi
-
-      # No Deepgram fallback; transcript/VTT generation only via crawler captions.
 
       - name: Upload VTT to GCS
         id: upload_vtt
