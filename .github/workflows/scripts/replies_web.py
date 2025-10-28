@@ -63,10 +63,8 @@ def safe_env_dump():
     log("ENV:\n  " + "\n  ".join(lines))
 
 def headers(screen_name, root_id):
-    ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}"
-    return {
-        "Authorization": AUTH,
-        "x-csrf-token": CSRF,
+    ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}" if (AUTH_COOKIE and CSRF) else ""
+    hdr = {
         "x-twitter-active-user": "yes",
         "x-twitter-client-language": "en",
         "Pragma": "no-cache",
@@ -74,8 +72,13 @@ def headers(screen_name, root_id):
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Referer": f"https://x.com/{screen_name}/status/{root_id}",
-        "Cookie": ck,
     }
+    if ck:
+        hdr["Cookie"] = ck
+        hdr["x-csrf-token"] = CSRF
+    if AUTH.startswith("Bearer "):
+        hdr["Authorization"] = AUTH
+    return hdr
 
 def build_params(root_id, cursor=None):
     q = f"conversation_id:{root_id}"
@@ -159,7 +162,6 @@ def find_bottom_cursor(data):
     try:
         timeline = data.get("timeline") or {}
         instructions = timeline.get("instructions") or []
-        # Newer shapes
         for ins in instructions:
             entries = []
             if "addEntries" in ins and ins["addEntries"].get("entries"):
@@ -168,16 +170,13 @@ def find_bottom_cursor(data):
                 entries.append(ins["replaceEntry"]["entry"])
             for e in entries:
                 content = e.get("content") or {}
-                # content.operation.cursor
                 cur = (((content.get("operation") or {}).get("cursor")) or {})
                 if cur and cur.get("cursorType") == "Bottom" and cur.get("value"):
                     return cur["value"]
-                # content.itemContent.value
                 item = content.get("itemContent") or {}
                 cur = (item.get("value") or {})
                 if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
                     return cur["value"]
-                # legacy: content.value
                 cur = content.get("value") or {}
                 if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
                     return cur["value"]
@@ -244,8 +243,10 @@ def ensure_inputs():
         write_empty("PURPLE_TWEET_URL did not match expected pattern")
         return None, None
 
-    if not (AUTH.startswith("Bearer ") and AUTH_COOKIE and CSRF):
-        write_empty("Missing or invalid AUTH/AUTH_COOKIE/CSRF")
+    has_cookie = bool(AUTH_COOKIE and CSRF)
+    has_bearer = bool(AUTH.startswith("Bearer "))
+    if not (has_cookie or has_bearer):
+        write_empty("Missing credentials: need auth_token+ct0 cookie or Bearer token")
         return None, None
 
     return screen_name, str(root_id)
