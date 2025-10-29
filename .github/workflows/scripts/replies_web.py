@@ -1,11 +1,12 @@
 # file: .github/workflows/scripts/replies_web.py
 #!/usr/bin/env python3
-import os, re, json, html, time, traceback, sys, math
+import os, re, json, html, time, traceback
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from collections import defaultdict
 
+# --------- ENV & Paths ----------
 ARTDIR = os.environ.get("ARTDIR",".")
 BASE   = os.environ.get("BASE","space")
 PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
@@ -16,7 +17,7 @@ LOG_PATH    = os.path.join(ARTDIR, f"{BASE}_replies.log")
 DBG_DIR     = os.path.join(ARTDIR, "debug")
 DBG_PREFIX  = os.path.join(DBG_DIR, f"{BASE}_replies_page")
 
-AUTH        = (os.environ.get("TWITTER_AUTHORIZATION","") or "").strip()   # "Bearer ..."
+AUTH        = (os.environ.get("TWITTER_AUTHORIZATION","") or "").strip()   # "Bearer …"
 AUTH_COOKIE = (os.environ.get("TWITTER_AUTH_TOKEN","") or "").strip()      # auth_token cookie
 CSRF        = (os.environ.get("TWITTER_CSRF_TOKEN","") or "").strip()      # ct0 cookie
 
@@ -24,8 +25,16 @@ MAX_PAGES   = int(os.environ.get("REPLIES_MAX_PAGES","40") or "40")
 SLEEP_SEC   = float(os.environ.get("REPLIES_SLEEP","0.7") or "0.7")
 SAVE_JSON   = (os.environ.get("REPLIES_SAVE_JSON","1") or "1") not in ("0","false","False")
 
-BASE_URL    = "https://twitter.com/i/api/2/search/adaptive.json"
+# Prefer x.com; keep both bases handy to dodge odd host-level quirks
+BASE_X      = "https://x.com"
+BASE_TW     = "https://twitter.com"
 
+# Primary: the web app’s own conversation timeline endpoint (most reliable)
+CONVO_URL   = f"{BASE_X}/i/api/2/timeline/conversation/{{tid}}.json"
+# Fallback: adaptive search for conversation_id
+SEARCH_URL  = f"{BASE_X}/i/api/2/search/adaptive.json"
+
+# --------- Helpers ----------
 def ensure_dirs():
     os.makedirs(ARTDIR, exist_ok=True)
     os.makedirs(DBG_DIR, exist_ok=True)
@@ -33,8 +42,7 @@ def ensure_dirs():
 def mask_token(s: str, keep=6):
     if not s: return ""
     s = str(s)
-    if len(s) <= keep: return "*" * len(s)
-    return "*" * (len(s)-keep) + s[-keep:]
+    return "*" * max(0, len(s)-keep) + s[-keep:]
 
 def log(msg: str):
     ensure_dirs()
@@ -69,9 +77,11 @@ def headers(screen_name, root_id):
         "x-twitter-client-language": "en",
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"https://x.com/{screen_name}/status/{root_id}",
+        "Origin":  "https://x.com",
     }
     if ck:
         hdr["Cookie"] = ck
@@ -80,149 +90,16 @@ def headers(screen_name, root_id):
         hdr["Authorization"] = AUTH
     return hdr
 
-def build_params(root_id, cursor=None):
-    q = f"conversation_id:{root_id}"
-    params = {
-        "q": q,
-        "count": 100,
-        "tweet_search_mode": "live",
-        "query_source": "typed_query",
-        "tweet_mode": "extended",
-        "pc": "ContextualServices",
-        "spelling_corrections": "1",
-        "include_quote_count": "true",
-        "include_reply_count": "true",
-        "ext": "mediaStats,highlightedLabel,hashtags,antispam_media_platform,voiceInfo,superFollowMetadata,unmentionInfo,editControl,emoji_reaction"
-    }
-    if cursor:
-        params["cursor"] = cursor
-    return params
-
-def fetch_page(screen_name, root_id, cursor=None, attempt=1, backoff=2.0):
-    url = BASE_URL + "?" + urlencode(build_params(root_id, cursor))
-    req = Request(url, headers=headers(screen_name, root_id))
-    try:
-        with urlopen(req, timeout=30) as r:
-            raw = r.read().decode("utf-8", "ignore")
-            data = json.loads(raw) if raw.strip() else {}
-            return data, raw, None
-    except HTTPError as e:
-        msg = f"HTTPError {e.code} on cursor={cursor!r}"
-        try:
-            body = e.read().decode("utf-8","ignore")
-        except Exception:
-            body = ""
-        log(msg + (f" body={body[:3000]}" if body else ""))
-        if e.code in (429, 403) and attempt <= 4:
-            sleep_for = backoff ** attempt
-            log(f"Retrying after {sleep_for:.1f}s (attempt {attempt}/4)")
-            time.sleep(sleep_for)
-            return fetch_page(screen_name, root_id, cursor, attempt+1, backoff)
-        return None, None, e
-    except URLError as e:
-        log(f"URLError {e.reason} on cursor={cursor!r}")
-        if attempt <= 4:
-            sleep_for = backoff ** attempt
-            log(f"Retrying after {sleep_for:.1f}s (attempt {attempt}/4)")
-            time.sleep(sleep_for)
-            return fetch_page(screen_name, root_id, cursor, attempt+1, backoff)
-        return None, None, e
-    except Exception as e:
-        log(f"Exception fetch_page: {e}\n{traceback.format_exc()}")
-        return None, None, e
-
-def save_debug_page(idx, raw):
+def save_debug_blob(kind, idx, raw):
     if not SAVE_JSON: return
     ensure_dirs()
-    path = f"{DBG_PREFIX}{idx:02d}.json"
+    path = f"{DBG_PREFIX}_{kind}{idx:02d}.json"
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False))
-        log(f"Saved debug page {idx} to {path}")
+        log(f"Saved debug {kind} page {idx} to {path}")
     except Exception as e:
-        log(f"Failed to save debug page {idx}: {e}")
-
-def find_bottom_cursor(data):
-    """Scan multiple shapes for a Bottom cursor."""
-    # 1) Generic recursive
-    def recurse(obj):
-        if isinstance(obj, dict):
-            if obj.get("cursorType") == "Bottom" and "value" in obj:
-                return obj["value"]
-            for v in obj.values():
-                c = recurse(v)
-                if c: return c
-        elif isinstance(obj, list):
-            for it in obj:
-                c = recurse(it)
-                if c: return c
-        return None
-
-    # 2) Instruction/entry shapes often present in search timelines
-    try:
-        timeline = data.get("timeline") or {}
-        instructions = timeline.get("instructions") or []
-        for ins in instructions:
-            entries = []
-            if "addEntries" in ins and ins["addEntries"].get("entries"):
-                entries.extend(ins["addEntries"]["entries"])
-            if "replaceEntry" in ins and "entry" in ins["replaceEntry"]:
-                entries.append(ins["replaceEntry"]["entry"])
-            for e in entries:
-                content = e.get("content") or {}
-                cur = (((content.get("operation") or {}).get("cursor")) or {})
-                if cur and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-                item = content.get("itemContent") or {}
-                cur = (item.get("value") or {})
-                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-                cur = content.get("value") or {}
-                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-    except Exception as e:
-        log(f"Cursor parse (instruction path) failed: {e}")
-
-    # 3) Fallback recursive scan
-    return recurse(data)
-
-def merge_objects(dst: dict, src: dict):
-    for k, v in (src or {}).items():
-        dst[k] = v
-
-def extract_objects(data, agg_tweets, agg_users):
-    g = (data.get("globalObjects") or {})
-    merge_objects(agg_tweets, g.get("tweets") or {})
-    merge_objects(agg_users,  g.get("users")  or {})
-
-def collect(screen_name, root_id):
-    tweets, users = {}, {}
-    cursor, pages = None, 0
-    seen_pages = 0
-
-    while pages < MAX_PAGES:
-        pages += 1
-        log(f"Fetching page {pages} cursor={cursor!r}")
-        data, raw, err = fetch_page(screen_name, root_id, cursor)
-        if raw is not None:
-            save_debug_page(pages, raw)
-        if not data:
-            log(f"No data returned on page {pages}. Stopping.")
-            break
-
-        extract_objects(data, tweets, users)
-
-        nxt = find_bottom_cursor(data)
-        log(f"Parsed bottom cursor: {nxt!r}")
-        if not nxt or nxt == cursor:
-            log("No next cursor or same cursor encountered — pagination ends.")
-            break
-        cursor = nxt
-        seen_pages += 1
-        time.sleep(SLEEP_SEC)
-
-    log(f"Collected pages: {seen_pages}, tweets: {len(tweets)}, users: {len(users)}")
-    return tweets, users
+        log(f"Failed to save debug {kind} page {idx}: {e}")
 
 def parse_purple(url):
     m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", url)
@@ -251,6 +128,167 @@ def ensure_inputs():
 
     return screen_name, str(root_id)
 
+# --------- HTTP fetch with retries ----------
+def fetch_json(url, hdrs, tag, attempt=1, backoff=2.0, timeout=30):
+    try:
+        req = Request(url, headers=hdrs)
+        with urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "ignore")
+            data = json.loads(raw) if raw.strip() else {}
+            return data, raw, None
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8","ignore")
+        except Exception:
+            pass
+        log(f"{tag} HTTPError {e.code} url={url} body={body[:800]}")
+        if e.code in (429, 403) and attempt <= 4:
+            sleep_for = backoff ** attempt
+            log(f"{tag} retry after {sleep_for:.1f}s (attempt {attempt}/4)")
+            time.sleep(sleep_for)
+            return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
+        return None, None, e
+    except URLError as e:
+        log(f"{tag} URLError {getattr(e,'reason',e)} url={url}")
+        if attempt <= 4:
+            sleep_for = backoff ** attempt
+            log(f"{tag} retry after {sleep_for:.1f}s (attempt {attempt}/4)")
+            time.sleep(sleep_for)
+            return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
+        return None, None, e
+    except Exception as e:
+        log(f"{tag} EXC: {e}\n{traceback.format_exc()}")
+        return None, None, e
+
+# --------- Cursor parsing (common) ----------
+def find_bottom_cursor(data):
+    """Find a 'Bottom' cursor in timeline/instructions."""
+    def recurse(obj):
+        if isinstance(obj, dict):
+            if obj.get("cursorType") == "Bottom" and "value" in obj:
+                return obj["value"]
+            for v in obj.values():
+                c = recurse(v)
+                if c: return c
+        elif isinstance(obj, list):
+            for it in obj:
+                c = recurse(it)
+                if c: return c
+        return None
+
+    # Try typical instruction shapes first
+    try:
+        timeline = data.get("timeline") or {}
+        instructions = timeline.get("instructions") or []
+        for ins in instructions:
+            entries = []
+            if "addEntries" in ins and ins["addEntries"].get("entries"):
+                entries.extend(ins["addEntries"]["entries"])
+            if "replaceEntry" in ins and "entry" in ins["replaceEntry"]:
+                entries.append(ins["replaceEntry"]["entry"])
+            for e in entries:
+                content = e.get("content") or {}
+                cur = (((content.get("operation") or {}).get("cursor")) or {})
+                if cur and cur.get("cursorType") == "Bottom" and cur.get("value"):
+                    return cur["value"]
+                item = content.get("itemContent") or {}
+                cur = (item.get("value") or {})
+                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
+                    return cur["value"]
+                cur = content.get("value") or {}
+                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
+                    return cur["value"]
+    except Exception:
+        pass
+
+    return recurse(data)
+
+# --------- Extraction ----------
+def merge_objects(dst: dict, src: dict):
+    for k, v in (src or {}).items():
+        dst[k] = v
+
+def extract_from_global_objects(data, agg_tweets, agg_users):
+    g = (data.get("globalObjects") or {})
+    merge_objects(agg_tweets, g.get("tweets") or {})
+    merge_objects(agg_users,  g.get("users")  or {})
+
+# --------- Collectors ----------
+def collect_conversation(screen_name, root_id):
+    """Primary collector: /i/api/2/timeline/conversation/<id>.json"""
+    tweets, users = {}, {}
+    cursor, pages = None, 0
+
+    while pages < MAX_PAGES:
+        pages += 1
+        params = {"count": 100, "tweet_mode": "extended"}
+        if cursor: params["cursor"] = cursor
+        url = CONVO_URL.format(tid=root_id) + "?" + urlencode(params)
+
+        log(f"[CONVO] Fetch page {pages} cursor={cursor!r}")
+        data, raw, err = fetch_json(url, headers(screen_name, root_id), tag="[CONVO]")
+        if raw is not None: save_debug_blob("convo", pages, raw)
+        if not data:
+            log(f"[CONVO] No data on page {pages}.")
+            break
+
+        extract_from_global_objects(data, tweets, users)
+
+        nxt = find_bottom_cursor(data)
+        log(f"[CONVO] Parsed Bottom cursor: {nxt!r}")
+        if not nxt or nxt == cursor:
+            log("[CONVO] No next cursor or same cursor — done.")
+            break
+        cursor = nxt
+        time.sleep(SLEEP_SEC)
+
+    log(f"[CONVO] pages={pages-1} tweets={len(tweets)} users={len(users)}")
+    return tweets, users
+
+def collect_search(screen_name, root_id):
+    """Fallback collector: adaptive search over conversation_id:<root_id> (live)."""
+    tweets, users = {}, {}
+    cursor, pages = None, 0
+
+    while pages < MAX_PAGES:
+        pages += 1
+        params = {
+            "q": f"conversation_id:{root_id}",
+            "count": 100,
+            "tweet_search_mode": "live",
+            "query_source": "typed_query",
+            "tweet_mode": "extended",
+            "pc": "ContextualServices",
+            "spelling_corrections": "1",
+            "include_quote_count": "true",
+            "include_reply_count": "true",
+            "ext": "mediaStats,highlightedLabel,hashtags,antispam_media_platform,voiceInfo,superFollowMetadata,unmentionInfo,editControl,emoji_reaction"
+        }
+        if cursor: params["cursor"] = cursor
+        url = SEARCH_URL + "?" + urlencode(params)
+
+        log(f"[SEARCH] Fetch page {pages} cursor={cursor!r}")
+        data, raw, err = fetch_json(url, headers(screen_name, root_id), tag="[SEARCH]")
+        if raw is not None: save_debug_blob("search", pages, raw)
+        if not data:
+            log(f"[SEARCH] No data on page {pages}.")
+            break
+
+        extract_from_global_objects(data, tweets, users)
+
+        nxt = find_bottom_cursor(data)
+        log(f"[SEARCH] Parsed Bottom cursor: {nxt!r}")
+        if not nxt or nxt == cursor:
+            log("[SEARCH] No next cursor or same cursor — done.")
+            break
+        cursor = nxt
+        time.sleep(SLEEP_SEC)
+
+    log(f"[SEARCH] pages={pages-1} tweets={len(tweets)} users={len(users)}")
+    return tweets, users
+
+# --------- Build outputs ----------
 def tstamp(tweet):
     try:
         import time as _t
@@ -304,6 +342,7 @@ def build_outputs(replies, users):
     open(OUT_LINKS,"w", encoding="utf-8").write("\n".join(lines))
     log(f"Wrote links HTML: {OUT_LINKS} (domains={len(doms)})")
 
+# --------- Main ----------
 def main():
     try:
         screen_name, root_id = ensure_inputs()
@@ -311,9 +350,16 @@ def main():
             return
 
         log(f"Begin collection for @{screen_name} status {root_id}")
-        tweets, users = collect(screen_name, root_id)
 
-        # Filter to the conversation thread only, exclude the root itself
+        # 1) Try the conversation timeline (what the site itself uses)
+        tweets, users = collect_conversation(screen_name, root_id)
+
+        # 2) If that returns empty (auth/rate/visibility), fall back to search
+        if not tweets:
+            log("Primary (conversation) returned no tweets; falling back to adaptive search.")
+            tweets, users = collect_search(screen_name, root_id)
+
+        # Filter to the conversation thread only, exclude the root itself, skip pure RTs
         replies = []
         for tid, t in (tweets or {}).items():
             conv = str(t.get("conversation_id_str") or t.get("conversation_id") or "")
@@ -321,21 +367,19 @@ def main():
                 continue
             if str(t.get("id_str") or t.get("id")) == str(root_id):
                 continue
-            # Skip pure retweets to cut noise
             if t.get("retweeted_status_id") or t.get("retweeted_status_id_str"):
                 continue
             replies.append(t)
 
-        # De-duplicate by tweet ID
+        # De-duplicate and sort
         uniq = {}
         for t in replies:
             tid = str(t.get("id_str") or t.get("id") or "")
-            uniq[tid] = t
+            if tid: uniq[tid] = t
         replies = list(uniq.values())
-
         replies.sort(key=tstamp)
-        log(f"Total replies in conversation: {len(replies)}")
 
+        log(f"Total replies in conversation: {len(replies)}")
         build_outputs(replies, users)
 
         if not replies:
