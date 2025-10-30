@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-replies_web.py — robust crawler+API replies builder (v3.1)
+replies_web.py — replies HTML (with OG cards + media grids, no cropping)
 
-- Keeps replies; threads replies-to-replies; outputs nested HTML.
-- Orders by posted time; preserves parent->children structure.
-- Expands t.co; builds media blocks with *no crop*, height=400px, smart grids:
-  n=1 (single), n=2 (side-by-side), n=3 (1 top, 2 below), n=4 (2×2).
-- Robust OpenGraph/Twitter Card fetch (cached) for external links.
-- Quote tweet embeds; metrics; timestamp link; sidebar links summary.
-- WP patch optional.
+What’s new in this build:
+- OpenGraph enrichment: if a URL entity lacks title/image, we fetch the page
+  (small, fast GET with tight limits) and extract og:/twitter: meta to render
+  proper content cards (thumb + title + host).
+- Media layout rules (images/videos):
+    1 item  -> 1 column, 400px tall
+    2 items -> 2 columns, 400px tall
+    3 items -> 2 columns, FIRST spans both columns on row 1 (400px tall),
+               items 2–3 on row 2 (400px tall each)
+    4 items -> 2×2 grid (400px tiles)
+  All media are UN-CROPPED: height fixed to 400px; width is auto with
+  max-width:100%; object-fit:contain (done inline to override theme CSS).
+- Chronological ordering (as posted), while still emitting data-parent and a
+  computed data-depth for optional visual threading in CSS.
 
-Env:
+Environment:
   ARTDIR, BASE, PURPLE_TWEET_URL, REPLIES_JSONL
-  TWITTER_AUTHORIZATION, TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN
-  WP_BASE_URL/WP_URL, WP_USER, WP_APP_PASSWORD, WP_POST_ID
-  OG_FETCH=1, OG_TIMEOUT=5, OG_MAXKB=128
+  TWITTER_AUTHORIZATION, TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN (optional)
+  WP_BASE_URL, WP_USER, WP_APP_PASSWORD, WP_POST_ID (optional)
 """
 
-import os, re, json, html, time, traceback, ssl
+import os, re, json, html, time, traceback
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -38,6 +44,7 @@ LOG_PATH    = os.path.join(ARTDIR, f"{BASE}_replies.log")
 DBG_DIR     = os.path.join(ARTDIR, "debug")
 DBG_PREFIX  = os.path.join(DBG_DIR, f"{BASE}_replies_page")
 
+# X auth (optional — for API fallback)
 AUTH        = (os.environ.get("TWITTER_AUTHORIZATION", "") or "").strip()
 AUTH_COOKIE = (os.environ.get("TWITTER_AUTH_TOKEN", "") or "").strip()
 CSRF        = (os.environ.get("TWITTER_CSRF_TOKEN", "") or "").strip()
@@ -46,23 +53,17 @@ MAX_PAGES   = int(os.environ.get("REPLIES_MAX_PAGES", "40") or "40")
 SLEEP_SEC   = float(os.environ.get("REPLIES_SLEEP", "0.7") or "0.7")
 SAVE_JSON   = (os.environ.get("REPLIES_SAVE_JSON", "1") or "1").lower() not in ("0","false")
 
+# WP patch (optional)
 WP_BASE = (os.environ.get("WP_BASE_URL", "") or os.environ.get("WP_URL", "") or "").rstrip("/")
 WP_USER = os.environ.get("WP_USER", "") or ""
 WP_PW   = os.environ.get("WP_APP_PASSWORD", "") or ""
 WP_PID  = (os.environ.get("WP_POST_ID", "") or os.environ.get("POST_ID", "") or "").strip()
 
-# ---- OG fetch env
-OG_FETCH   = (os.environ.get("OG_FETCH", "1") or "1").lower() not in ("0","false")
-OG_TIMEOUT = float(os.environ.get("OG_TIMEOUT", "5.0") or "5.0")
-OG_MAXKB   = int(os.environ.get("OG_MAXKB", "128") or "128")
-OG_CACHE   = os.path.join(ARTDIR, f"{BASE}_ogcache.json")
-
-# ---------- Constants ----------
 BASE_X = "https://x.com"
 CONVO_URL = f"{BASE_X}/i/api/2/timeline/conversation/{{tid}}.json"
 SEARCH_URL = f"{BASE_X}/i/api/2/search/adaptive.json"
 
-# ---------- FS helpers ----------
+# ---------- FS ----------
 os.makedirs(ARTDIR, exist_ok=True)
 os.makedirs(DBG_DIR, exist_ok=True)
 
@@ -72,17 +73,15 @@ def log(msg: str) -> None:
         lf.write(f"[{ts}Z] {msg}\n")
 
 def save_debug_blob(kind: str, idx: int, raw: str) -> None:
-    if not SAVE_JSON:
-        return
+    if not SAVE_JSON: return
     p = f"{DBG_PREFIX}_{kind}{idx:02d}.json"
     try:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(raw)
+        with open(p, "w", encoding="utf-8") as f: f.write(raw)
         log(f"Saved debug {kind} page {idx} to {p}")
     except Exception as e:
         log(f"Failed to save debug {kind} page {idx}: {e}")
 
-# ---------- String & time utils ----------
+# ---------- utils ----------
 EMOJI_RE = re.compile("["+
     "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF"+
     "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF"+
@@ -91,8 +90,7 @@ EMOJI_RE = re.compile("["+
 ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
 def is_emoji_only(s: str) -> bool:
-    if not s or not s.strip():
-        return False
+    if not s or not s.strip(): return False
     t = ONLY_PUNCT_SPACE.sub("", s)
     t = EMOJI_RE.sub("", t)
     return len(t.strip()) == 0
@@ -101,8 +99,7 @@ def esc(s: Optional[str]) -> str:
     return html.escape(s or "", quote=True)
 
 def iso_from_twitter(created_at: str) -> str:
-    if not created_at:
-        return ""
+    if not created_at: return ""
     try:
         dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y").astimezone(timezone.utc)
         return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
@@ -111,104 +108,22 @@ def iso_from_twitter(created_at: str) -> str:
 
 def fmt_when(iso: str) -> str:
     try:
-        if not iso:
-            return ""
+        if not iso: return ""
         d = datetime.fromisoformat(iso.replace("Z","+00:00")).astimezone(timezone.utc)
         return d.strftime("%b %d, %Y, %H:%M UTC")
     except Exception:
         return iso
 
 def fmt_metric(n: Optional[int]) -> str:
-    if n is None:
-        return ""
-    try:
-        n = int(n)
-    except Exception:
-        return ""
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{round(n/100)/10}K"
-    if n < 1_000_000_000:
-        return f"{round(n/100_000)/10}M"
+    if n is None: return ""
+    try: n = int(n)
+    except Exception: return ""
+    if n < 1000: return str(n)
+    if n < 1_000_000: return f"{round(n/100)/10}K"
+    if n < 1_000_000_000: return f"{round(n/100_000)/10}M"
     return f"{round(n/100_000_000)/10}B"
 
-# ---------- OG fetch/cache ----------
-def _load_og_cache() -> dict:
-    try:
-        if os.path.isfile(OG_CACHE):
-            with open(OG_CACHE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        log(f"OG cache load failed: {e}")
-    return {}
-
-def _save_og_cache(cache: dict) -> None:
-    try:
-        with open(OG_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
-    except Exception as e:
-        log(f"OG cache save failed: {e}")
-
-OG_CACHE_MAP = _load_og_cache()
-META_RE = re.compile(
-    rb'<meta\s+[^>]*?(?:property|name)\s*=\s*["\']([^"\']+)["\'][^>]*?content\s*=\s*["\']([^"\']+)["\'][^>]*?>',
-    re.IGNORECASE
-)
-
-def _parse_og_from_html(head_bytes: bytes, base_url: str) -> dict:
-    out = {"title": "", "description": "", "image": ""}
-    try:
-        for m in META_RE.finditer(head_bytes or b""):
-            key = m.group(1).decode("utf-8", "ignore").strip().lower()
-            val = m.group(2).decode("utf-8", "ignore").strip()
-            if key in ("og:title", "twitter:title") and not out["title"]:
-                out["title"] = val
-            elif key in ("og:description", "twitter:description") and not out["description"]:
-                out["description"] = val
-            elif key in ("og:image", "twitter:image", "twitter:image:src") and not out["image"]:
-                out["image"] = val
-    except Exception:
-        pass
-    if out["image"]:
-        out["image"] = urljoin(base_url, out["image"])
-    return out
-
-def _fetch_og(url: str) -> dict:
-    try:
-        key = re.sub(r"#.*$", "", url)
-        if key in OG_CACHE_MAP:
-            return OG_CACHE_MAP[key]
-        if not OG_FETCH:
-            return {}
-        scheme = urlparse(url).scheme.lower()
-        if scheme not in ("http", "https"):
-            return {}
-        ctx = ssl.create_default_context()
-        req = Request(url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
-            "Accept-Language": "en-US,en;q=0.9"
-        })
-        with urlopen(req, timeout=OG_TIMEOUT, context=ctx) as r:
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if "text/html" not in ctype:
-                OG_CACHE_MAP[key] = {}
-                return {}
-            head = r.read(OG_MAXKB * 1024)
-            res = _parse_og_from_html(head, r.geturl())
-            cleaned = {
-                "title": (res.get("title") or "").strip(),
-                "description": (res.get("description") or "").strip(),
-                "image": (res.get("image") or "").strip(),
-            }
-            OG_CACHE_MAP[key] = cleaned
-            return cleaned
-    except Exception as e:
-        log(f"OG fetch failed for {url}: {e}")
-        return {}
-
-# ---------- Link expansion ----------
+# ---------- t.co expansion ----------
 def expand_text_with_entities(text: str, entities: Dict[str, Any]) -> Tuple[str, List[Dict[str,Any]], List[Dict[str,Any]]]:
     s = esc(text or "")
     urls = list((entities or {}).get("urls") or [])
@@ -217,8 +132,8 @@ def expand_text_with_entities(text: str, entities: Dict[str, Any]) -> Tuple[str,
     rep = []
     for u in urls:
         short = u.get("url") or ""
-        exp = u.get("expanded_url") or short
-        disp = u.get("display_url") or (exp.replace("https://",""))
+        exp = u.get("unwound_url") or u.get("expanded_url") or short
+        disp = u.get("display_url") or (exp.replace("https://","").replace("http://",""))
         start, end = None, None
         if isinstance(u.get("indices"), list) and len(u["indices"]) == 2:
             start, end = u["indices"]
@@ -233,32 +148,100 @@ def expand_text_with_entities(text: str, entities: Dict[str, Any]) -> Tuple[str,
             s = s[:start] + anchor + s[end:]
         except Exception:
             s = s.replace(short, anchor)
-
     for start, end, short, anchor in rep:
         if start is None:
             s = s.replace(short, anchor)
-
     for short in media_short:
         s = s.replace(esc(short), "")
 
     s = re.sub(r'@([A-Za-z0-9_]{1,15})', r'<a href="https://x.com/\1" target="_blank" rel="noopener">@\1</a>', s)
     s = re.sub(r'#([A-Za-z0-9_]+)', r'<a href="https://x.com/hashtag/\1" target="_blank" rel="noopener">#\1</a>', s)
-
     return s, urls, media
 
+# ---------- OG fetch ----------
+OG_CACHE: Dict[str, Dict[str,str]] = {}
+MAX_OG_FETCH = 30
+OG_FETCHED = 0
+
+META_RE = re.compile(
+    r'<meta\b[^>]+?(?:property|name)\s*=\s*["\'](?P<key>og:[^"\']+|twitter:[^"\']+)["\'][^>]*?content\s*=\s*["\'](?P<val>[^"\']+)["\']',
+    re.IGNORECASE)
+TITLE_RE = re.compile(r'<title[^>]*>(?P<title>.*?)</title>', re.IGNORECASE|re.DOTALL)
+
+def fetch_small(url: str) -> Optional[str]:
+    try:
+        req = Request(url, headers={
+            "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":"en-US,en;q=0.9",
+            "Referer": url,
+        })
+        with urlopen(req, timeout=8) as r:
+            raw = r.read(524288)  # 512 KB max
+            return raw.decode("utf-8", "ignore")
+    except Exception as e:
+        log(f"OG fetch fail {url}: {e}")
+        return None
+
+def fetch_og(url: str) -> Dict[str,str]:
+    global OG_FETCHED
+    if not url or url.split("://",1)[0] not in ("http","https"):
+        return {}
+    if url in OG_CACHE: return OG_CACHE[url]
+    if OG_FETCHED >= MAX_OG_FETCH:
+        return {}
+    OG_FETCHED += 1
+
+    html_src = fetch_small(url)
+    if not html_src:
+        OG_CACHE[url] = {}
+        return OG_CACHE[url]
+
+    out: Dict[str,str] = {}
+    for m in META_RE.finditer(html_src):
+        k = m.group("key").lower().strip()
+        v = m.group("val").strip()
+        if k in ("og:title","twitter:title"): out.setdefault("title", v)
+        elif k in ("og:description","twitter:description"): out.setdefault("description", v)
+        elif k in ("og:image","twitter:image","twitter:image:src"): out.setdefault("image", v)
+        elif k == "og:site_name": out.setdefault("site", v)
+    if "title" not in out:
+        m = TITLE_RE.search(html_src)
+        if m:
+            t = re.sub(r"\s+"," ", m.group("title")).strip()
+            out["title"] = t
+    OG_CACHE[url] = out
+    return out
+
+def host_of(u: str) -> str:
+    try:
+        return urlsplit(u).netloc or ""
+    except Exception:
+        return ""
+
+# ---------- Quote embed ----------
 def is_status_url(u: str) -> bool:
     return bool(re.search(r"https?://(x|twitter)\.com/[^/]+/status/\d+", u or ""))
 
-# ---------- Media rendering (no crop, height=400, smart layouts) ----------
-def best_mp4(variants: List[Dict[str,Any]]) -> Optional[str]:
-    best = None
-    best_br = -1
-    for v in variants or []:
-        if v.get("content_type") == "video/mp4" and v.get("url"):
-            br = int(v.get("bitrate") or 0)
-            if br > best_br:
-                best_br = br; best = v["url"]
-    return best
+def render_quote_embed(u: str) -> str:
+    safe = esc(u)
+    return '<blockquote class="twitter-tweet" data-dnt="true"><a href="%s"></a></blockquote>' % safe
+
+# ---------- Media rendering (no crop, fixed height) ----------
+def media_container_style(n: int) -> str:
+    # Use inline style to avoid depending on theme CSS
+    if n <= 1:
+        return "display:grid;grid-template-columns:1fr;gap:8px;grid-auto-rows:400px;"
+    # 2,3,4 -> two columns
+    return "display:grid;grid-template-columns:repeat(2,1fr);gap:8px;grid-auto-rows:400px;"
+
+def media_item_style() -> str:
+    # Every media item is a 400px-tall tile; content un-cropped
+    return "width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#f8fafc;border:1px solid #e6eaf2;border-radius:10px;overflow:hidden;"
+
+def fit_style() -> str:
+    # Applied directly to <img>/<video>: no cropping, height fixed 400px, width variable
+    return "height:400px;width:auto;max-width:100%;object-fit:contain;display:block;background:#000;"
 
 def render_media(media_list: List[Dict[str,Any]], extended: Dict[str,Any]) -> str:
     if not media_list and not extended:
@@ -266,7 +249,7 @@ def render_media(media_list: List[Dict[str,Any]], extended: Dict[str,Any]) -> st
     ext_media = []
     if isinstance(extended, dict):
         ext_media = list((extended.get("media") or []))
-    by_id = {}
+    by_id: Dict[str,Dict[str,Any]] = {}
     for m in media_list or []:
         mid = str(m.get("id_str") or m.get("id") or "")
         by_id[mid] = m
@@ -275,64 +258,87 @@ def render_media(media_list: List[Dict[str,Any]], extended: Dict[str,Any]) -> st
             mid = str(m.get("id_str") or m.get("id") or "")
             by_id[mid] = {**by_id.get(mid, {}), **m}
 
+    # Normalize into ordered list (stable)
     items = []
-    for m in by_id.values():
+    for mid, m in by_id.items():
         t = (m.get("type") or "").lower()
         if t == "photo" and m.get("media_url_https"):
-            items.append(f'<div class="cell"><img src="{esc(m["media_url_https"])}" alt=""></div>')
+            items.append(("img", m["media_url_https"]))
         elif t in ("video","animated_gif"):
             vi = (m.get("video_info") or {})
             src = best_mp4(vi.get("variants") or [])
             poster = m.get("media_url_https") or ""
             if src:
-                items.append(
-                    '<div class="cell"><video controls playsinline preload="metadata" %s>'
-                    '  <source src="%s" type="video/mp4">'
-                    '  Your browser does not support the video tag.'
-                    '</video></div>' % (f'poster="{esc(poster)}"' if poster else "", esc(src))
-                )
+                items.append(("vid", src, poster))
 
-    if not items:
-        return ""
+    if not items: return ""
+
     n = len(items)
-    cls = "n1" if n == 1 else "n2" if n == 2 else "n3" if n == 3 else "n4" if n == 4 else "n4"
-    # index classes for 3-layout
-    items = [re.sub(r'^<div class="cell"', f'<div class="cell idx-{i+1}"', it) if n==3 else it for i,it in enumerate(items)]
-    return f'<div class="ss3k-media {cls}">' + "".join(items[:4]) + "</div>"
+    html_items = []
+    for i, it in enumerate(items, 1):
+        # First figure wrapper provides the tile
+        tile = ['<figure class="media-item" style="%s">' % media_item_style()]
+        if it[0] == "img":
+            tile.append('<img src="%s" alt="" style="%s"/>' % (esc(it[1]), fit_style()))
+        else:
+            poster_attr = ' poster="%s"' % esc(it[2]) if len(it) > 2 and it[2] else ""
+            tile.append('<video controls preload="metadata" playsinline%s style="%s"><source src="%s" type="video/mp4">Your browser does not support the video tag.</video>' %
+                        (poster_attr, fit_style(), esc(it[1])))
+        tile.append("</figure>")
+        html_items.append("".join(tile))
 
-# ---------- OG cards ----------
-def render_link_card(u: Dict[str,Any]) -> str:
-    exp = u.get("unwound_url") or u.get("expanded_url") or u.get("url") or ""
-    ttl = u.get("title") or u.get("display_url") or exp
-    desc = u.get("description") or ""
+    # Layout tweaks: span first for 3-pack
+    wrapper_open = '<div class="ss3k-media" data-media-count="%d" style="%s">' % (n, media_container_style(n))
+    if n == 3:
+        # Insert style to span cols for first item
+        html_items[0] = html_items[0].replace(
+            'class="media-item"',
+            'class="media-item" style="%s grid-column:1 / -1;"' % media_item_style(), 1
+        )
+    out = [wrapper_open] + html_items + ["</div>"]
+    return "".join(out)
+
+def best_mp4(variants: List[Dict[str,Any]]) -> Optional[str]:
+    best, best_br = None, -1
+    for v in variants or []:
+        if v.get("content_type") == "video/mp4" and v.get("url"):
+            br = int(v.get("bitrate") or 0)
+            if br > best_br: best_br, best = br, v["url"]
+    return best
+
+# ---------- Cards ----------
+def render_link_card_from_url(url_entity: Dict[str,Any]) -> str:
+    exp = url_entity.get("unwound_url") or url_entity.get("expanded_url") or url_entity.get("url") or ""
+    if not exp: return ""
+    if is_status_url(exp): return ""  # handled as quote-embed elsewhere
+
+    # Prefer entity-provided meta if present; otherwise fetch OG
+    title = url_entity.get("title") or ""
+    desc  = url_entity.get("description") or ""
+    images = url_entity.get("images") or []
     thumb = None
-    if isinstance(u.get("images"), list) and u["images"]:
-        thumb = u["images"][0].get("url") or None
+    if images and isinstance(images, list):
+        thumb = images[0].get("url") or None
 
-    # Fallback to OG fetch when missing
-    if (not thumb or not ttl or ttl == exp):
-        og = _fetch_og(exp)
-        if og:
-            ttl = og.get("title") or ttl
-            if not desc:
-                desc = og.get("description") or ""
-            if not thumb:
-                thumb = og.get("image") or None
+    if not (title and thumb):
+        og = fetch_og(exp)
+        title = title or og.get("title","")
+        desc  = desc  or og.get("description","")
+        thumb = thumb or og.get("image","")
 
-    host = re.sub(r"^https?://", "", exp).split("/")[0]
-    thumb_html = f'<img class="thumb" src="{esc(thumb)}" alt="">' if thumb else ""
-    desc_html  = f'<div class="desc">{esc(desc)}</div>' if desc else ""
-
+    host = host_of(exp) or (url_entity.get("display_url") or "")
+    # Minimal clean card; CSS in your PHP already styles .ss3k-card.ext
     return (
-        '<div class="ss3k-card ext">'
+        '<div class="ss3k-card ext" data-og="1">'
         f'  <a class="wrap" href="{esc(exp)}" target="_blank" rel="noopener">'
-        f'    {thumb_html}'
-        f'    <div class="meta"><div class="ttl">{esc(ttl)}</div><div class="dom">{esc(host)}</div>{desc_html}</div>'
+        f'    {"<img class=\"thumb\" src=\"%s\" alt=\"\">" % esc(thumb) if thumb else ""}'
+        f'    <div class="meta"><div class="ttl">{esc(title or host or "Open link")}</div>'
+        f'    <div class="dom">{esc(host)}</div></div>'
         '  </a>'
         '</div>'
     )
 
-# ---------- API fallback ----------
+# ---------- API (optional) ----------
 def hdrs(screen_name: str, root_id: str) -> Dict[str,str]:
     ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}" if (AUTH_COOKIE and CSRF) else ""
     h = {
@@ -408,12 +414,10 @@ def collect_via_api(root_sn: str, root_id: str) -> Tuple[Dict[str,Any], Dict[str
         log(f"[CONVO] page={page} cursor={cursor}")
         data, raw = fetch_json(url, hdrs(root_sn, root_id), "[CONVO]")
         if raw: save_debug_blob("convo", page, raw)
-        if not data:
-            break
+        if not data: break
         parse_global_objects(data, tweets, users)
         nxt = find_bottom_cursor(data)
-        if not nxt or nxt == cursor:
-            break
+        if not nxt or nxt == cursor: break
         cursor = nxt
         time.sleep(SLEEP_SEC)
     if not tweets:
@@ -431,12 +435,10 @@ def collect_via_api(root_sn: str, root_id: str) -> Tuple[Dict[str,Any], Dict[str
             log(f"[SEARCH] page={page} cursor={cursor}")
             data, raw = fetch_json(url, hdrs(root_sn, root_id), "[SEARCH]")
             if raw: save_debug_blob("search", page, raw)
-            if not data:
-                break
+            if not data: break
             parse_global_objects(data, tweets, users)
             nxt = find_bottom_cursor(data)
-            if not nxt or nxt == cursor:
-                break
+            if not nxt or nxt == cursor: break
             cursor = nxt
             time.sleep(SLEEP_SEC)
     return tweets, users
@@ -446,21 +448,20 @@ class Reply:
     __slots__ = (
         "id","user_id","name","handle","verified","avatar",
         "text","html","created_iso","metrics","entities","extended_entities",
-        "in_reply_to","quoted_url","parent_id","root_id","media_html","link_cards_html"
+        "in_reply_to","quoted_url","parent_id","root_id",
+        "media_html","link_cards_html","depth"
     )
     def __init__(self):
-        self.id = ""; self.user_id = ""; self.name = "User"; self.handle = ""; self.verified=False
-        self.avatar = ""; self.text=""; self.html=""; self.created_iso=""
-        self.metrics = {"replies":None, "reposts":None, "likes":None, "quotes":None, "bookmarks":None, "views":None}
-        self.entities = {}; self.extended_entities = {}
-        self.in_reply_to = None; self.quoted_url = None; self.parent_id = None; self.root_id = None
-        self.media_html = ""; self.link_cards_html = ""
+        self.id=""; self.user_id=""; self.name="User"; self.handle=""; self.verified=False
+        self.avatar=""; self.text=""; self.html=""; self.created_iso=""
+        self.metrics={"replies":None,"reposts":None,"likes":None,"quotes":None,"bookmarks":None,"views":None}
+        self.entities={}; self.extended_entities={}
+        self.in_reply_to=None; self.quoted_url=None; self.parent_id=None; self.root_id=None
+        self.media_html=""; self.link_cards_html=""; self.depth=0
 
 def from_tweet_obj(t: Dict[str,Any], users: Dict[str,Any]) -> Optional[Reply]:
     tid = str(t.get("id_str") or t.get("id") or "").strip()
-    if not tid:
-        return None
-
+    if not tid: return None
     r = Reply(); r.id = tid
     uid = str(t.get("user_id_str") or t.get("user_id") or (t.get("user") or {}).get("id_str") or (t.get("user") or {}).get("id") or "")
     u = users.get(uid) if uid and isinstance(users, dict) else (t.get("user") or {})
@@ -475,26 +476,27 @@ def from_tweet_obj(t: Dict[str,Any], users: Dict[str,Any]) -> Optional[Reply]:
     r.extended_entities = (t.get("extended_entities") or {})
     html_text, url_entities, media_entities = expand_text_with_entities(text, r.entities)
 
-    # Quote-tweet
+    # Quote tweet from URL entities
     qt = None
     for uent in url_entities:
-        ex = uent.get("expanded_url") or uent.get("unwound_url") or uent.get("url") or ""
+        ex = uent.get("unwound_url") or uent.get("expanded_url") or uent.get("url") or ""
         if is_status_url(ex):
             qt = ex; break
     r.quoted_url = qt
 
+    # Media tiles
     r.media_html = render_media(media_entities, r.extended_entities)
 
-    # External cards for non-status links
+    # External link cards (with OG fetch if needed)
     cards = []
     seen = set()
     for uent in url_entities:
         ex = uent.get("unwound_url") or uent.get("expanded_url") or uent.get("url") or ""
-        if not ex or is_status_url(ex):
+        if not ex or is_status_url(ex):  # quote tweets handled separately
             continue
         if ex in seen: continue
         seen.add(ex)
-        cards.append(render_link_card(uent))
+        cards.append(render_link_card_from_url(uent))
     r.link_cards_html = "".join(cards)
 
     r.text = text
@@ -502,15 +504,15 @@ def from_tweet_obj(t: Dict[str,Any], users: Dict[str,Any]) -> Optional[Reply]:
 
     ca = t.get("created_at") or ""
     r.created_iso = iso_from_twitter(ca) if ca else (t.get("created_at_iso") or t.get("created_at_utc") or "")
+
     pm = t.get("public_metrics") or {}
-    r.metrics["replies"] = pm.get("reply_count") if pm else (t.get("reply_count"))
-    r.metrics["reposts"] = pm.get("retweet_count") if pm else (t.get("retweet_count"))
-    r.metrics["likes"]   = pm.get("like_count")    if pm else (t.get("favorite_count"))
-    r.metrics["quotes"]  = pm.get("quote_count")    if pm else (t.get("quote_count"))
+    r.metrics["replies"]   = pm.get("reply_count") if pm else (t.get("reply_count"))
+    r.metrics["reposts"]   = pm.get("retweet_count") if pm else (t.get("retweet_count"))
+    r.metrics["likes"]     = pm.get("like_count")    if pm else (t.get("favorite_count"))
+    r.metrics["quotes"]    = pm.get("quote_count")    if pm else (t.get("quote_count"))
     r.metrics["bookmarks"] = t.get("bookmark_count")
     views = t.get("views") or t.get("ext_views") or {}
-    if isinstance(views, dict):
-        r.metrics["views"] = views.get("count")
+    if isinstance(views, dict): r.metrics["views"] = views.get("count")
 
     r.in_reply_to = str(t.get("in_reply_to_status_id_str") or t.get("in_reply_to_status_id") or "") or None
     for ref in (t.get("referenced_tweets") or []):
@@ -519,26 +521,24 @@ def from_tweet_obj(t: Dict[str,Any], users: Dict[str,Any]) -> Optional[Reply]:
         if ref.get("type") == "quoted" and ref.get("id"):
             if not r.quoted_url:
                 r.quoted_url = f"https://x.com/i/web/status/{ref['id']}"
-
     return r
 
-# ---------- Crawler JSONL ----------
+# ---------- JSONL ingestion ----------
 def parse_jsonl(path: str) -> Tuple[List[Reply], Dict[str,Any]]:
     replies: List[Reply] = []
     users_index: Dict[str,Any] = {}
+
     if not path or not os.path.isfile(path):
         return replies, users_index
 
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             line = (line or "").strip()
-            if not line:
-                continue
+            if not line: continue
             try:
                 obj = json.loads(line)
             except Exception:
                 continue
-
             cand = None
             if isinstance(obj, dict):
                 if obj.get("tweet") and isinstance(obj["tweet"], dict):
@@ -547,75 +547,53 @@ def parse_jsonl(path: str) -> Tuple[List[Reply], Dict[str,Any]]:
                     cand = obj["data"]["tweet"]
                 else:
                     cand = obj
-
-            if not isinstance(cand, dict):
-                continue
+            if not isinstance(cand, dict): continue
 
             text = cand.get("full_text") or cand.get("text") or ""
-            if text and is_emoji_only(text):
+            if text and is_emoji_only(text):  # drop emoji-only lines
                 continue
 
             uobj = cand.get("user")
             if isinstance(uobj, dict):
                 uid = str(uobj.get("id_str") or uobj.get("id") or "")
-                if uid:
-                    users_index.setdefault(uid, uobj)
+                if uid: users_index.setdefault(uid, uobj)
 
             r = from_tweet_obj(cand, users_index)
-            if r:
-                replies.append(r)
-
+            if r: replies.append(r)
     return replies, users_index
 
-# ---------- Build thread + HTML ----------
-def build_thread(replies: List[Reply], root_id: Optional[str]) -> Tuple[List[Reply], Dict[str,List[Reply]]]:
-    by_id = {r.id: r for r in replies if r.id}
-
+# ---------- Ordering + depth ----------
+def compute_depths(replies: List[Reply]) -> None:
+    by_id = {r.id: r for r in replies}
     for r in replies:
-        pid = r.in_reply_to
-        if pid and pid in by_id:
-            r.parent_id = pid
-        r.root_id = root_id or r.root_id
+        d, cur = 0, r.in_reply_to
+        steps = 0
+        while cur and cur in by_id and steps < 20:
+            d += 1
+            cur = by_id[cur].in_reply_to
+            steps += 1
+        r.depth = d
+        r.parent_id = r.in_reply_to
 
-    children: Dict[str,List[Reply]] = defaultdict(list)
-    roots: List[Reply] = []
-    for r in replies:
-        if r.parent_id and r.parent_id in by_id:
-            children[r.parent_id].append(r)
-        else:
-            roots.append(r)
+def chronological(replies: List[Reply]) -> List[Reply]:
+    # order strictly by created time (as posted)
+    def key(r: Reply):
+        try:
+            return datetime.fromisoformat((r.created_iso or "").replace("Z","+00:00"))
+        except Exception:
+            return datetime(1970,1,1,tzinfo=timezone.utc)
+    return sorted(replies, key=key)
 
-    # Sort everything by created time (posted order)
-    def by_time(x: Reply): return x.created_iso or ""
-    roots.sort(key=by_time)
-    for k in children:
-        children[k].sort(key=by_time)
-
-    # Flatten order: DFS but respecting time for each siblings set
-    ordered: List[Reply] = []
-    def visit(node: Reply):
-        ordered.append(node)
-        for ch in children.get(node.id, []):
-            visit(ch)
-    for rt in roots:
-        visit(rt)
-
-    return ordered, children
-
-def render_quote_embed(u: str) -> str:
-    safe = esc(u)
-    return '<blockquote class="twitter-tweet" data-dnt="true"><a href="%s"></a></blockquote>' % safe
-
-def render_reply_block(r: Reply, children: Dict[str,List[Reply]]) -> str:
+# ---------- Render ----------
+def render_reply(r: Reply) -> str:
     url = f"{BASE_X}/{esc(r.handle)}/status/{esc(r.id)}" if r.handle else f"{BASE_X}/i/web/status/{esc(r.id)}"
     when = fmt_when(r.created_iso)
-
     av = f'<div class="avatar-50">{f"<img src=\"{esc(r.avatar)}\" alt=\"\">" if r.avatar else ""}</div>'
     head = (
         '<div class="head">'
         f'  <span class="disp">{esc(r.name)}</span>'
         f'  <span class="handle"> @{esc(r.handle or "user")}</span>'
-        f'  {"<span class=\\"badge\\"></span>" if r.verified else ""}'
+        f'  {"<span class=\"badge\"></span>" if r.verified else ""}'
         '</div>'
     )
     body = f'<div class="body">{r.html}</div>'
@@ -624,10 +602,10 @@ def render_reply_block(r: Reply, children: Dict[str,List[Reply]]) -> str:
     cards = r.link_cards_html
 
     metrics = []
-    if r.metrics.get("replies") is not None:  metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M14 9V5l-7 7 7 7v-4h1c4 0 7 1 9 4-1-7-5-10-10-10h-1z"/></svg><span>{fmt_metric(r.metrics["replies"])}</span></span>')
-    if r.metrics.get("reposts") is not None:  metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M17 1l4 4-4 4V7H7a3 3 0 00-3 3v2H2V9a5 5 0 015-5h10V1zm-6 16H5l4-4v2h10a3 3 0 003-3v-2h2v3a5 5 0 01-5 5H11v2l-4-4 4-4v3z"/></svg><span>{fmt_metric(r.metrics["reposts"])}</span></span>')
-    if r.metrics.get("likes")   is not None:  metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M12 21s-7-4.4-9-8.6C1.1 9.6 3 7 5.9 7c1.9 0 3.1 1 4.1 2 1-1 2.2-2 4.1-2 2.9 0 4.8 2.6 2.9 5.4C19 16.6 12 21 12 21z"/></svg><span>{fmt_metric(r.metrics["likes"])}</span></span>')
-    if r.metrics.get("quotes")  is not None:  metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M6 2h12a1 1 0 011 1v19l-7-4-7 4V3a1 1 0 011-1z"/></svg><span>{fmt_metric(r.metrics["quotes"])}</span></span>')
+    if r.metrics.get("replies") is not None: metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M14 9V5l-7 7 7 7v-4h1c4 0 7 1 9 4-1-7-5-10-10-10h-1z"/></svg><span>{fmt_metric(r.metrics["replies"])}</span></span>')
+    if r.metrics.get("reposts") is not None: metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M17 1l4 4-4 4V7H7a3 3 0 00-3 3v2H2V9a5 5 0 015-5h10V1zm-6 16H5l4-4v2h10a3 3 0 003-3v-2h2v3a5 5 0 01-5 5H11v2l-4-4 4-4v3z"/></svg><span>{fmt_metric(r.metrics["reposts"])}</span></span>')
+    if r.metrics.get("likes")   is not None: metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M12 21s-7-4.4-9-8.6C1.1 9.6 3 7 5.9 7c1.9 0 3.1 1 4.1 2 1-1 2.2-2 4.1-2 2.9 0 4.8 2.6 2.9 5.4C19 16.6 12 21 12 21z"/></svg><span>{fmt_metric(r.metrics["likes"])}</span></span>')
+    if r.metrics.get("quotes")  is not None: metrics.append(f'<span class="metric"><svg viewBox="0 0 24 24"><path d="M6 2h12a1 1 0 011 1v19l-7-4-7 4V3a1 1 0 011-1z"/></svg><span>{fmt_metric(r.metrics["quotes"])}</span></span>')
     bar = (f'<div class="tweetbar">{"".join(metrics)}</div>' if metrics else "")
     linkx = f'<span class="linkx"><a href="{url}" target="_blank" rel="noopener">{esc(when or "Open on X")}</a></span>'
 
@@ -640,6 +618,7 @@ def render_reply_block(r: Reply, children: Dict[str,List[Reply]]) -> str:
         "data-url": url,
         "data-ts": r.created_iso,
         "data-parent": r.parent_id or "",
+        "data-depth": str(r.depth),
         "data-root": r.root_id or "",
         "data-replies": str(r.metrics.get("replies") or ""),
         "data-reposts": str(r.metrics.get("reposts") or ""),
@@ -648,14 +627,12 @@ def render_reply_block(r: Reply, children: Dict[str,List[Reply]]) -> str:
     }
     attr_s = " ".join(f'{k}="{esc(v)}"' for k,v in attrs.items() if v)
 
-    # Render children (if any) nested
-    kid_html = ""
-    kids = children.get(r.id, [])
-    if kids:
-        kid_html = '<div class="ss3k-children">' + "".join(render_reply_block(k, children) for k in kids) + '</div>'
+    # Optional inline indent (keeps things readable even if CSS not yet added)
+    indent_px = min(5, r.depth) * 16  # cap at depth 5
+    style_indent = f' style="margin-left:{indent_px}px;"' if indent_px else ""
 
     return (
-        f'<div {attr_s}>'
+        f'<div {attr_s}{style_indent}>'
         f'  {av}'
         f'  <div>'
         f'    {head}'
@@ -663,9 +640,8 @@ def render_reply_block(r: Reply, children: Dict[str,List[Reply]]) -> str:
         f'    {embed}'
         f'    {media}'
         f'    {cards}'
-        f'    <div class="tweetbar-wrap">{bar}</div>'
+        f'    {bar}'
         f'    {linkx}'
-        f'    {kid_html}'
         f'  </div>'
         f'</div>'
     )
@@ -731,31 +707,26 @@ def main():
             users.update(umap or {})
             for tid, t in (tmap or {}).items():
                 conv = str(t.get("conversation_id_str") or t.get("conversation_id") or "")
-                if root_id and conv != str(root_id):
-                    continue
-                if str(t.get("id_str") or t.get("id")) == str(root_id):
-                    continue
-                if t.get("retweeted_status_id") or t.get("retweeted_status_id_str"):
-                    continue
+                if root_id and conv != str(root_id): continue
+                if str(t.get("id_str") or t.get("id")) == str(root_id): continue
+                if t.get("retweeted_status_id") or t.get("retweeted_status_id_str"): continue
                 r = from_tweet_obj(t, users)
-                if r:
-                    replies.append(r)
+                if r: replies.append(r)
 
-        # Dedup
+        # Dedup + assign root
         uniq = {}
-        for r in replies:
-            uniq[r.id] = r
+        for r in replies: uniq[r.id] = r
         replies = list(uniq.values())
-
         if root_id:
-            for r in replies:
-                r.root_id = root_id
+            for r in replies: r.root_id = root_id
 
-        ordered, children = build_thread(replies, root_id)
+        # Order by time; compute depths for optional indent/threading
+        replies = chronological(replies)
+        compute_depths(replies)
 
-        # Emit nested HTML: render only roots; children are included recursively
-        roots_only = [r for r in ordered if not r.parent_id]
-        html_replies = "".join(render_reply_block(r, children) for r in roots_only)
+        # Emit HTML
+        reply_blocks = [render_reply(r) for r in replies]
+        html_replies = "\n".join(reply_blocks)
         with open(OUT_REPLIES, "w", encoding="utf-8") as f:
             f.write(html_replies)
         log(f"Wrote replies HTML: {OUT_REPLIES} ({len(replies)} items)")
@@ -770,7 +741,6 @@ def main():
         except Exception:
             pass
 
-        _save_og_cache(OG_CACHE_MAP)
         wp_patch_if_possible(html_replies, html_links)
 
     except Exception as e:
