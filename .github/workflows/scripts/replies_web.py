@@ -1,6 +1,7 @@
 # file: .github/workflows/scripts/replies_web.py
 #!/usr/bin/env python3
 import os, re, json, html, time, traceback
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -288,39 +289,196 @@ def collect_search(screen_name, root_id):
     log(f"[SEARCH] pages={pages-1} tweets={len(tweets)} users={len(users)}")
     return tweets, users
 
+# --------- Utilities ----------
+def _iso(created_at: str) -> str:
+    """Twitter's 'Wed Oct 29 19:29:36 +0000 2025' -> '2025-10-29T19:29:36Z'"""
+    if not created_at:
+        return ""
+    try:
+        dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y").astimezone(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
+    except Exception:
+        return ""
+
+def _fmt_when(iso: str) -> str:
+    """Human string for the anchor text (UTC)."""
+    try:
+        if not iso: return ""
+        d = datetime.fromisoformat(iso.replace("Z","+00:00")).astimezone(timezone.utc)
+        # Example: Oct 29, 2025, 19:29 UTC
+        return d.strftime("%b %d, %Y, %H:%M UTC")
+    except Exception:
+        return iso or ""
+
+def _int_or_none(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def _extract_views(t: dict):
+    # Various shapes seen in the wild
+    v = t.get("view_count")
+    if isinstance(v, int):
+        return v
+    v = t.get("views") or t.get("ext_views")
+    if isinstance(v, dict):
+        c = v.get("count")
+        if isinstance(c, int):
+            return c
+    return None
+
+def _verified(u: dict) -> bool:
+    return bool(u.get("verified") or u.get("is_blue_verified") or u.get("ext_is_blue_verified"))
+
+def _linkify(text: str, entities: dict) -> str:
+    """Escape, then linkify URLs, @mentions, #hashtags."""
+    if not text:
+        return ""
+    s = html.escape(text)
+
+    ents = entities or {}
+    # URLs: replace t.co with expanded/display
+    for u in (ents.get("urls") or []):
+        short = html.escape(u.get("url") or "")
+        exp   = html.escape(u.get("expanded_url") or short)
+        disp  = html.escape(u.get("display_url") or (exp.replace("https://","").replace("http://","")))
+        if short:
+            s = s.replace(short, f'<a href="{exp}" target="_blank" rel="noopener">{disp}</a>')
+
+    # Mentions (best-effort; entities sometimes missing)
+    s = re.sub(r'@([A-Za-z0-9_]{1,15})',
+               r'<a href="https://x.com/\1" target="_blank" rel="noopener">@\1</a>', s)
+
+    # Hashtags
+    s = re.sub(r'#([A-Za-z0-9_]+)',
+               r'<a href="https://x.com/hashtag/\1" target="_blank" rel="noopener">#\1</a>', s)
+
+    return s
+
+def _svg(icon: str) -> str:
+    if icon == "reply":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 9V5l-7 7 7 7v-4h1c4 0 7 1 9 4-1-7-5-10-10-10h-1z"/></svg>'
+    if icon == "repost":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 1l4 4-4 4V7H7a3 3 0 00-3 3v2H2V9a5 5 0 015-5h10V1zm-6 16H5l4-4v2h10a3 3 0 003-3v-2h2v3a5 5 0 01-5 5H11v2l-4-4 4-4v3z"/></svg>'
+    if icon == "like":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.4-9-8.6C1.1 9.6 3 7 5.9 7c1.9 0 3.1 1 4.1 2 1-1 2.2-2 4.1-2 2.9 0 4.8 2.6 2.9 5.4C19 16.6 12 21 12 21z"/></svg>'
+    if icon == "bookmark":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h12a1 1 0 011 1v19l-7-4-7 4V3a1 1 0 011-1z"/></svg>'
+    if icon == "views":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5C6 5 1.7 9.1 1 12c.7 2.9 5 7 11 7s10.3-4.1 11-7c-.7-2.9-5-7-11-7zm0 11a4 4 0 110-8 4 4 0 010 8z"/></svg>'
+    if icon == "check":
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M9.2 16.2l-3.9-3.9 1.4-1.4 2.5 2.5 5.7-6 1.5 1.3z"/></svg>'
+    return ""
+
+def _fmt_metric(n):
+    if n is None: return ""
+    try:
+        n = int(n)
+    except Exception:
+        return ""
+    if n < 1000: return str(n)
+    if n < 1_000_000: return f"{round(n/100)/10}K"
+    if n < 1_000_000_000: return f"{round(n/100_000)/10}M"
+    return f"{round(n/100_000_000)/10}B"
+
 # --------- Build outputs ----------
 def tstamp(tweet):
     try:
-        import time as _t
-        return _t.mktime(_t.strptime(tweet.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
+        return time.mktime(time.strptime(tweet.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
     except Exception:
         return 0
 
 def build_outputs(replies, users):
-    # Replies HTML
+    """Emit already-normalized tweet-like cards the frontend can use directly."""
     blocks = []
     for t in replies:
-        uid = str(t.get("user_id_str") or t.get("user_id") or "")
-        u = users.get(uid, {})
-        name = u.get("name") or "User"
-        handle = u.get("screen_name") or ""
-        avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
-        url = f"https://x.com/{handle}/status/{t.get('id_str') or t.get('id')}"
-        text = html.escape(t.get("full_text") or t.get("text") or "")
-        imgtag = f'<img class="ss3k-ravatar" src="{html.escape(avatar)}" alt="">' if avatar else '<div class="ss3k-ravatar" style="width:32px;height:32px;border-radius:50%;background:#eee"></div>'
-        who = html.escape(f"{name} (@{handle})") if handle else html.escape(name)
-        blocks.append(
-            f'<div class="ss3k-reply"><a href="{url}" target="_blank" rel="noopener">{imgtag}</a>'
-            f'<div class="ss3k-rcontent"><div class="ss3k-rname">{who}</div>'
-            f'<div class="ss3k-rtext">{text}</div></div></div>'
+        uid    = str(t.get("user_id_str") or t.get("user_id") or "")
+        u      = users.get(uid, {})
+        name   = (u.get("name") or "User")
+        handle = (u.get("screen_name") or "")
+        verified = _verified(u)
+
+        avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "")
+        avatar = avatar.replace("_normal.","_bigger.")
+        url    = f"https://x.com/{handle}/status/{t.get('id_str') or t.get('id')}"
+        text   = t.get("full_text") or t.get("text") or ""
+        text_h = _linkify(text, t.get("entities") or {})
+
+        ts_iso = _iso(t.get("created_at",""))
+        when   = _fmt_when(ts_iso)
+
+        # Metrics (present on search path; convo path may omit)
+        m_replies   = _int_or_none(t.get("reply_count"))
+        m_reposts   = _int_or_none(t.get("retweet_count"))
+        m_likes     = _int_or_none(t.get("favorite_count"))
+        m_bookmarks = _int_or_none(t.get("bookmark_count"))
+        m_views     = _extract_views(t)
+
+        # data-* attributes for the frontend JS to read (and for audio sync)
+        attrs = {
+            "class": "ss3k-reply",
+            "data-name": name,
+            "data-handle": f"@{handle}" if handle else "",
+            "data-verified": "true" if verified else "",
+            "data-url": url,
+            "data-ts": ts_iso,
+            "data-replies": str(m_replies) if m_replies is not None else "",
+            "data-reposts": str(m_reposts) if m_reposts is not None else "",
+            "data-likes": str(m_likes) if m_likes is not None else "",
+            "data-bookmarks": str(m_bookmarks) if m_bookmarks is not None else "",
+            "data-views": str(m_views) if m_views is not None else "",
+        }
+        attr_s = " ".join(f'{k}="{html.escape(v)}"' for k,v in attrs.items() if v not in (None,""))
+
+        # Build inner tweet-like card (avatar, head, body, metrics, bottom-right time link)
+        if avatar:
+            av = f'<div class="avatar-50"><img src="{html.escape(avatar)}" alt=""></div>'
+        else:
+            av = '<div class="avatar-50"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#90a0b7;font-weight:700;">?</div></div>'
+
+        head = (
+            f'<div class="head">'
+            f'  <span class="disp">{html.escape(name)}</span>'
+            f'  <span class="handle"> @{html.escape(handle or "user")}</span>'
+            f'  {"<span class=\"badge\">" + _svg("check") + "</span>" if verified else ""}'
+            f'</div>'
         )
-    open(OUT_REPLIES,"w", encoding="utf-8").write("\n".join(blocks))
+
+        body = f'<div class="body">{text_h}</div>'
+
+        # Metrics bar (only include present metrics)
+        metrics_html = []
+        if m_replies is not None:   metrics_html.append(f'<span class="metric">{_svg("reply")}<span>{_fmt_metric(m_replies)}</span></span>')
+        if m_reposts is not None:   metrics_html.append(f'<span class="metric">{_svg("repost")}<span>{_fmt_metric(m_reposts)}</span></span>')
+        if m_likes   is not None:   metrics_html.append(f'<span class="metric">{_svg("like")}<span>{_fmt_metric(m_likes)}</span></span>')
+        if m_bookmarks is not None: metrics_html.append(f'<span class="metric">{_svg("bookmark")}<span>{_fmt_metric(m_bookmarks)}</span></span>')
+        if m_views   is not None:   metrics_html.append(f'<span class="metric">{_svg("views")}<span>{_fmt_metric(m_views)}</span></span>')
+        bar = f'<div class="tweetbar">{"".join(metrics_html)}</div>' if metrics_html else ""
+
+        linkx = ""
+        if url:
+            linkx = f'<span class="linkx"><a href="{html.escape(url)}" target="_blank" rel="noopener">{html.escape(when or "Open on X")}</a></span>'
+
+        blocks.append(
+            f'<div {attr_s}>'
+            f'  {av}'
+            f'  <div>'
+            f'    {head}'
+            f'    {body}'
+            f'    {bar}'
+            f'    {linkx}'
+            f'  </div>'
+            f'</div>'
+        )
+
+    open(OUT_REPLIES, "w", encoding="utf-8").write("\n".join(blocks))
     log(f"Wrote replies HTML: {OUT_REPLIES} ({len(blocks)} items)")
 
-    # Links HTML grouped by domain
+    # Links HTML grouped by domain (unchanged behavior)
     doms = defaultdict(set)
-    def add_urls_from(t):
-        ent = t.get("entities") or {}
+    def add_urls_from(tw):
+        ent = tw.get("entities") or {}
         for u in (ent.get("urls") or []):
             u2 = u.get("expanded_url") or u.get("url")
             if not u2: continue
@@ -328,8 +486,8 @@ def build_outputs(replies, users):
             dom = m.group(1) if m else "links"
             doms[dom].add(u2)
 
-    for t in replies:
-        add_urls_from(t)
+    for tw in replies:
+        add_urls_from(tw)
 
     lines = []
     for dom in sorted(doms):
@@ -339,7 +497,7 @@ def build_outputs(replies, users):
             e = html.escape(u)
             lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
         lines.append("</ul>")
-    open(OUT_LINKS,"w", encoding="utf-8").write("\n".join(lines))
+    open(OUT_LINKS, "w", encoding="utf-8").write("\n".join(lines))
     log(f"Wrote links HTML: {OUT_LINKS} (domains={len(doms)})")
 
 # --------- Main ----------
