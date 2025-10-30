@@ -3,7 +3,7 @@
 """
 replies_web.py — resilient replies/links builder for Space Worker
 
-- Discovers crawler outputs automatically (JSONL or debug page JSON).
+- Discovers crawler outputs automatically (JSONL or debug page JSON/HTML).
 - Ignores emoji/VTT rows; keeps only real tweet/reply/message nodes.
 - Handles v1/v2/legacy shapes (ids, user, text, created_at, public_metrics, entities, extended_entities).
 - Expands t.co, removes media placeholders, builds content cards, embeds quote tweets.
@@ -35,6 +35,9 @@ START_ISO = (os.environ.get("START_ISO") or "").strip()
 # Explicit inputs (if the crawler wrote them)
 REPLIES_JSONL = (os.environ.get("REPLIES_JSONL") or
                  os.environ.get("CRAWLER_REPLIES_JSONL") or "").strip()
+
+# WORKDIR for recursive discovery fallback
+WORKDIR = Path(os.environ.get("WORKDIR") or ARTDIR)
 
 # Files we will write
 OUT_REPLIES = ARTDIR / f"{BASE}_replies.html"
@@ -87,7 +90,6 @@ def human_k(n: Optional[int]) -> str:
     return f"{v//1_000_000}M"
 
 def parse_epoch_maybe(x: Any) -> Optional[float]:
-    """Accept seconds or ms epoch; return seconds float."""
     if x is None: return None
     try:
         v = float(x)
@@ -97,17 +99,13 @@ def parse_epoch_maybe(x: Any) -> Optional[float]:
     return v
 
 def parse_time_any(created_at: Any) -> Optional[float]:
-    """Try ISO 8601, RFC, epoch sec/ms; return UTC seconds."""
     if created_at is None: return None
     s = str(created_at).strip()
-    # Epoch?
     if re.fullmatch(r"\d{10,13}", s):
         return parse_epoch_maybe(s)
-    # ISO-ish normalize
     try:
         if s.endswith("Z"): dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         elif re.search(r"[+-]\d{2}:?\d{2}$", s):
-            # allow +0000
             if re.search(r"[+-]\d{4}$", s):
                 s = s[:-5] + s[-5:-3] + ":" + s[-3:]
             dt = datetime.fromisoformat(s)
@@ -118,7 +116,6 @@ def parse_time_any(created_at: Any) -> Optional[float]:
         return dt.astimezone(timezone.utc).timestamp()
     except Exception:
         pass
-    # RFC 2822-ish (Tue, 03 Oct 2023 12:34:56 +0000)
     try:
         return datetime.strptime(s, "%a, %d %b %Y %H:%M:%S %z").timestamp()
     except Exception:
@@ -148,52 +145,90 @@ STATUS_RE = re.compile(r"https?://(?:x|twitter)\.com/[^/]+/status/\d+")
 HTTP_RE = re.compile(r"https?://[^\s<]+", re.I)
 
 # ----------------- Discovery -----------------
-def find_jsonl() -> Optional[Path]:
-    # Env override
-    if REPLIES_JSONL:
-        p = Path(REPLIES_JSONL)
-        if p.exists() and p.is_file(): return p
-    # Common patterns in ARTDIR
-    pats = [
-        f"{BASE}_replies.jsonl",
-        f"{BASE}-replies.jsonl",
-        f"{BASE}.replies.jsonl",
-        "*_replies.jsonl",
-        "*replies*.jsonl",
-        "*conversation*.jsonl",
+def find_jsonl_candidates() -> List[Path]:
+    cands: List[Path] = []
+    names = [
+        f"{BASE}_replies.jsonl", f"{BASE}-replies.jsonl", f"{BASE}.replies.jsonl",
+        f"{BASE}_conversation.jsonl", f"{BASE}_thread.jsonl",
     ]
-    for pat in pats:
+    for nm in names:
+        p = ARTDIR / nm
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            cands.append(p)
+    for pat in [f"{BASE}*replies*.jsonl", "*replies*.jsonl", "*conversation*.jsonl", "*thread*.jsonl"]:
         for p in ARTDIR.glob(pat):
             if p.is_file() and p.stat().st_size > 0:
-                return p
-    return None
+                cands.append(p)
+    for p in WORKDIR.rglob("*replies*.jsonl"):
+        if p.is_file() and p.stat().st_size > 0:
+            cands.append(p)
+    seen = set(); out=[]
+    for p in cands:
+        rp = p.resolve()
+        if rp in seen: continue
+        seen.add(rp); out.append(p)
+    return out
+
+def find_jsonl() -> Optional[Path]:
+    if REPLIES_JSONL:
+        p = Path(REPLIES_JSONL)
+        if p.exists() and p.is_file() and p.stat().st_size > 0: return p
+    cands = find_jsonl_candidates()
+    return cands[0] if cands else None
 
 def iter_debug_pages():
-    """Yield tweet payloads from saved debug JSON pages."""
-    if not DBG_DIR.exists(): return
-    pages = sorted(DBG_DIR.glob(f"{BASE}_replies_page*.json"))
+    pages = []
+    if DBG_DIR.exists():
+        pages.extend(sorted(DBG_DIR.glob(f"{BASE}_replies_page*.json")))
+        pages.extend(sorted(DBG_DIR.glob(f"{BASE}_page*.json")))
+        pages.extend(sorted(DBG_DIR.glob("*.json")))
+        pages.extend(sorted(DBG_DIR.glob(f"{BASE}_replies_page*.html")))
+        pages.extend(sorted(DBG_DIR.glob("*.html")))
+
+    searched = [str(p) for p in pages]
+    if searched: log("Debug pages considered: " + ", ".join(searched[:10]) + (" ..." if len(searched)>10 else ""))
+
     for p in pages:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
         try:
-            doc = json.loads(p.read_text(encoding="utf-8"))
+            if p.suffix.lower() == ".json":
+                doc = json.loads(txt)
+                yield from _walk_any(doc)
+            else:
+                blobs = re.findall(r"(<script[^>]*>)([\s\S]{100,}?)(</script>)", txt, re.I)
+                for _, body, _ in blobs:
+                    body = body.strip()
+                    try:
+                        j = json.loads(body)
+                        yield from _walk_any(j)
+                        continue
+                    except Exception:
+                        pass
+                    m = re.search(r"=\s*({[\s\S]+?})\s*;?\s*$", body)
+                    if m:
+                        try:
+                            j = json.loads(m.group(1))
+                            yield from _walk_any(j); continue
+                        except Exception:
+                            pass
         except Exception:
             continue
-        # Accept several shapes; try to walk to instructions entries
-        # We keep this lenient — crawler images vary.
-        stacks = [doc]
-        while stacks:
-            cur = stacks.pop()
-            if isinstance(cur, dict):
-                # Possible v2 data.data.threads or instruction entries
-                if "entries" in cur and isinstance(cur["entries"], list):
-                    for e in cur["entries"]:
-                        yield e
-                for v in cur.values():
-                    if isinstance(v, (dict, list)):
-                        stacks.append(v)
-            elif isinstance(cur, list):
-                for v in cur:
-                    if isinstance(v, (dict, list)):
-                        stacks.append(v)
+
+def _walk_any(doc):
+    stack = [doc]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if "entries" in cur and isinstance(cur["entries"], list):
+                for e in cur["entries"]:
+                    yield e
+            if "tweet_results" in cur and isinstance(cur["tweet_results"], dict):
+                yield cur
+            for v in cur.values():
+                if isinstance(v, (dict, list)): stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)): stack.append(v)
 
 # ----------------- Extraction -----------------
 def first(*vals):
@@ -202,7 +237,6 @@ def first(*vals):
     return None
 
 def take_user(u: Dict[str, Any]) -> Tuple[str, str, str]:
-    """Return (name, screen_name, avatar_url) from user block."""
     if not isinstance(u, dict): u = {}
     name = first(u.get("name"), u.get("legacy", {}).get("name"), u.get("display_name"), "User")
     sn   = first(u.get("screen_name"), u.get("legacy", {}).get("screen_name"), u.get("username"), "")
@@ -218,20 +252,12 @@ def unwrap_entities(obj: Dict[str, Any]) -> Dict[str, Any]:
     return {"entities": ent, "extended_entities": ext}
 
 def expand_tco(text: str, entities: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], List[str]]:
-    """
-    Replace t.co with expanded_url/unwound_url; remove media URLs from text.
-    Return (new_text, link_cards, media_tco_urls_removed)
-    """
     s = text or ""
     links: List[Dict[str, Any]] = []
     removed_media_urls: List[str] = []
-
-    # media t.co to strip
     for m in (entities.get("media") or []):
         u = first(m.get("url"), m.get("expanded_url"))
         if u: removed_media_urls.append(u)
-
-    # Build replacement map using indices to preserve order
     repls: List[Tuple[int, int, str]] = []
     for u in (entities.get("urls") or []):
         tco = u.get("url") or ""
@@ -239,10 +265,8 @@ def expand_tco(text: str, entities: Dict[str, Any]) -> Tuple[str, List[Dict[str,
         start, end = None, None
         if isinstance(u.get("indices"), list) and len(u["indices"]) == 2:
             start, end = int(u["indices"][0]), int(u["indices"][1])
-        # Choose best expansion
         expanded = first(u.get("unwound_url"), u.get("expanded_url"), u.get("display_url"), tco)
         if not expanded: expanded = tco
-        # Build link card skeleton
         card = {
             "url": expanded,
             "title": first(u.get("title"), u.get("unwound_title")),
@@ -252,33 +276,14 @@ def expand_tco(text: str, entities: Dict[str, Any]) -> Tuple[str, List[Dict[str,
         links.append(card)
         if start is not None:
             repls.append((start, end, expanded))
-        else:
-            # fallback regex pass later
-            pass
-
-    # Apply index-based replacements from right to left
     if repls:
         repls.sort(key=lambda x: x[0], reverse=True)
         for st, en, rep in repls:
             if 0 <= st < en <= len(s):
                 s = s[:st] + rep + s[en:]
-
-    # Regex fallback for any remaining t.co
-    def _repl(m):
-        url = m.group(0)
-        for c in links:
-            if c["url"].startswith("http"):
-                # if display_url was used, keep it; we only replace with expanded the first time
-                pass
-        return url  # keep if we couldn't map specifically
-
-    s = TCO_RE.sub(_repl, s)
-
-    # Remove media t.co from text
+    s = TCO_RE.sub(lambda m: m.group(0), s)
     for mu in removed_media_urls:
         s = s.replace(mu, "")
-
-    # Collapse whitespace around removed URLs
     s = re.sub(r"\s+", " ", s).strip()
     return s, links, removed_media_urls
 
@@ -291,7 +296,6 @@ def collect_inline_media(extended_entities: Dict[str, Any]) -> List[Dict[str, An
             src = m.get("media_url_https") or m.get("media_url")
             if src: out.append({"kind":"img","src":src})
         elif t in ("video","animated_gif"):
-            # Choose the highest bitrate mp4
             best = None
             for v in (m.get("video_info", {}).get("variants") or []):
                 if v.get("content_type") != "video/mp4": continue
@@ -310,11 +314,7 @@ def is_valid_text(s: str) -> bool:
     return True
 
 def walk_debug_entry(e: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Extract a tweet-like object from a debug "entry" item (flexible).
-    """
     if not isinstance(e, dict): return None
-    # Attempt to locate "itemContent.tweet_results.result"
     cur = e
     keys = [
         ("content","itemContent","tweet_results","result"),
@@ -332,13 +332,11 @@ def walk_debug_entry(e: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 ok = False; break
         if ok and isinstance(node, dict):
             return node
-    # Fallback: return None
+    if "tweet_results" in e and isinstance(e["tweet_results"], dict):
+        return e
     return None
 
 def normalize_tweet(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Normalize a tweet 'result' object (as from v2 entries) or legacy shapes into a flat dict.
-    """
     if not isinstance(t, dict): return None
     core = t
     leg  = first(core.get("legacy"), core.get("tweet"), {})
@@ -352,9 +350,7 @@ def normalize_tweet(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                  core.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {}).get("text"))
     if not is_valid_text(text): return None
 
-    # Entities
     ents = unwrap_entities(leg if isinstance(leg, dict) else core)
-    # created_at
     created = first(leg.get("created_at") if isinstance(leg, dict) else None,
                     core.get("created_at"),
                     core.get("legacy", {}).get("created_at"),
@@ -363,7 +359,6 @@ def normalize_tweet(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     core.get("created_at_secs"))
     created_epoch = parse_time_any(created)
 
-    # Public metrics
     pm = first(core.get("legacy", {}),
                core.get("metrics"),
                core.get("public_metrics"),
@@ -376,11 +371,9 @@ def normalize_tweet(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     in_reply_to = str(first(leg.get("in_reply_to_status_id_str") if isinstance(leg, dict) else None,
                             core.get("in_reply_to_status_id_str"), core.get("in_reply_to_status_id")) or "")
 
-    # t.co expansion + link cards
-    text_expanded, link_cards, media_tcos = expand_tco(text, ents["entities"])
-    # Inline media
+    text_expanded, link_cards, _media_tcos = expand_tco(text, ents["entities"])
     media_items = collect_inline_media(ents["extended_entities"])
-    # Quote tweet detection
+
     quote_url = None
     m = STATUS_RE.search(text_expanded or "")
     if m: quote_url = m.group(0)
@@ -416,11 +409,19 @@ def load_from_jsonl(path: Path) -> List[Dict[str, Any]]:
                 obj = json.loads(line)
             except Exception:
                 continue
-            # Accept direct tweet-like object or nested result
-            t = obj
-            if isinstance(t, dict) and "result" in t:
-                t = t["result"]
-            norm = normalize_tweet(t)
+            if isinstance(obj, dict) and isinstance(obj.get("payload"), str):
+                try:
+                    pl = json.loads(obj["payload"])
+                    if isinstance(pl, dict) and isinstance(pl.get("body"), str):
+                        obj = json.loads(pl["body"])
+                except Exception:
+                    pass
+            cand = obj
+            if isinstance(cand, dict) and "result" in cand:
+                cand = cand["result"]
+            if isinstance(cand, dict) and "tweet_results" in cand:
+                cand = cand.get("tweet_results", {}).get("result", cand)
+            norm = normalize_tweet(cand) if isinstance(cand, dict) else None
             if norm: out.append(norm)
     return out
 
@@ -435,10 +436,8 @@ def load_from_debug() -> List[Dict[str, Any]]:
 
 # ----------------- Build HTML -----------------
 def fmt_local_ts(epoch: Optional[float]) -> Tuple[str, str]:
-    """Return (display, iso_attr). Display remains UTC; browser will localize in tooltip."""
     if not epoch: return ("", "")
     dt = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
-    # Display as 'YYYY-MM-DD HH:MM UTC'
     disp = dt.strftime("%Y-%m-%d %H:%M UTC")
     iso  = dt.isoformat().replace("+00:00", "Z")
     return disp, iso
@@ -459,12 +458,8 @@ def render_link_cards(cards: List[Dict[str, Any]]) -> str:
             pass
         img  = None
         for im in (c.get("images") or []):
-            # twitter unwinder sometimes gives dicts with url
-            if isinstance(im, dict) and im.get("url"):
-                img = im["url"]; break
-            if isinstance(im, str):
-                img = im; break
-        # Minimal, clean card
+            if isinstance(im, dict) and im.get("url"): img = im["url"]; break
+            if isinstance(im, str): img = im; break
         parts.append(
             f'<a class="ss3k-cardlink" href="{esc(u)}" target="_blank" rel="noopener">'
             f'  <div class="card">'
@@ -492,7 +487,6 @@ def render_media(ms: List[Dict[str, Any]]) -> str:
 
 def render_reply_item(it: Dict[str, Any], start_epoch: Optional[float]) -> str:
     disp, iso = fmt_local_ts(it.get("created_epoch"))
-    # Map to audio timeline if we have a Space start time
     data_begin = ""
     if start_epoch and it.get("created_epoch"):
         rel = max(0.0, float(it["created_epoch"] - start_epoch))
@@ -501,16 +495,12 @@ def render_reply_item(it: Dict[str, Any], start_epoch: Optional[float]) -> str:
     handle = it.get("handle") or ""
     name   = it.get("name") or ""
     status = it.get("status_url") or ""
-
-    # Build counts
     stats = (
         f'<div class="stats"><span title="Replies">💬 {human_k(it.get("reply_count"))}</span>'
         f' <span title="Reposts">🔁 {human_k(it.get("retweet_count"))}</span>'
         f' <span title="Likes">❤️ {human_k(it.get("like_count"))}</span>'
         f'{(" <span title=\"Quotes\">🔗 " + human_k(it.get("quote_count")) + "</span>") if (it.get("quote_count") or 0)>0 else ""}</div>'
     )
-
-    # Quote tweet embed (official X widget; graceful fallback)
     quote = ""
     if it.get("quote_url"):
         q = it["quote_url"]
@@ -520,7 +510,6 @@ def render_reply_item(it: Dict[str, Any], start_epoch: Optional[float]) -> str:
             '</blockquote>'
             '<script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>'
         )
-
     body = (
         f'<div class="body">'
         f'  <div class="head"><span class="nm">{esc(name)}</span> <span class="hn">@{esc(handle)}</span></div>'
@@ -534,13 +523,11 @@ def render_reply_item(it: Dict[str, Any], start_epoch: Optional[float]) -> str:
         f'  </div>'
         f'</div>'
     )
-
     avatar_html = (
         f'<div class="ss3k-avatar">'
         f'  {("<img src=\"%s\" alt=\"\">" % esc(av)) if av else ("<span>" + esc((handle or "U")[:1].upper()) + "</span>")}'
         f'</div>'
     )
-
     return (
         f'<div class="ss3k-reply" data-id="{esc(it.get("id") or "")}" data-parent="{esc(it.get("parent_id") or "")}" '
         f'data-conv="{esc(it.get("conv_id") or "")}" data-ts="{esc(it.get("created_raw") or "")}"{data_begin}>'
@@ -557,20 +544,33 @@ def main():
         log(f"  {k}={globals().get(k)}")
 
     tweets: List[Dict[str, Any]] = []
-    src = find_jsonl()
+    searched_files: List[str] = []
+
+    src = None
+    if REPLIES_JSONL:
+        p = Path(REPLIES_JSONL)
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            src = p
+    if not src:
+        cands = find_jsonl_candidates()
+        searched_files.extend([str(c) for c in cands])
+        src = cands[0] if cands else None
+
     if src:
         log(f"Using JSONL: {src}")
         tweets = load_from_jsonl(src)
+    else:
+        log("No JSONL candidate found.")
 
     if not tweets:
-        # Try debug pages fallback
-        log("No JSONL or empty; trying debug pages fallback…")
+        log("No replies from JSONL; trying debug pages fallback…")
         tweets = load_from_debug()
 
     if not tweets:
-        # If still nothing, but a Purple pill exists, emit a link so UI shows *something*
         if PURPLE:
             log("No replies parsed; writing Purple-pill only placeholder.")
+            if searched_files:
+                log("Searched JSONL candidates: " + ", ".join(searched_files[:12]) + (" ..." if len(searched_files)>12 else ""))
             OUT_REPLIES.write_text(
                 f'<div class="ss3k-replies"><p><a href="{html.escape(PURPLE)}" target="_blank" rel="noopener">Open conversation on X</a></p></div>',
                 encoding="utf-8"
@@ -578,39 +578,34 @@ def main():
             OUT_LINKS.write_text("<!-- no links: replies empty -->", encoding="utf-8")
             print(OUT_REPLIES.read_text(encoding="utf-8"))
             return
-        # Last resort: match earlier behavior (but now logged)
         die_empty("no crawler JSONL or debug pages discovered")
 
-    # Sort chronologically (created time), stable by id as tiebreaker
     tweets = [t for t in tweets if t.get("created_epoch")]
     tweets.sort(key=lambda x: (x.get("created_epoch") or 0, x.get("id") or ""))
 
     log(f"Collected replies: {len(tweets)}")
 
-    # Build replies HTML
     rows = [render_reply_item(t, start_epoch) for t in tweets]
     replies_html = (
+        CSS_INLINE +
         '<section class="ss3k-replies-list" id="ss3k-replies">\n' +
         "\n".join(rows) + "\n</section>\n"
     )
     OUT_REPLIES.write_text(replies_html, encoding="utf-8")
     print(replies_html)
 
-    # Build links HTML (aggregate all expanded links across replies)
     link_cards_flat: List[Dict[str, Any]] = []
     for t in tweets:
         for c in (t.get("link_cards") or []):
             if isinstance(c, dict) and c.get("url"):
                 link_cards_flat.append(c)
 
-    # Deduplicate by URL
     seen = set()
     link_items = []
     for c in link_cards_flat:
         u = c.get("url")
         if not u or u in seen: continue
         seen.add(u)
-        # reuse the card renderer inside a list
         link_items.append(
             f'<li class="link">{render_link_cards([c])}</li>'
         )
@@ -623,7 +618,6 @@ def main():
     else:
         OUT_LINKS.write_text("<!-- no links: none extracted from replies -->", encoding="utf-8")
 
-    # If WP creds exist and a target post id was passed to the workflow, patch WP
     pid = (os.environ.get("POST_ID") or os.environ.get("WP_POST_ID") or "").strip()
     if pid and WP_BASE_URL and WP_USER and WP_APP_PASSWORD:
         try:
@@ -641,15 +635,18 @@ def main():
         except Exception as e:
             log(f"WP patch failed: {e}")
 
-if __name__ == "__main__":
-    try:
-        # Minimal CSS (scoped to replies list)
-        # NOTE: Theme supplies dark-mode; classes are neutral.
-        css = """
+# -------- scoped CSS (discussion board, dark-mode friendly) --------
+CSS_INLINE = """
 <style>
 #ss3k-replies.ss3k-replies-list{border:1px solid var(--line,#e6eaf2);border-radius:10px;overflow:hidden;background:var(--card,#fff)}
+@media(prefers-color-scheme:dark){
+  #ss3k-replies.ss3k-replies-list{border-color:rgba(255,255,255,.1);background:rgba(255,255,255,.03)}
+}
 #ss3k-replies .ss3k-reply{display:grid;grid-template-columns:50px minmax(0,1fr);gap:12px;padding:12px 12px 14px;border-bottom:1px solid var(--line,#e6eaf2)}
 #ss3k-replies .ss3k-reply:nth-child(odd){background:var(--soft,#f6f8fc)}
+@media(prefers-color-scheme:dark){
+  #ss3k-replies .ss3k-reply:nth-child(odd){background:rgba(255,255,255,.04)}
+}
 #ss3k-replies .ss3k-reply:last-child{border-bottom:none}
 #ss3k-replies .ss3k-reply.highlight{background:var(--highlight,#fef3c7)}
 #ss3k-replies .ss3k-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;background:#e5e7eb;display:flex;align-items:center;justify-content:center;font-weight:700;color:#6b7280}
@@ -669,9 +666,9 @@ if __name__ == "__main__":
 #ss3k-replies .ss3k-cardlink .card .h{font-size:.85em;color:#9aa3b2;margin-top:4px}
 </style>
 """
-        # Prepend CSS to output file (useful when piping stdout to WP in no-creds mode)
-        # We'll buffer stdout to include CSS + HTML when run standalone.
-        sys.stdout.write(css)
+
+if __name__ == "__main__":
+    try:
         main()
     except SystemExit:
         raise
