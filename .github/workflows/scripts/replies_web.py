@@ -389,106 +389,96 @@ def tstamp(tweet):
     except Exception:
         return 0
 
-def build_outputs(replies, users):
-    """Emit already-normalized tweet-like cards the frontend can use directly."""
+def build_outputs(replies, users, tweets_by_id):
     blocks = []
     for t in replies:
-        uid    = str(t.get("user_id_str") or t.get("user_id") or "")
-        u      = users.get(uid, {})
-        name   = (u.get("name") or "User")
-        handle = (u.get("screen_name") or "")
-        verified = _verified(u)
-
-        avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "")
-        avatar = avatar.replace("_normal.","_bigger.")
+        uid = str(t.get("user_id_str") or t.get("user_id") or "")
+        u = users.get(uid, {})
+        name   = u.get("name") or "User"
+        handle = u.get("screen_name") or ""
+        avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
         url    = f"https://x.com/{handle}/status/{t.get('id_str') or t.get('id')}"
         text   = t.get("full_text") or t.get("text") or ""
-        text_h = _linkify(text, t.get("entities") or {})
+        created= t.get("created_at") or ""
+        # Counts (best-effort; may be absent on some payloads)
+        replies_ct  = t.get("reply_count");  reposts_ct = t.get("retweet_count")
+        likes_ct    = t.get("favorite_count"); views_ct = (t.get("ext_views") or t.get("view_count"))
+        bookmarks_ct= t.get("bookmark_count")
 
-        ts_iso = _iso(t.get("created_at",""))
-        when   = _fmt_when(ts_iso)
+        # Quoted tweet payload (if present)
+        quote_json = ""
+        if t.get("is_quote_status"):
+            qid = str(t.get("quoted_status_id_str") or t.get("quoted_status_id") or "")
+            q   = tweets_by_id.get(qid) or (t.get("quoted_status") or {})
+            if q:
+                quser_id = str(q.get("user_id_str") or q.get("user_id") or "")
+                qu       = users.get(quser_id, {})
+                qhandle  = qu.get("screen_name") or ""
+                qname    = qu.get("name") or ""
+                qurl     = f"https://x.com/{qhandle}/status/{q.get('id_str') or q.get('id')}" if qhandle else ""
+                quote = {
+                    "text": q.get("full_text") or q.get("text") or "",
+                    "url":  qurl,
+                    "name": qname,
+                    "handle": qhandle,
+                    "verified": bool(qu.get("verified")),
+                    "media": _collect_media(q),
+                    "embed": _detect_embed(q),
+                    "links": _collect_links(q)
+                }
+                quote_json = html.escape(json.dumps(quote, separators=(",",":")), quote=True)
 
-        # Metrics (present on search path; convo path may omit)
-        m_replies   = _int_or_none(t.get("reply_count"))
-        m_reposts   = _int_or_none(t.get("retweet_count"))
-        m_likes     = _int_or_none(t.get("favorite_count"))
-        m_bookmarks = _int_or_none(t.get("bookmark_count"))
-        m_views     = _extract_views(t)
+        # Media/Embed for THIS reply
+        media_list = _collect_media(t)
+        embed_url  = _detect_embed(t)
 
-        # data-* attributes for the frontend JS to read (and for audio sync)
-        attrs = {
-            "class": "ss3k-reply",
-            "data-name": name,
-            "data-handle": f"@{handle}" if handle else "",
-            "data-verified": "true" if verified else "",
-            "data-url": url,
-            "data-ts": ts_iso,
-            "data-replies": str(m_replies) if m_replies is not None else "",
-            "data-reposts": str(m_reposts) if m_reposts is not None else "",
-            "data-likes": str(m_likes) if m_likes is not None else "",
-            "data-bookmarks": str(m_bookmarks) if m_bookmarks is not None else "",
-            "data-views": str(m_views) if m_views is not None else "",
+        # Attribute pack
+        attr = {
+          "class": "ss3k-reply",
+          "data-handle": "@"+handle if handle else "",
+          "data-name": name,
+          "data-verified": "true" if u.get("verified") else "false",
+          "data-url": url,
+          "data-ts": created,
+          "data-replies": str(replies_ct or ""),
+          "data-reposts": str(reposts_ct or ""),
+          "data-likes": str(likes_ct or ""),
+          "data-views": str(views_ct or ""),
+          "data-bookmarks": str(bookmarks_ct or ""),
+          "data-media": html.escape(json.dumps(media_list, separators=(",",":")), quote=True) if media_list else "",
+          "data-embed": embed_url or "",
+          "data-quote": quote_json
         }
-        attr_s = " ".join(f'{k}="{html.escape(v)}"' for k,v in attrs.items() if v not in (None,""))
+        attr_s = " ".join(f'{k}="{v}"' for k,v in attr.items() if v)
 
-        # Build inner tweet-like card (avatar, head, body, metrics, bottom-right time link)
-        if avatar:
-            av = f'<div class="avatar-50"><img src="{html.escape(avatar)}" alt=""></div>'
-        else:
-            av = '<div class="avatar-50"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#90a0b7;font-weight:700;">?</div></div>'
-
-        head = (
-            f'<div class="head">'
-            f'  <span class="disp">{html.escape(name)}</span>'
-            f'  <span class="handle"> @{html.escape(handle or "user")}</span>'
-            f'  {"<span class=\"badge\">" + _svg("check") + "</span>" if verified else ""}'
-            f'</div>'
-        )
-
-        body = f'<div class="body">{text_h}</div>'
-
-        # Metrics bar (only include present metrics)
-        metrics_html = []
-        if m_replies is not None:   metrics_html.append(f'<span class="metric">{_svg("reply")}<span>{_fmt_metric(m_replies)}</span></span>')
-        if m_reposts is not None:   metrics_html.append(f'<span class="metric">{_svg("repost")}<span>{_fmt_metric(m_reposts)}</span></span>')
-        if m_likes   is not None:   metrics_html.append(f'<span class="metric">{_svg("like")}<span>{_fmt_metric(m_likes)}</span></span>')
-        if m_bookmarks is not None: metrics_html.append(f'<span class="metric">{_svg("bookmark")}<span>{_fmt_metric(m_bookmarks)}</span></span>')
-        if m_views   is not None:   metrics_html.append(f'<span class="metric">{_svg("views")}<span>{_fmt_metric(m_views)}</span></span>')
-        bar = f'<div class="tweetbar">{"".join(metrics_html)}</div>' if metrics_html else ""
-
-        linkx = ""
-        if url:
-            linkx = f'<span class="linkx"><a href="{html.escape(url)}" target="_blank" rel="noopener">{html.escape(when or "Open on X")}</a></span>'
+        # Minimal inner HTML; frontend hydrates bars/cards
+        text_html = html.escape(text).replace("\n", "<br>")
+        avatar_tag = f'<div class="avatar-50"><img src="{html.escape(avatar)}" alt=""></div>' if avatar else '<div class="avatar-50"></div>'
+        who = html.escape(name) + (f' <span class="handle">@{html.escape(handle)}</span>' if handle else '')
 
         blocks.append(
-            f'<div {attr_s}>'
-            f'  {av}'
-            f'  <div>'
-            f'    {head}'
-            f'    {body}'
-            f'    {bar}'
-            f'    {linkx}'
-            f'  </div>'
-            f'</div>'
+          f'<div {attr_s}>'
+          f'{avatar_tag}'
+          f'<div><div class="head"><span class="disp">{who}</span></div>'
+          f'<div class="body">{text_html}</div>'
+          f'</div></div>'
         )
 
-    open(OUT_REPLIES, "w", encoding="utf-8").write("\n".join(blocks))
+    open(OUT_REPLIES,"w", encoding="utf-8").write("\n".join(blocks))
     log(f"Wrote replies HTML: {OUT_REPLIES} ({len(blocks)} items)")
 
-    # Links HTML grouped by domain (unchanged behavior)
+    # ---- Links HTML (unchanged) ----
+    from collections import defaultdict
     doms = defaultdict(set)
-    def add_urls_from(tw):
-        ent = tw.get("entities") or {}
-        for u in (ent.get("urls") or []):
+    def add_urls_from(t):
+        for u in ((t.get("entities") or {}).get("urls") or []):
             u2 = u.get("expanded_url") or u.get("url")
             if not u2: continue
             m = re.search(r"https?://([^/]+)/?", u2)
             dom = m.group(1) if m else "links"
             doms[dom].add(u2)
 
-    for tw in replies:
-        add_urls_from(tw)
-
+    for t in replies: add_urls_from(t)
     lines = []
     for dom in sorted(doms):
         lines.append(f"<h4>{html.escape(dom)}</h4>")
@@ -497,8 +487,7 @@ def build_outputs(replies, users):
             e = html.escape(u)
             lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
         lines.append("</ul>")
-    open(OUT_LINKS, "w", encoding="utf-8").write("\n".join(lines))
-    log(f"Wrote links HTML: {OUT_LINKS} (domains={len(doms)})")
+    open(OUT_LINKS,"w", encoding="utf-8").write("\n".join(lines))
 
 # --------- Main ----------
 def main():
