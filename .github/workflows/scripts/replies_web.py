@@ -9,7 +9,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-# ---------- ENV & paths ----------
+# ─────────────────────────────────────────────────────────────
+# ENV & paths
+# ─────────────────────────────────────────────────────────────
 ARTDIR = Path(os.environ.get("ARTDIR", "."))
 BASE   = os.environ.get("BASE", "space")
 PURPLE = (os.environ.get("PURPLE_TWEET_URL", "") or "").strip()
@@ -20,34 +22,40 @@ LOG_PATH    = ARTDIR / f"{BASE}_replies.log"
 DBG_DIR     = ARTDIR / "debug"
 DBG_PREFIX  = DBG_DIR / f"{BASE}_replies_page"
 
-# Auth (either cookie+ct0 or Bearer)
-AUTH_BEARER = (os.environ.get("TWITTER_AUTHORIZATION") or "").strip()  # "Bearer XXX"
-AUTH_COOKIE = (os.environ.get("TWITTER_AUTH_TOKEN") or "").strip()     # auth_token cookie
-CSRF        = (os.environ.get("TWITTER_CSRF_TOKEN") or "").strip()     # ct0 cookie
+# X auth: either Bearer, or cookie (auth_token + ct0)
+AUTH_BEARER = (os.environ.get("TWITTER_AUTHORIZATION") or "").strip()      # "Bearer …"
+AUTH_COOKIE = (os.environ.get("TWITTER_AUTH_TOKEN") or "").strip()         # auth_token
+CSRF        = (os.environ.get("TWITTER_CSRF_TOKEN") or "").strip()         # ct0
 
-# Optional start time to compute data-begin
-START_ISO = (os.environ.get("START_ISO") or "").strip()
+# Start time (for data-begin sync)
+START_ISO   = (os.environ.get("START_ISO") or "").strip()  # ISO8601 or epoch
+# If not set, we’ll try {ARTDIR}/{BASE}.start.txt
 
 MAX_PAGES = int(os.environ.get("REPLIES_MAX_PAGES", "40") or "40")
 SLEEP_SEC = float(os.environ.get("REPLIES_SLEEP", "0.7") or "0.7")
-SAVE_JSON = (os.environ.get("REPLIES_SAVE_JSON", "1") or "1") not in ("0", "false", "False")
+SAVE_JSON = (os.environ.get("REPLIES_SAVE_JSON", "1") or "1").lower() not in ("0","false","no")
 
-# Prefer x.com; keep both handy
-BASE_X  = "https://x.com"
-CONVO_URL  = f"{BASE_X}/i/api/2/timeline/conversation/{{tid}}.json"
-SEARCH_URL = f"{BASE_X}/i/api/2/search/adaptive.json"
+# Optional WP patch (graceful if missing)
+WP_PATCH_URL   = (os.environ.get("WP_PATCH_URL") or "").strip()     # e.g. https://chbmp.org/wp-json/ss3k/v1/patch-assets
+WP_PATCH_TOKEN = (os.environ.get("WP_PATCH_TOKEN") or "").strip()   # e.g. "Bearer xyz" or "key abc"
 
-# ---------- small utils ----------
+# X endpoints
+BASE_X    = "https://x.com"
+CONVO_URL = f"{BASE_X}/i/api/2/timeline/conversation/{{tid}}.json"
+SEARCH_URL= f"{BASE_X}/i/api/2/search/adaptive.json"
+
+# ─────────────────────────────────────────────────────────────
+# utils
+# ─────────────────────────────────────────────────────────────
 def ensure_dirs():
     ARTDIR.mkdir(parents=True, exist_ok=True)
     DBG_DIR.mkdir(parents=True, exist_ok=True)
 
-def mask_token(s: str, keep=6) -> str:
+def mask(s, keep=6):
     s = s or ""
-    if len(s) <= keep: return s
-    return s[:keep] + "…" + s[-keep:]
+    return s if len(s) <= keep else (s[:keep] + "…" + s[-keep:])
 
-def log(msg: str):
+def log(msg):
     ensure_dirs()
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     with open(LOG_PATH, "a", encoding="utf-8") as lf:
@@ -58,64 +66,58 @@ def write_empty(reason=""):
     OUT_REPLIES.write_text(f"<!-- no replies: {html.escape(reason)} -->\n", encoding="utf-8")
     OUT_LINKS.write_text(f"<!-- no links: {html.escape(reason)} -->\n", encoding="utf-8")
     log(f"Wrote empty outputs: {reason}")
+    # Print to stdout so GH Action captures something
     print(OUT_REPLIES.read_text(encoding="utf-8"))
 
-def safe_env_dump():
-    lines = [
-        f"ARTDIR={ARTDIR}", f"BASE={BASE}",
-        f"PURPLE_TWEET_URL={(PURPLE or '')}",
-        f"AUTH_BEARER={mask_token(AUTH_BEARER)}",
-        f"AUTH_COOKIE={mask_token(AUTH_COOKIE)}",
-        f"CSRF={mask_token(CSRF)}",
+def dump_env():
+    log("ENV:\n  " + "\n  ".join([
+        f"ARTDIR={ARTDIR}",
+        f"BASE={BASE}",
+        f"PURPLE_TWEET_URL={PURPLE}",
+        f"AUTH_BEARER={mask(AUTH_BEARER)}",
+        f"AUTH_COOKIE={mask(AUTH_COOKIE)}",
+        f"CSRF={mask(CSRF)}",
         f"MAX_PAGES={MAX_PAGES}",
         f"SAVE_JSON={SAVE_JSON}",
-    ]
-    log("ENV:\n  " + "\n  ".join(lines))
+    ]))
 
-def headers(screen_name, root_id):
-    ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}" if (AUTH_COOKIE and CSRF) else ""
-    hdr = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "en-US,en;q=0.9",
-        "referer": f"{BASE_X}/{screen_name}/status/{root_id}",
-        "user-agent": "Mozilla/5.0",
-        "x-twitter-active-user": "yes",
-        "x-twitter-client-language": "en",
-    }
-    if AUTH_BEARER.startswith("Bearer "):
-        hdr["authorization"] = AUTH_BEARER
-        hdr["x-twitter-auth-type"] = "OAuth2Session"
-    if ck:
-        hdr["cookie"] = ck
-        hdr["x-csrf-token"] = CSRF
-    return hdr
-
-def save_debug_blob(kind, idx, raw):
-    if not SAVE_JSON: return
-    ensure_dirs()
-    path = str(DBG_PREFIX) + f"_{kind}{idx:02d}.json"
-    try:
-        Path(path).write_text(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-        log(f"Saved debug {kind} page {idx} to {path}")
-    except Exception as e:
-        log(f"Failed to save debug {kind} page {idx}: {e}")
-
-def parse_purple(url: str):
+def parse_purple(url):
     m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", url)
-    if not m: return None, None
-    return m.group(1), m.group(2)
+    return (m.group(1), m.group(2)) if m else (None, None)
 
-def load_start_epoch() -> float | None:
+def load_start_epoch():
     if START_ISO:
         e = parse_time_any(START_ISO)
         if e: return e
     p = ARTDIR / f"{BASE}.start.txt"
     if p.exists():
-        try: return parse_time_any(p.read_text(encoding="utf-8").strip())
-        except Exception: pass
+        try:
+            return parse_time_any(p.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
     return None
 
-# ---------- HTTP with retry ----------
+# ─────────────────────────────────────────────────────────────
+# HTTP
+# ─────────────────────────────────────────────────────────────
+def headers(screen_name, root_id):
+    h = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": f"{BASE_X}/{screen_name}/status/{root_id}",
+        "user-agent": "Mozilla/5.0",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "eng",
+        "origin": BASE_X,
+    }
+    if AUTH_BEARER.startswith("Bearer "):
+        h["authorization"] = AUTH_BEARER
+        h["x-twitter-auth-type"] = "OAuth2Session"
+    if AUTH_COOKIE and CSRF:
+        h["cookie"] = f"auth_token={AUTH_COOKIE}; ct0={CSRF}"
+        h["x-csrf-token"] = CSRF
+    return h
+
 def fetch_json(url, hdrs, tag, attempt=1, backoff=2.0, timeout=30):
     try:
         req = Request(url, headers=hdrs)
@@ -128,9 +130,9 @@ def fetch_json(url, hdrs, tag, attempt=1, backoff=2.0, timeout=30):
         try: body = e.read().decode("utf-8","ignore")
         except Exception: pass
         log(f"{tag} HTTPError {e.code} url={url} body={body[:800]}")
-        if e.code in (429, 403) and attempt <= 4:
+        if e.code in (429,403) and attempt <= 4:
             sleep_for = backoff ** attempt
-            log(f"{tag} backoff {sleep_for:.1f}s and retry (attempt {attempt+1})")
+            log(f"{tag} backoff {sleep_for:.1f}s, retry {attempt+1}/4")
             time.sleep(sleep_for)
             return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
         return None, body, e
@@ -141,49 +143,61 @@ def fetch_json(url, hdrs, tag, attempt=1, backoff=2.0, timeout=30):
             return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
         return None, None, e
     except Exception as e:
-        log(f"{tag} EXC {e}")
+        log(f"{tag} EXC {e}\n{traceback.format_exc()}")
         return None, None, e
 
-# ---------- extraction helpers ----------
-def merge_objects(dst: dict, src: dict):
-    for k, v in (src or {}).items():
+def save_debug(kind, idx, raw):
+    if not SAVE_JSON: return
+    ensure_dirs()
+    path = f"{DBG_PREFIX}_{kind}{idx:02d}.json"
+    try:
+        Path(path).write_text(raw if isinstance(raw,str) else json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        log(f"Saved debug {kind} page {idx} -> {path}")
+    except Exception as e:
+        log(f"Failed to save debug {kind} page {idx}: {e}")
+
+# ─────────────────────────────────────────────────────────────
+# timeline/search collectors
+# ─────────────────────────────────────────────────────────────
+def merge(dst, src):
+    for k,v in (src or {}).items():
         dst[k] = v
 
-def extract_from_global_objects(data, agg_tweets, agg_users):
+def from_global(data, agg_tweets, agg_users):
     g = (data.get("globalObjects") or {})
-    merge_objects(agg_tweets, g.get("tweets") or {})
-    merge_objects(agg_users,  g.get("users")  or {})
+    merge(agg_tweets, g.get("tweets") or {})
+    merge(agg_users,  g.get("users")  or {})
 
-def find_bottom_cursor(data) -> str | None:
-    def rec(obj):
-        if isinstance(obj, dict):
-            if obj.get("cursorType") == "Bottom" and "value" in obj:
-                return obj["value"]
-            for v in obj.values():
+def find_bottom_cursor(data):
+    # Walk known shapes for Bottom cursor
+    def rec(x):
+        if isinstance(x, dict):
+            if x.get("cursorType") == "Bottom" and x.get("value"):
+                return x["value"]
+            for v in x.values():
                 c = rec(v)
                 if c: return c
-        elif isinstance(obj, list):
-            for v in obj:
+        elif isinstance(x, list):
+            for v in x:
                 c = rec(v)
                 if c: return c
         return None
-    # Try common instruction shapes
+
     for path in [
-        ("timeline", "instructions"),
+        ("timeline","instructions"),
         ("instructions",),
-        ("data", "threaded_conversation_with_injections_v2", "instructions"),
+        ("data","threaded_conversation_with_injections_v2","instructions"),
     ]:
         node = data
         ok = True
         for k in path:
             node = node.get(k) if isinstance(node, dict) else None
-            if node is None: ok = False; break
+            if node is None: ok=False; break
         if ok:
             c = rec(node)
             if c: return c
     return None
 
-# ---------- collectors ----------
 def collect_conversation(screen_name, root_id):
     tweets, users = {}, {}
     cursor, pages = None, 0
@@ -192,64 +206,71 @@ def collect_conversation(screen_name, root_id):
         params = {"count": 100, "tweet_mode": "extended"}
         if cursor: params["cursor"] = cursor
         url = CONVO_URL.format(tid=root_id) + "?" + urlencode(params)
-        log(f"[CONVO] Fetch page {pages} cursor={cursor!r}")
+        log(f"[CONVO] page {pages} cursor={cursor!r}")
         data, raw, err = fetch_json(url, headers(screen_name, root_id), "[CONVO]")
-        if raw is not None: save_debug_blob("convo", pages, raw)
-        if not data:
-            log(f"[CONVO] No data on page {pages}.")
-            break
-        extract_from_global_objects(data, tweets, users)
+        if raw is not None: save_debug("convo", pages, raw)
+        if not data: break
+        from_global(data, tweets, users)
         nxt = find_bottom_cursor(data)
-        if not nxt:
-            log(f"[CONVO] No Bottom cursor; stop after {pages}")
+        if not nxt or nxt == cursor:
+            log("[CONVO] end (no Bottom cursor)")
             break
         cursor = nxt
         time.sleep(SLEEP_SEC)
+    log(f"[CONVO] collected tweets={len(tweets)} users={len(users)}")
     return tweets, users
 
 def collect_search(screen_name, root_id):
     tweets, users = {}, {}
     cursor, pages = None, 0
-    q = f"conversation_id:{root_id}"
     while pages < MAX_PAGES:
         pages += 1
-        params = {"q": q, "count": 100, "tweet_mode": "extended"}
+        params = {
+            "q": f"conversation_id:{root_id}",
+            "count": 100,
+            "tweet_search_mode": "live",
+            "query_source": "typed_query",
+            "tweet_mode": "extended",
+            "include_quote_count": "true",
+            "include_reply_count": "true",
+        }
         if cursor: params["cursor"] = cursor
         url = SEARCH_URL + "?" + urlencode(params)
-        log(f"[SEARCH] Fetch page {pages} cursor={cursor!r}")
+        log(f"[SEARCH] page {pages} cursor={cursor!r}")
         data, raw, err = fetch_json(url, headers(screen_name, root_id), "[SEARCH]")
-        if raw is not None: save_debug_blob("search", pages, raw)
-        if not data:
-            log(f"[SEARCH] No data on page {pages}.")
-            break
-        extract_from_global_objects(data, tweets, users)
+        if raw is not None: save_debug("search", pages, raw)
+        if not data: break
+        from_global(data, tweets, users)
         nxt = find_bottom_cursor(data)
-        if not nxt:
-            log(f"[SEARCH] No Bottom cursor; stop after {pages}")
+        if not nxt or nxt == cursor:
+            log("[SEARCH] end (no Bottom cursor)")
             break
         cursor = nxt
         time.sleep(SLEEP_SEC)
+    log(f"[SEARCH] collected tweets={len(tweets)} users={len(users)}")
     return tweets, users
 
-# ---------- formatting helpers ----------
+# ─────────────────────────────────────────────────────────────
+# normalization & formatting
+# ─────────────────────────────────────────────────────────────
 EMOJI_RE = re.compile("[" +
-    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
-    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
-    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF" "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" "\U0001FA00-\U0001FAFF"
+    "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
 ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
-def is_emoji_only(s: str) -> bool:
+def is_emoji_only(s):
     if not s or not s.strip(): return False
     t = ONLY_PUNCT_SPACE.sub("", s)
     t = EMOJI_RE.sub("", t)
     return len(t.strip()) == 0
 
-def esc(s: str) -> str:
-    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def human_k(n) -> str:
+def human_k(n):
     try: v = int(n or 0)
-    except Exception: v = 0
+    except: v = 0
     if v < 1000: return str(v)
     if v < 10000: return f"{v/1000:.1f}K".rstrip("0").rstrip(".") + "K"
     if v < 1_000_000: return f"{v//1000}K"
@@ -259,13 +280,13 @@ def human_k(n) -> str:
 def parse_epoch_maybe(x):
     if x is None: return None
     try: v = float(x)
-    except Exception: return None
+    except: return None
     if v > 1e12: v /= 1000.0
     return v
 
-def parse_time_any(created_at) -> float | None:
-    if created_at is None: return None
-    s = str(created_at).strip()
+def parse_time_any(s):
+    if s is None: return None
+    s = str(s).strip()
     if re.fullmatch(r"\d{10,13}", s): return parse_epoch_maybe(s)
     try:
         if s.endswith("Z"): dt = datetime.fromisoformat(s.replace("Z","+00:00"))
@@ -278,27 +299,28 @@ def parse_time_any(created_at) -> float | None:
             if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).timestamp()
     except Exception:
-        pass
-    try:
-        return datetime.strptime(s, "%a, %d %b %Y %H:%M:%S %z").timestamp()
-    except Exception:
-        return None
+        try:
+            return datetime.strptime(s, "%a, %d %b %Y %H:%M:%S %z").timestamp()
+        except Exception:
+            return None
 
-def fmt_local_ts(epoch: float | None):
-    if not epoch: return ("", "")
+def fmt_local_ts(epoch):
+    if not epoch: return ("","")
     dt = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
-    disp = dt.strftime("%Y-%m-%d %H:%M UTC")
-    return disp, dt.isoformat().replace("+00:00", "Z")
+    # Display as UTC (stable), WP/page can localize if desired
+    return dt.strftime("%Y-%m-%d %H:%M UTC"), dt.isoformat().replace("+00:00","Z")
 
-TCO_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
 STATUS_RE = re.compile(r"https?://(?:x|twitter)\.com/[^/]+/status/\d+")
 
-def expand_tco(text: str, entities: dict):
+def expand_tco(text, entities):
+    """Expand t.co; collect content card data; strip media placeholders."""
     s = text or ""
     links, removed_media_urls = [], []
+
     for m in (entities.get("media") or []):
-        u = (m.get("url") or m.get("expanded_url"))
-        if u: removed_media_urls.append(u)
+        mu = (m.get("url") or m.get("expanded_url"))
+        if mu: removed_media_urls.append(mu)
+
     repls = []
     for u in (entities.get("urls") or []):
         tco = u.get("url") or ""
@@ -308,20 +330,26 @@ def expand_tco(text: str, entities: dict):
             start, end = int(u["indices"][0]), int(u["indices"][1])
         expanded = (u.get("unwound_url") or u.get("expanded_url") or u.get("display_url") or tco)
         links.append({
-            "url": expanded, "title": u.get("title") or u.get("unwound_title"),
+            "url": expanded,
+            "title": u.get("title") or u.get("unwound_title"),
             "description": u.get("description") or u.get("unwound_description"),
             "images": u.get("images") or []
         })
-        if start is not None: repls.append((start, end, expanded))
+        if start is not None:
+            repls.append((start, end, expanded))
+
     if repls:
         repls.sort(key=lambda x: x[0], reverse=True)
         for st, en, rep in repls:
-            if 0 <= st < en <= len(s): s = s[:st] + rep + s[en:]
-    for mu in removed_media_urls: s = s.replace(mu, "")
+            if 0 <= st < en <= len(s):
+                s = s[:st] + rep + s[en:]
+
+    for mu in removed_media_urls:
+        s = s.replace(mu, "")
     s = re.sub(r"\s+", " ", s).strip()
     return s, links
 
-def collect_inline_media(extended_entities: dict):
+def collect_inline_media(extended_entities):
     out = []
     if not isinstance(extended_entities, dict): return out
     for m in (extended_entities.get("media") or []):
@@ -340,16 +368,16 @@ def collect_inline_media(extended_entities: dict):
     return out
 
 def make_status_url(handle, tid):
-    h = (handle or "").lstrip("@"); i = (tid or "").strip()
-    if not h or not i: return None
-    return f"https://x.com/{h}/status/{i}"
+    h = (handle or "").lstrip("@")
+    i = (tid or "").strip()
+    return f"https://x.com/{h}/status/{i}" if (h and i) else None
 
-def normalize(tweet_obj: dict, user_map: dict):
+def normalize(tweet_obj, user_map):
     if not isinstance(tweet_obj, dict): return None
-    tid   = str(tweet_obj.get("id_str") or tweet_obj.get("id") or "")
+    tid = str(tweet_obj.get("id_str") or tweet_obj.get("id") or "")
     if not tid: return None
-    full  = tweet_obj.get("full_text") or tweet_obj.get("text") or ""
-    if not full.strip() or is_emoji_only(full): return None
+    full = tweet_obj.get("full_text") or tweet_obj.get("text") or ""
+    if not full.strip() or is_emoji_only(full): return None  # ignore pure emoji/VTT-like entries
 
     uid   = str(tweet_obj.get("user_id_str") or tweet_obj.get("user_id") or "")
     u     = user_map.get(uid, {}) if uid else {}
@@ -358,21 +386,19 @@ def normalize(tweet_obj: dict, user_map: dict):
     avatar= (u.get("profile_image_url_https") or u.get("profile_image_url") or "")
     if avatar: avatar = avatar.replace("_normal.", "_bigger.")
 
-    created= (tweet_obj.get("created_at") or tweet_obj.get("timestamp_ms"))
-    epoch  = parse_time_any(created)
+    created = (tweet_obj.get("created_at") or tweet_obj.get("timestamp_ms"))
+    epoch   = parse_time_any(created)
 
-    leg    = tweet_obj
-    ents   = leg.get("entities") or {}
-    exts   = leg.get("extended_entities") or {}
+    ents    = tweet_obj.get("entities") or {}
+    exts    = tweet_obj.get("extended_entities") or {}
     text_exp, link_cards = expand_tco(full, ents)
     media_items          = collect_inline_media(exts)
 
-    pm = {
-        "favorite_count": tweet_obj.get("favorite_count"),
-        "retweet_count":  tweet_obj.get("retweet_count") or tweet_obj.get("repost_count"),
-        "reply_count":    tweet_obj.get("reply_count"),
-        "quote_count":    tweet_obj.get("quote_count"),
-    }
+    # metrics (v1 style)
+    like_count   = int(tweet_obj.get("favorite_count") or 0)
+    retweet_count= int(tweet_obj.get("retweet_count") or tweet_obj.get("repost_count") or 0)
+    reply_count  = int(tweet_obj.get("reply_count") or 0)
+    quote_count  = int(tweet_obj.get("quote_count") or 0)
 
     quote_url = None
     m = STATUS_RE.search(text_exp)
@@ -387,10 +413,10 @@ def normalize(tweet_obj: dict, user_map: dict):
         "text": text_exp,
         "created_raw": created,
         "created_epoch": epoch,
-        "like_count": int(pm.get("favorite_count") or 0),
-        "retweet_count": int(pm.get("retweet_count") or 0),
-        "reply_count": int(pm.get("reply_count") or 0),
-        "quote_count": int(pm.get("quote_count") or 0),
+        "like_count": like_count,
+        "retweet_count": retweet_count,
+        "reply_count": reply_count,
+        "quote_count": quote_count,
         "status_url": make_status_url(handle, tid),
         "link_cards": link_cards,
         "media": media_items,
@@ -399,7 +425,41 @@ def normalize(tweet_obj: dict, user_map: dict):
         "quote_url": quote_url,
     }
 
-# ---------- HTML builders ----------
+# ─────────────────────────────────────────────────────────────
+# HTML builders
+# ─────────────────────────────────────────────────────────────
+CSS = """
+<style>
+#ss3k-replies.ss3k-replies-list{border:1px solid var(--line,#e6eaf2);border-radius:10px;overflow:hidden;background:var(--card,#fff)}
+@media(prefers-color-scheme:dark){
+  #ss3k-replies.ss3k-replies-list{border-color:rgba(255,255,255,.1);background:rgba(255,255,255,.03)}
+}
+#ss3k-replies .ss3k-reply{display:grid;grid-template-columns:50px minmax(0,1fr);gap:12px;padding:12px 12px 14px;border-bottom:1px solid var(--line,#e6eaf2);position:relative}
+#ss3k-replies .ss3k-reply:nth-child(odd){background:var(--soft,#f6f8fc)}
+@media(prefers-color-scheme:dark){
+  #ss3k-replies .ss3k-reply:nth-child(odd){background:rgba(255,255,255,.04)}
+}
+#ss3k-replies .ss3k-reply:last-child{border-bottom:none}
+#ss3k-replies .ss3k-reply.highlight{background:var(--highlight,#fef3c7)}
+#ss3k-replies .ss3k-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;background:#e5e7eb;display:flex;align-items:center;justify-content:center;font-weight:700;color:#6b7280}
+#ss3k-replies .ss3k-avatar img{width:100%;height:100%;object-fit:cover;display:block}
+#ss3k-replies .body .head{font-weight:700;display:flex;gap:.5ch;align-items:baseline}
+#ss3k-replies .body .hn{color:#6b7280;font-weight:500}
+#ss3k-replies .body .tx{margin:.25rem 0 .4rem;line-height:1.45;word-wrap:anywhere}
+#ss3k-replies figure.m{margin:.25rem 0}
+#ss3k-replies figure.m img, #ss3k-replies figure.m video{max-width:100%;height:auto;border-radius:10px;border:1px solid var(--line,#e6eaf2)}
+#ss3k-replies .meta{display:flex;align-items:center;justify-content:space-between;font-size:.9em;color:#6b7280;margin-top:.35rem}
+#ss3k-replies .stats span{margin-left:.8ch}
+#ss3k-replies .date a{color:#1d9bf0;text-decoration:none}
+#ss3k-replies .ss3k-cardlink{display:block;text-decoration:none;color:inherit;margin:.35rem 0}
+#ss3k-replies .ss3k-cardlink .card{display:grid;grid-template-columns:96px minmax(0,1fr);gap:10px;border:1px solid var(--line,#e6eaf2);border-radius:10px;padding:8px;background:var(--card,#fff)}
+#ss3k-replies .ss3k-cardlink .card img{width:96px;height:72px;object-fit:cover;border-radius:8px}
+#ss3k-replies .ss3k-cardlink .card .t{font-weight:700;margin-bottom:2px}
+#ss3k-replies .ss3k-cardlink .card .d{font-size:.9em;color:#6b7280}
+#ss3k-replies .ss3k-cardlink .card .h{font-size:.85em;color:#9aa3b2;margin-top:4px}
+</style>
+"""
+
 def render_link_cards(cards):
     parts, seen = [], set()
     for c in cards or []:
@@ -408,7 +468,7 @@ def render_link_cards(cards):
         seen.add(u)
         title = c.get("title") or ""
         desc  = c.get("description") or ""
-        dom = ""
+        dom   = ""
         try: dom = re.sub(r"^https?://(www\.)?([^/]+).*$", r"\2", u, flags=re.I)
         except Exception: pass
         img = None
@@ -418,10 +478,10 @@ def render_link_cards(cards):
         parts.append(
             f'<a class="ss3k-cardlink" href="{esc(u)}" target="_blank" rel="noopener">'
             f'  <div class="card">'
-            f'    {"<img src=\"%s\" alt=\"\">" % esc(img) if img else ""}'
+            f'    {"<img src=\\"%s\\" alt=\\"\\"/>" % esc(img) if img else ""}'
             f'    <div class="meta">'
             f'      <div class="t">{esc(title) if title else esc(dom or u)}</div>'
-            f'      {("<div class=\"d\">%s</div>" % esc(desc)) if desc else ""}'
+            f'      {("<div class=\\"d\\">%s</div>" % esc(desc)) if desc else ""}'
             f'      <div class="h">{esc(dom or "")}</div>'
             f'    </div>'
             f'  </div>'
@@ -440,7 +500,7 @@ def render_media(ms):
                 f'<source src="{esc(m["src"])}" type="video/mp4"></video></figure>')
     return "".join(out)
 
-def render_reply_item(it, start_epoch):
+def render_reply(it, start_epoch):
     disp, iso = fmt_local_ts(it.get("created_epoch"))
     data_begin = ""
     if start_epoch and it.get("created_epoch"):
@@ -451,7 +511,7 @@ def render_reply_item(it, start_epoch):
         f'<span title="Replies">💬 {human_k(it.get("reply_count"))}</span>'
         f' <span title="Reposts">🔁 {human_k(it.get("retweet_count"))}</span>'
         f' <span title="Likes">❤️ {human_k(it.get("like_count"))}</span>'
-        f'{(" <span title=\\"Quotes\\">🔗 " + human_k(it.get("quote_count")) + "</span>") if (it.get("quote_count") or 0)>0 else ""}'
+        f'{(" <span title=\\"Quotes\\">🔗 " + human_k(it.get("quote_count")) + "</span>") if (it.get("quote_count") or 0) > 0 else ""}'
         f'</div>'
     )
     quote = ""
@@ -467,6 +527,7 @@ def render_reply_item(it, start_epoch):
     handle = it.get("handle") or ""
     name   = it.get("name") or "User"
     status = it.get("status_url") or ""
+
     avatar_html = (
         f'<div class="ss3k-avatar">'
         f'  {("<img src=\\"%s\\" alt=\\"\\"/>" % esc(avatar)) if avatar else ("<span>" + esc((handle or "U")[:1].upper()) + "</span>")}'
@@ -480,7 +541,7 @@ def render_reply_item(it, start_epoch):
         f'  {render_link_cards(it.get("link_cards") or [])}'
         f'  {quote}'
         f'  <div class="meta">'
-        f'    <span class="when">{("<a href=\\"%s\\" target=\\"_blank\\" rel=\\"noopener\\">%s</a>" % (esc(status), esc(disp))) if status and disp else esc(disp)}</span>'
+        f'    <span class="date">{("<a href=\\"%s\\" target=\\"_blank\\" rel=\\"noopener\\">%s</a>" % (esc(status), esc(disp))) if status and disp else esc(disp)}</span>'
         f'    {stats}'
         f'  </div>'
         f'</div>'
@@ -491,46 +552,17 @@ def render_reply_item(it, start_epoch):
         f'{avatar_html}{body}</div>'
     )
 
-CSS_INLINE = """
-<style>
-#ss3k-replies.ss3k-replies-list{border:1px solid var(--line,#e6eaf2);border-radius:10px;overflow:hidden;background:var(--card,#fff)}
-@media(prefers-color-scheme:dark){
-  #ss3k-replies.ss3k-replies-list{border-color:rgba(255,255,255,.1);background:rgba(255,255,255,.03)}
-}
-#ss3k-replies .ss3k-reply{display:grid;grid-template-columns:50px minmax(0,1fr);gap:12px;padding:12px 12px 14px;border-bottom:1px solid var(--line,#e6eaf2)}
-#ss3k-replies .ss3k-reply:nth-child(odd){background:var(--soft,#f6f8fc)}
-@media(prefers-color-scheme:dark){
-  #ss3k-replies .ss3k-reply:nth-child(odd){background:rgba(255,255,255,.04)}
-}
-#ss3k-replies .ss3k-reply:last-child{border-bottom:none}
-#ss3k-replies .ss3k-reply.highlight{background:var(--highlight,#fef3c7)}
-#ss3k-replies .ss3k-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;background:#e5e7eb;display:flex;align-items:center;justify-content:center;font-weight:700;color:#6b7280}
-#ss3k-replies .ss3k-avatar img{width:100%;height:100%;object-fit:cover;display:block}
-#ss3k-replies .body .head{font-weight:700;display:flex;gap:.5ch;align-items:baseline}
-#ss3k-replies .body .hn{color:#6b7280;font-weight:500}
-#ss3k-replies .body .tx{margin:.25rem 0 .4rem;line-height:1.45;word-wrap:anywhere}
-#ss3k-replies figure.m{margin:.25rem 0}
-#ss3k-replies figure.m img, #ss3k-replies figure.m video{max-width:100%;height:auto;border-radius:10px;border:1px solid var(--line,#e6eaf2)}
-#ss3k-replies .meta{display:flex;align-items:center;justify-content:space-between;font-size:.9em;color:#6b7280;margin-top:.35rem}
-#ss3k-replies .stats span{margin-left:.8ch}
-#ss3k-replies .ss3k-cardlink{display:block;text-decoration:none;color:inherit;margin:.35rem 0}
-#ss3k-replies .ss3k-cardlink .card{display:grid;grid-template-columns:96px minmax(0,1fr);gap:10px;border:1px solid var(--line,#e6eaf2);border-radius:10px;padding:8px;background:var(--card,#fff)}
-#ss3k-replies .ss3k-cardlink .card img{width:96px;height:72px;object-fit:cover;border-radius:8px}
-#ss3k-replies .ss3k-cardlink .card .t{font-weight:700;margin-bottom:2px}
-#ss3k-replies .ss3k-cardlink .card .d{font-size:.9em;color:#6b7280}
-#ss3k-replies .ss3k-cardlink .card .h{font-size:.85em;color:#9aa3b2;margin-top:4px}
-</style>
-"""
-
-# ---------- build+write ----------
+# ─────────────────────────────────────────────────────────────
+# build & write
+# ─────────────────────────────────────────────────────────────
 def build_outputs(replies, users):
     start_epoch = load_start_epoch()
-    rows = [render_reply_item(r, start_epoch) for r in replies]
-    replies_html = CSS_INLINE + '<section class="ss3k-replies-list" id="ss3k-replies">\n' + "\n".join(rows) + "\n</section>\n"
-    OUT_REPLIES.write_text(replies_html, encoding="utf-8")
-    print(replies_html)
+    rows = [render_reply(r, start_epoch) for r in replies]
+    html_out = CSS + '<section class="ss3k-replies-list" id="ss3k-replies">\n' + "\n".join(rows) + "\n</section>\n"
+    OUT_REPLIES.write_text(html_out, encoding="utf-8")
+    print(html_out)  # stdout is useful for the workflow step
 
-    # links rollup
+    # links roll-up (unique)
     link_cards_flat = []
     for r in replies:
         for c in (r.get("link_cards") or []):
@@ -544,10 +576,34 @@ def build_outputs(replies, users):
         items.append(f'<li class="link">{render_link_cards([c])}</li>')
     OUT_LINKS.write_text('<ul class="ss3k-links">\n' + "\n".join(items) + "\n</ul>\n" if items else "<!-- no links -->", encoding="utf-8")
 
+    # Optional WP patch
+    if WP_PATCH_URL and (WP_PATCH_TOKEN or os.environ.get("WP_AUTH")):
+        try:
+            body = json.dumps({
+                "base": BASE,
+                "replies_html": html_out,
+                "links_html": OUT_LINKS.read_text(encoding="utf-8"),
+            }).encode("utf-8")
+            h = {"content-type":"application/json"}
+            tok = WP_PATCH_TOKEN or os.environ.get("WP_AUTH")
+            if tok:
+                if tok.lower().startswith("bearer "):
+                    h["authorization"] = tok
+                else:
+                    h["x-api-key"] = tok
+            req = Request(WP_PATCH_URL, data=body, headers=h, method="POST")
+            with urlopen(req, timeout=30) as r:
+                log(f"WP PATCH status={r.status}")
+        except Exception as e:
+            log(f"WP PATCH error: {e}")
+
+# ─────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────
 def main():
     try:
         ensure_dirs()
-        safe_env_dump()
+        dump_env()
 
         if not PURPLE:
             write_empty("No PURPLE_TWEET_URL provided")
@@ -561,11 +617,11 @@ def main():
             write_empty("Missing credentials: need TWITTER_AUTHORIZATION or TWITTER_AUTH_TOKEN+TWITTER_CSRF_TOKEN")
             return
 
-        # Collect
+        # Collect from X
         tw_convo, users_convo = collect_conversation(screen_name, root_id)
         tw_search, users_search = ({}, {})
         if not tw_convo:
-            log("Conversation endpoint empty; trying search fallback…")
+            log("Conversation empty; trying search fallback…")
             tw_search, users_search = collect_search(screen_name, root_id)
 
         tweets = {**tw_convo, **tw_search}
@@ -573,6 +629,7 @@ def main():
         log(f"Collected tweets={len(tweets)} users={len(users)}")
 
         if not tweets:
+            # Show friendly link instead of empty
             OUT_REPLIES.write_text(
                 f'<div class="ss3k-replies"><p><a href="{html.escape(PURPLE)}" target="_blank" rel="noopener">Open conversation on X</a></p></div>',
                 encoding="utf-8"
@@ -581,26 +638,30 @@ def main():
             print(OUT_REPLIES.read_text(encoding="utf-8"))
             return
 
-        # Normalize, dedupe, filter out the root and empty/emoji rows
+        # Normalize, filter to conversation, skip root & pure RTs & emoji-only
         norm = []
-        for tid, tobj in tweets.items():
-            if str(tid) == str(root_id):  # skip the root
+        for tid, t in tweets.items():
+            if str(t.get("id_str") or t.get("id")) == str(root_id):
                 continue
-            n = normalize(tobj, users)
+            if t.get("retweeted_status_id") or t.get("retweeted_status_id_str"):
+                continue
+            if str(t.get("conversation_id_str") or t.get("conversation_id") or "") != str(root_id):
+                # Some endpoints don’t fill conversation_id; still render if it’s a reply to the root chain
+                pass
+            n = normalize(t, users)
             if n: norm.append(n)
 
-        # de-dupe by id, prefer latest metrics if seen twice
+        # Deduplicate, sort by time/id
         uniq = {}
-        for n in norm:
-            uniq[n["id"]] = n
+        for n in norm: uniq[n["id"]] = n
         replies = list(uniq.values())
         replies.sort(key=lambda x: (x.get("created_epoch") or 0, x.get("id") or ""))
 
-        log(f"Total replies after normalize: {len(replies)}")
+        log(f"Total normalized replies: {len(replies)}")
         build_outputs(replies, users)
 
         if not replies:
-            log("No replies found; wrote empty structures with headers.")
+            log("No replies found after normalization; wrote empty structures with headers.")
     except Exception as e:
         log(f"FATAL: {e}\n{traceback.format_exc()}")
         write_empty(f"fatal error: {e}")
