@@ -1,393 +1,297 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Build WEBVTT (speech + emoji) and an interactive transcript HTML.
-- Emoji are REMOVED from transcript/speech VTT.
-- Emoji VTT cues contain JSON with time+avatar+emoji+handle for perfect sync.
-"""
+# Builds 3 artifacts from a Space CC JSONL:
+#  1) BASE.vtt               (spoken text only; emoji stripped)
+#  2) BASE_emoji.vtt         (emoji-only cues; JSON payload per cue with name/avatar/handle-or-id)
+#  3) BASE_transcript.html   (clean transcript markup; no timestamps; no emoji)
+#
+# Inputs (env):
+#   ARTDIR        - output dir
+#   BASE          - base filename (without extension)
+#   CC_JSONL      - path to crawler-generated CC JSONL
+#   SHIFT_SECS    - head trim/shift seconds to align with AUDIO_IN (float, optional)
+#
+# Behavior when no captions exist: creates a minimal transcript with a "No captions" note
+# and still emits BASE_emoji.vtt (if any reactions exist).
 
-import os, sys, re, json, html, unicodedata, math
-from datetime import datetime, timezone
-from statistics import median
-from typing import Any, Dict, List, Optional
+import os, sys, json, re, html
+from pathlib import Path
+from datetime import datetime
 
-ARTDIR = (os.environ.get("ARTDIR") or ".").strip()
-BASE   = (os.environ.get("BASE") or "space").strip()
-SRC    = (os.environ.get("CC_JSONL") or "").strip()
-
-SHIFT  = float((os.environ.get("SHIFT_SECS") or "0").strip() or "0")
-TRIM   = float((os.environ.get("TRIM_LEAD")  or "0").strip() or "0")
+ARTDIR = Path(os.environ.get("ARTDIR","."))
+BASE   = os.environ.get("BASE","space")
+CC     = os.environ.get("CC_JSONL","")
+SHIFT  = float(os.environ.get("SHIFT_SECS","0") or "0")
+TRIM   = float(os.environ.get("TRIM_LEAD","0") or "0")
 TOTAL_SHIFT = SHIFT + TRIM
 
-os.makedirs(ARTDIR, exist_ok=True)
+OUT_VTT        = ARTDIR / f"{BASE}.vtt"
+OUT_EMOJI_VTT  = ARTDIR / f"{BASE}_emoji.vtt"
+OUT_HTML       = ARTDIR / f"{BASE}_transcript.html"
+OUT_SPEECH_JSON = ARTDIR / f"{BASE}_speech.json"
+OUT_REACT_JSON  = ARTDIR / f"{BASE}_reactions.json"
 
-VTT_PATH         = os.path.join(ARTDIR, f"{BASE}.vtt")
-EVTT_PATH        = os.path.join(ARTDIR, f"{BASE}_emoji.vtt")
-TRANSCRIPT_PATH  = os.path.join(ARTDIR, f"{BASE}_transcript.html")
-START_PATH       = os.path.join(ARTDIR, f"{BASE}.start.txt")
-SPEECH_JSON_PATH = os.path.join(ARTDIR, f"{BASE}_speech.json")
-REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
-META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
+ARTDIR.mkdir(parents=True, exist_ok=True)
 
-def esc(s: str) -> str:
-    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001F5FF"  # symbols & pictographs
+    r"\U0001F600-\U0001F64F"   # emoticons
+    r"\U0001F680-\U0001F6FF"   # transport & map symbols
+    r"\U0001F700-\U0001F77F"   # alchemical symbols
+    r"\U0001F780-\U0001F7FF"   # geometric shapes extended
+    r"\U0001F800-\U0001F8FF"   # supplemental arrows-C
+    r"\U0001F900-\U0001F9FF"   # supplemental symbols and pictographs
+    r"\U0001FA00-\U0001FA6F"   # chess symbols etc
+    r"\U0001FA70-\U0001FAFF"   # symbols & pictographs extended-A
+    r"\U00002700-\U000027BF"   # dingbats
+    r"\U00002600-\U000026FF"   # miscellaneous symbols
+    r"\U00002B00-\U00002BFF"   # misc symbols & arrows
+    r"]+", flags=re.UNICODE
+)
 
-def nfc(s: str) -> str:
-    if not s: return ""
-    s = unicodedata.normalize("NFC", s)
-    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
+def strip_emojis(s: str) -> str:
+    return EMOJI_RE.sub("", s or "")
 
-def fmt_ts(t: float) -> str:
-    if t < 0: t = 0.0
-    ms = int(round((t - math.floor(t)) * 1000))
-    s  = int(math.floor(t))
-    h, rem = divmod(s, 3600)
-    m, ss  = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{ss:02d}.{ms:03d}"
+def only_emoji(s: str) -> bool:
+    if not s: return False
+    # Remove variation selectors / ZWJ / skin-tone modifiers
+    t = re.sub(r"[\u200d\ufe0f\U0001F3FB-\U0001F3FF]", "", s)
+    return strip_emojis(t) == ""
 
-def parse_time_iso(s: Optional[str]) -> Optional[float]:
-    if not s: return None
-    s = s.strip()
+def ts_norm(x):
     try:
-        if s.endswith("Z"): s = s[:-1] + "+00:00"
-        if re.search(r"[+-]\d{4}$", s):
-            s = s[:-5] + s[-5:-3] + ":" + s[-3:]
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
+        v = float(x)
+        v = max(0.0, v - TOTAL_SHIFT)
+        return v
     except Exception:
         return None
 
-def to_secs(x: Any) -> Optional[float]:
-    if x in (None, ""): return None
-    try: v = float(x)
-    except Exception: return None
-    if v >= 1e12: v /= 1000.0
-    return v
-
-def first(*vals):
-    for v in vals:
-        if v not in (None, ""): return v
-    return None
-
-# Emoji detection/removal
-EMOJI_RE = re.compile("[" +
-    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
-    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
-    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
-ONLY_PSPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
-
-def strip_emoji(s: str) -> str:
-    return EMOJI_RE.sub("", s or "")
-
-def is_emoji_only(s: str) -> bool:
-    if not s or not s.strip(): return False
-    t = ONLY_PSPACE.sub("", s)
-    t = EMOJI_RE.sub("", t)
-    return len(t.strip()) == 0
-
-# Early empty
-if not (SRC and os.path.isfile(SRC)):
-    open(VTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(EVTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH,"w",encoding="utf-8").write("")
-    open(SPEECH_JSON_PATH,"w",encoding="utf-8").write("[]")
-    open(REACT_JSON_PATH,"w",encoding="utf-8").write("[]")
-    open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({"speech_segments":0,"reactions":0}))
-    open(START_PATH,"w",encoding="utf-8").write("")
-    sys.exit(0)
-
-REL_KEYS  = ("offset","startSec","startMs","start")
-ABS_KEYS  = ("programDateTime","timestamp","ts")
-raw_speech: List[Dict[str,Any]] = []
-raw_rx:     List[Dict[str,Any]] = []
-abs_candidates: List[float] = []
-idx = 0
-
-def pick_rel_abs(d: Dict[str,Any]) -> (Optional[float], Optional[float]):
-    rel = None; abs_ts = None
-    for k in REL_KEYS:
-        if k in d and d[k] not in (None, ""):
-            v = to_secs(d[k]); 
-            if v is not None: rel = v; break
-    if "programDateTime" in d and d["programDateTime"] not in (None, ""):
-        abs_ts = parse_time_iso(d["programDateTime"])
-    for k in ("timestamp","ts"):
-        if k in d and d[k] not in (None,""):
-            v = to_secs(d[k]); 
-            if v is None: continue
-            if v >= 1e6: abs_ts = v
-            elif rel is None: rel = v
-    return rel, abs_ts
-
-def harvest(d: Dict[str,Any]):
-    global idx
-    txt = first(d.get("body"), d.get("text"), d.get("caption"), d.get("payloadText"))
-    if not txt: return
-    txt = nfc(str(txt)).strip()
-
-    sender = d.get("sender") or {}
-    disp   = first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
-                   (sender or {}).get("display_name"), d.get("name"), d.get("user"))
-    uname  = first(d.get("username"), d.get("handle"), d.get("screen_name"),
-                   d.get("user_id"), (sender or {}).get("screen_name"))
-    avatar = first((sender or {}).get("profile_image_url_https"),
-                   (sender or {}).get("profile_image_url"),
-                   d.get("profile_image_url_https"), d.get("profile_image_url"))
-    name   = nfc(first(disp, uname, "Speaker") or "Speaker")
-    handle = (uname or "").lstrip("@")
-    rel, abs_ts = pick_rel_abs(d)
-
-    if is_emoji_only(txt):
-        raw_rx.append({"idx":idx,"rel":rel,"abs":abs_ts,"emoji":txt,"name":name,"handle":handle,"avatar":avatar or ""})
-    else:
-        # Keep speech sans any embedded emoji
-        txt_no_emoji = strip_emoji(txt).strip()
-        if txt_no_emoji:
-            raw_speech.append({"idx":idx,"rel":rel,"abs":abs_ts,"text":txt_no_emoji,"name":name,"handle":handle,"avatar":avatar or ""})
-    if abs_ts is not None: abs_candidates.append(abs_ts)
-    idx += 1
-
-def ingest_line(ln: str):
-    ln = (ln or "").strip()
-    if not ln: return
+def parse_jsonl_line(line: str):
+    # Crawler lines are wrapper JSON with "payload" that itself contains JSON whose "body" is also JSON.
     try:
-        obj = json.loads(ln)
+        outer = json.loads(line)
     except Exception:
-        return
-    layers: List[Dict[str,Any]] = []
-    if isinstance(obj, dict):
-        layers.append(obj)
-        pl = obj.get("payload")
-        if isinstance(pl, str):
-            try:
-                pj = json.loads(pl); 
-                if isinstance(pj, dict):
-                    layers.append(pj)
-                    if isinstance(pj.get("body"), str):
-                        try:
-                            inner = json.loads(pj["body"])
-                            if isinstance(inner, dict):
-                                inner = dict(inner)
-                                if isinstance(pj.get("sender"), dict):
-                                    inner["sender"] = pj["sender"]
-                                layers.append(inner)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        elif isinstance(pl, dict):
-            layers.append(pl)
-            if isinstance(pl.get("body"), str):
-                try:
-                    inner = json.loads(pl["body"])
-                    if isinstance(inner, dict):
-                        inner = dict(inner)
-                        if isinstance(pl.get("sender"), dict):
-                            inner["sender"] = pl["sender"]
-                        layers.append(inner)
-                except Exception:
-                    pass
-    for d in layers:
-        if isinstance(d, dict): harvest(d)
+        return None, None
+    payload = outer.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict):
+        return outer, None
+    body = payload.get("body")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            body = None
+    return payload, body
 
-with open(SRC,"r",encoding="utf-8",errors="ignore") as fh:
-    for ln in fh: ingest_line(ln)
+def iter_rows(path: Path):
+    with path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln: continue
+            pay, body = parse_jsonl_line(ln)
+            if body is None: 
+                # registration/join/other events we don't need
+                continue
+            yield pay, body
 
-if not raw_speech and not raw_rx:
-    open(VTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(EVTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH,"w",encoding="utf-8").write("")
-    open(SPEECH_JSON_PATH,"w",encoding="utf-8").write("[]")
-    open(REACT_JSON_PATH,"w",encoding="utf-8").write("[]")
-    open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({"speech_segments":0,"reactions":0}))
-    open(START_PATH,"w",encoding="utf-8").write("")
-    sys.exit(0)
+def extract_caption(body):
+    # Returns (start_s, end_s, text, speaker_name, handle, avatar) or None
+    # Many crawlers put spoken captions as type 45-ish entries; but sometimes it's text without explicit type.
+    # We'll use content-based filtering: non-empty, not emoji-only, has some letters.
+    txt = body.get("text") or body.get("caption") or body.get("body") or ""
+    txt = str(txt)
+    if not txt: 
+        return None
+    if only_emoji(txt):  # this is a reaction, not speech
+        return None
+    # Require at least a letter/number to avoid stray symbols
+    if not re.search(r"[A-Za-z0-9]", txt):
+        return None
+    # time bounds
+    # Try typical fields: start/end in seconds; else timestamp in ms/µs
+    start = body.get("start") or body.get("startSec") or body.get("timestamp") or body.get("ts") or None
+    end   = body.get("end")   or body.get("endSec")   or body.get("timestampEnd") or None
+    # Convert ms-like integers
+    def to_sec(v):
+        if v is None: return None
+        try:
+            vv = float(v)
+            # Heuristic: > 10^6 is probably ms or µs
+            if vv > 3_600_000: vv = vv / 1000.0
+            return vv
+        except Exception:
+            return None
+    start_s = ts_norm(to_sec(start))
+    end_s   = ts_norm(to_sec(end)) if end is not None else None
+    if start_s is None:
+        return None
+    if end_s is None:
+        end_s = start_s + 1.8  # conservative default window
+    # speaker
+    speaker_name = body.get("speakerName") or body.get("name") or ""
+    handle = body.get("speakerHandle") or body.get("handle") or ""
+    avatar = body.get("avatar") or ""
+    return (start_s, end_s, txt, speaker_name, handle, avatar)
 
-# --- clock alignment ---
-abs0 = min(abs_candidates) if abs_candidates else None
-if abs0 is not None:
-    deltas = []
-    for it in raw_speech:
-        if it["abs"] is not None and it["rel"] is not None:
-            deltas.append((it["abs"] - abs0) - it["rel"])
-    for r in raw_rx:
-        if r["abs"] is not None and r["rel"] is not None:
-            deltas.append((r["abs"] - abs0) - r["rel"])
-    delta = median(deltas) if deltas else 0.0
-else:
-    delta = 0.0
+def extract_reaction(pay, body):
+    # Returns (t_s, emoji_str, user_handle_or_id, display_name, avatar_url) or None
+    txt = body.get("text") or body.get("body") or ""
+    if not txt or not only_emoji(txt):
+        return None
+    # pick a representative emoji (could also emit one cue per codepoint if needed)
+    emj = txt
+    # sender info from payload
+    sender = pay.get("sender") or {}
+    disp = sender.get("displayName") or body.get("displayName") or ""
+    avatar = sender.get("profile_image_url_https") or sender.get("profile_image_url") or ""
+    handle_or_id = sender.get("screen_name") or sender.get("twitter_id") or ""
+    # time
+    t = body.get("start") or body.get("startSec") or body.get("timestamp") or body.get("ts") or pay.get("timestamp") or None
+    def to_sec(v):
+        if v is None: return None
+        try:
+            vv = float(v)
+            if vv > 3_600_000: vv = vv / 1000.0
+            return vv
+        except Exception:
+            return None
+    t_s = ts_norm(to_sec(t))
+    if t_s is None:
+        return None
+    return (t_s, emj, handle_or_id, disp, avatar)
 
-def rel_time(rel: Optional[float], abs_ts: Optional[float]) -> float:
-    if rel is not None: t = rel + delta
-    elif abs_ts is not None and abs0 is not None: t = abs_ts - abs0
-    else: t = 0.0
-    return max(0.0, t - TOTAL_SHIFT)
+def vtt_time(s):
+    # s in seconds -> "HH:MM:SS.mmm"
+    if s < 0: s = 0
+    hrs = int(s//3600)
+    s -= hrs*3600
+    mins = int(s//60)
+    sec = s - mins*60
+    return f"{hrs:02d}:{mins:02d}:{sec:06.3f}"
 
-norm = []
-for it in raw_speech:
-    t = rel_time(it["rel"], it["abs"])
-    norm.append({"t":float(t), **it})
-norm.sort(key=lambda x: (x["t"], x["idx"]))
-EPS=5e-4; last=-1e9
-for u in norm:
-    if u["t"] <= last: u["t"] = last + EPS
-    last = u["t"]
+def write_vtt(path: Path, cues):
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("WEBVTT\n\n")
+        for (st, en, text) in cues:
+            fh.write(f"{vtt_time(st)} --> {vtt_time(en)}\n{text}\n\n")
 
-# --- build segments ---
-MIN_DUR=0.80; MAX_DUR=10.0; GUARD=0.020; MERGE_GAP=3.0
-segs = [{"start":u["t"], "end":u["t"]+MIN_DUR, "text":u["text"],
-         "name":u["name"],"handle":u["handle"],"avatar":u["avatar"]} for u in norm]
+def main():
+    if not CC or not Path(CC).is_file():
+        print("No CC JSONL provided; nothing to do.")
+        return 0
 
-merged=[]; cur=None
-def ends_sentence(s:str)->bool: return bool(re.search(r'[.!?]"?$', (s or "").strip()))
-for s in segs:
-    if cur and s["name"]==cur["name"] and s["handle"]==cur["handle"] and s["start"]-cur["end"]<=MERGE_GAP:
-        cur["text"] = (cur["text"] + ("" if ends_sentence(cur["text"]) else " ") + s["text"]).strip()
-        cur["end"]  = max(cur["end"], s["end"])
+    speech = []
+    reacts = []
+
+    for pay, body in iter_rows(Path(CC)):
+        cap = extract_caption(body)
+        if cap:
+            speech.append(cap)
+            continue
+        r = extract_reaction(pay, body)
+        if r:
+            reacts.append(r)
+
+    # Sort
+    speech.sort(key=lambda x: x[0])
+    reacts.sort(key=lambda x: x[0])
+
+    # Build speech VTT cues (emoji stripped)
+    vtt_cues = []
+    speech_json = []
+    for (st, en, txt, name, handle, avatar) in speech:
+        clean = strip_emojis(txt).strip()
+        if not clean:
+            continue
+        vtt_cues.append((st, en, clean))
+        speech_json.append({
+            "t0": round(st,3),
+            "t1": round(en,3),
+            "text": clean,
+            "name": name,
+            "handle": handle,
+            "avatar": avatar
+        })
+
+    # Build emoji VTT cues (JSON payload per cue)
+    emoji_cues = []
+    react_json = []
+    for (t_s, emj, h, disp, ava) in reacts:
+        payload = {
+            "t": round(t_s,3),
+            "e": emj,
+            "user": str(h or ""),
+            "name": disp or "",
+            "avatar": ava or ""
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        emoji_cues.append((t_s, t_s + 0.8, text))
+        react_json.append(payload)
+
+    # Write artifacts
+    if vtt_cues:
+        write_vtt(OUT_VTT, vtt_cues)
     else:
-        cur = dict(s); merged.append(cur)
+        # create an empty WEBVTT so the player doesn't 404
+        OUT_VTT.write_text("WEBVTT\n\n", encoding="utf-8")
 
-for i,g in enumerate(merged):
-    if i+1 < len(merged):
-        nxt = merged[i+1]["start"]
-        dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
-        g["end"] = g["start"] + (dur if dur>0 else MIN_DUR)
+    if emoji_cues:
+        write_vtt(OUT_EMOJI_VTT, emoji_cues)
     else:
-        words = max(1, len((g["text"] or "").split()))
-        g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33*words + 0.7))
+        OUT_EMOJI_VTT.write_text("WEBVTT\n\n", encoding="utf-8")
 
-prev=0.0
-for g in merged:
-    if g["start"] < prev + GUARD: g["start"] = prev + GUARD
-    if g["end"]   < g["start"] + MIN_DUR: g["end"] = g["start"] + MIN_DUR
-    prev = g["end"]
+    # JSON sidecars (optional debug)
+    OUT_SPEECH_JSON.write_text(json.dumps(speech_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    OUT_REACT_JSON.write_text(json.dumps(react_json, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# --- speech WEBVTT (emoji-free) ---
-with open(VTT_PATH,"w",encoding="utf-8") as f:
-    f.write("WEBVTT\n\n")
-    for i,g in enumerate(merged,1):
-        f.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n")
-        f.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
-
-# --- emoji VTT + JSON sidecar ---
-rx_out=[]
-for r in raw_rx:
-    t = rel_time(r["rel"], r["abs"])
-    rx_out.append({
-        "t": round(t,3),
-        "emoji": r["emoji"],
-        "name": r["name"],
-        "handle": r["handle"],
-        "avatar": r["avatar"]
-    })
-
-with open(EVTT_PATH,"w",encoding="utf-8") as f:
-    f.write("WEBVTT\n\n")
-    for j,r in enumerate(sorted(rx_out, key=lambda x:x["t"]), 1):
-        st = max(0.0, r["t"]); en = st + 2.0
-        payload = json.dumps(r, ensure_ascii=False)
-        f.write(f"{j}\n{fmt_ts(st)} --> {fmt_ts(en)}\n{payload}\n\n")
-
-open(REACT_JSON_PATH,"w",encoding="utf-8").write(json.dumps(rx_out, ensure_ascii=False))
-
-# --- interactive transcript (no timestamps; single 50x50 avatar) ---
-CSS = '''
+    # Minimal transcript HTML (no timestamps; no emoji)
+    if speech_json:
+        rows = []
+        for seg in speech_json:
+            name = html.escape(seg.get("name") or "").strip()
+            handle = html.escape(seg.get("handle") or "").strip()
+            avatar = html.escape(seg.get("avatar") or "").strip()
+            txt = html.escape(seg["text"])
+            # 50x50 avatars per your spec
+            head = f'''
+            <div class="ss3k-row" data-t0="{seg["t0"]}" data-t1="{seg["t1"]}">
+              <img class="ss3k-ava" src="{avatar}" alt="" width="50" height="50" loading="lazy" decoding="async" />
+              <div class="ss3k-bubble">
+                <div class="ss3k-name">{name or handle}</div>
+                <div class="ss3k-text">{txt}</div>
+              </div>
+            </div>
+            '''
+            rows.append(head)
+        html_out = f"""<!doctype html>
+<meta charset="utf-8">
 <style>
-.ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px}
-.ss3k-row{display:flex; align-items:flex-start; gap:10px; padding:8px 10px; border-radius:10px; margin:6px 0}
-.ss3k-row.active{background:#eef6ff; outline:1px solid #bfdbfe}
-.ss3k-avatar{width:50px; height:50px; border-radius:50%; flex:0 0 50px; background:#e5e7eb}
-.ss3k-line{display:flex; flex-wrap:wrap; gap:6px; min-width:0}
-.ss3k-name{font-weight:700; color:#0f172a; white-space:nowrap}
-.ss3k-text{white-space:pre-wrap; word-break:break-word; cursor:pointer; min-width:0}
-.ss3k-name a{color:inherit; text-decoration:none}
+  .ss3k-row{{display:flex;gap:.6rem;align-items:flex-start;padding:.35rem .5rem;border-bottom:1px solid rgba(0,0,0,.05);}}
+  .ss3k-ava{{border-radius:999px;flex:0 0 auto;width:50px;height:50px;object-fit:cover;}}
+  .ss3k-bubble{{flex:1 1 auto;}}
+  .ss3k-name{{font-weight:600;margin-bottom:.1rem;}}
+  .ss3k-text{{line-height:1.35}}
 </style>
-'''
-JS = r'''
-<script>
-(function(){
-  function tnum(s){return parseFloat(s||'0')||0}
-  function inwin(t,el){return t>=tnum(el.dataset.start)&&t<tnum(el.dataset.end)}
-  function bind(){
-    var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
-    var box=document.querySelector('.ss3k-transcript'); if(!audio||!box) return;
-    var rows=[].slice.call(box.querySelectorAll('.ss3k-row'));
-    var userScrolling=false, scrollTimer=null;
+<div class="ss3k-transcript">
+{''.join(rows)}
+</div>
+"""
+        OUT_HTML.write_text(html_out, encoding="utf-8")
+    else:
+        OUT_HTML.write_text("""<!doctype html>
+<meta charset="utf-8">
+<style>
+  .ss3k-note{padding:.75rem;border:1px dashed #bbb;border-radius:.5rem;background:#fafafa}
+</style>
+<div class="ss3k-note">No captions were available for this Space. Emoji reactions are provided via the emoji VTT.</div>
+""", encoding="utf-8")
 
-    box.addEventListener('scroll', function(){
-      userScrolling = true;
-      clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(function(){ userScrolling=false; }, 1200);
-    });
+    print(f"Wrote: {OUT_VTT}, {OUT_EMOJI_VTT}, {OUT_HTML}")
+    return 0
 
-    function ensureVisible(el){
-      if(userScrolling) return;
-      var top = el.offsetTop - box.offsetTop;
-      var desired = top - 8;
-      if (Math.abs(box.scrollTop - desired) > 6) box.scrollTop = desired;
-    }
-    function tick(){
-      var t=audio.currentTime||0, found=null;
-      for(var i=0;i<rows.length;i++){ if(inwin(t,rows[i])){ found=rows[i]; break; } }
-      rows.forEach(function(r){ r.classList.toggle('active', r===found); });
-      if(found) ensureVisible(found);
-    }
-    rows.forEach(function(r){
-      r.addEventListener('click', function(){
-        audio.currentTime = tnum(r.dataset.start) + 0.05;
-        if(audio.play) audio.play().catch(function(){});
-      });
-    });
-    audio.addEventListener('timeupdate', tick);
-    audio.addEventListener('seeked', tick);
-    tick();
-  }
-  if(document.readyState!=="loading") bind(); else document.addEventListener('DOMContentLoaded', bind);
-})();
-</script>
-'''
-with open(TRANSCRIPT_PATH,"w",encoding="utf-8") as tf:
-    tf.write(CSS+"\n<div class=\"ss3k-transcript\">\n")
-    for i,g in enumerate(merged,1):
-        uname = (g.get("handle") or "").lstrip("@")
-        prof  = f"https://x.com/{html.escape(uname, True)}" if uname else ""
-        avatar= g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
-        if avatar and prof:
-            av = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
-        elif avatar:
-            av = f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
-        else:
-            av = '<div class="ss3k-avatar" aria-hidden="true"></div>'
-        name_html = html.escape(g["name"], True)
-        if prof: name_html = f'<a href="{prof}" target="_blank" rel="noopener">{name_html}</a>'
-        tf.write(f'<div class="ss3k-row" id="seg-{i:04d}" data-start="{g["start"]:.3f}" data-end="{g["end"]:.3f}">')
-        tf.write(av)
-        tf.write('<div class="ss3k-line">')
-        tf.write(f'<span class="ss3k-name">{name_html}:</span> ')
-        tf.write(f'<span class="ss3k-text">{esc(g["text"])}</span>')
-        tf.write('</div></div>\n')
-    tf.write("</div>\n"+JS+"\n")
-
-# Sidecars + start
-speech_out = [{
-    "start": round(g["start"],3), "end": round(g["end"],3),
-    "text": g["text"], "name": g["name"], "handle": g["handle"], "avatar": g["avatar"]
-} for g in merged]
-open(SPEECH_JSON_PATH,"w",encoding="utf-8").write(json.dumps(speech_out, ensure_ascii=False))
-
-rx_out = json.loads(open(REACT_JSON_PATH,"r",encoding="utf-8").read()) if os.path.exists(REACT_JSON_PATH) else []
-open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({
-    "speech_segments": len(merged),
-    "reactions": len(rx_out),
-    "timing": {"shift_secs": SHIFT, "trim_lead": TRIM, "total_shift": TOTAL_SHIFT}
-}, ensure_ascii=False, indent=2))
-
-start_iso = ""
-env_start = os.environ.get("START_ISO") or ""
-if env_start:
-    ts = parse_time_iso(env_start)
-    if ts: start_iso = datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
-open(START_PATH,"w",encoding="utf-8").write((start_iso or "")+"\n")
+if __name__ == "__main__":
+    sys.exit(main())
