@@ -140,7 +140,6 @@ jobs:
 
       - name: Validate config and prefixes
         id: cfg
-        if: ${{ github.event.inputs.mode != 'replies_only' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -252,33 +251,6 @@ jobs:
           if [ -n "${CC_JSONL:-}" ]; then
             echo "CRAWLER_CC=${CC_JSONL}" >> "$GITHUB_ENV"
           fi
-
-      # ---- META EARLY: compute START_ISO and title BEFORE VTT so timing is accurate
-      - name: Derive Space title and publish date (early)
-        id: meta
-        shell: bash
-        env:
-          AS_LINE: ${{ steps.crawl.outputs.as_line }}
-        run: |
-          set -euo pipefail
-          TTL=""
-          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
-            TTL="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.name // .title // "")' "${AS_LINE}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-          fi
-          [ -z "$TTL" ] && TTL="${BASE}"
-          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
-
-          START_ISO=""
-          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
-            MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
-            if [[ "$MS" =~ ^[0-9]+$ ]]; then
-              if [ ${#MS} -gt 10 ]; then SECS=$((MS/1000)); else SECS=$MS; fi
-              START_ISO="$(date -u -d "@$SECS" +%Y-%m-%dT%H:%M:%SZ || true)"
-            fi
-          fi
-          [ -z "$START_ISO" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ] && START_ISO="$(head -n1 "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')"
-          [ -z "$START_ISO" ] && START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
 
       - name: Detect lead silence seconds
         id: detect
@@ -394,11 +366,10 @@ jobs:
         env:
           CC_JSONL: ${{ env.CRAWLER_CC }}
           SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
-          START_ISO: ${{ env.START_ISO }}
         run: |
           set -euxo pipefail
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" START_ISO="${START_ISO}" \
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
               python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_emoji.vtt" ] && echo "EMOJI_VTT_PATH=${ARTDIR}/${BASE}_emoji.vtt" >> "$GITHUB_ENV" || true
@@ -494,12 +465,25 @@ jobs:
             fi
           fi
 
+      - name: Discover replies JSONL (if present)
+        id: find_replies_jsonl
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Try to find any plausible replies jsonl the crawler may have dropped
+          CAND="$( (ls -1t "${ARTDIR}"/*repl*.jsonl "${ARTDIR}"/*reply*.jsonl "${ARTDIR}"/*tweets*.jsonl "${ARTDIR}"/*tweet*.jsonl 2>/dev/null || true) | head -n1 )"
+          if [ -n "$CAND" ] && [ -s "$CAND" ]; then
+            echo "replies_jsonl=${CAND}" >> "$GITHUB_OUTPUT"
+            echo "REPLIES_JSONL=${CAND}" >> "$GITHUB_ENV"
+          fi
+
       - name: Scrape replies and shared links (web)
         shell: bash
         env:
           PURPLE_TWEET_URL: ${{ github.event.inputs.purple_tweet_url }}
         run: |
           set -euo pipefail
+          # Pass through REPLIES_JSONL if we discovered one; otherwise replies_web.py will try API fallback using PURPLE_TWEET_URL
           python3 ".github/workflows/scripts/replies_web.py" || true
           if [ -s "${ARTDIR}/${BASE}_replies.html" ]; then
             echo "REPLIES_PATH=${ARTDIR}/${BASE}_replies.html" >> "$GITHUB_ENV"
@@ -507,6 +491,36 @@ jobs:
           if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
             echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
           fi
+
+      - name: Derive Space title and publish date
+        id: meta
+        shell: bash
+        env:
+          AS_LINE: ${{ steps.crawl.outputs.as_line }}
+        run: |
+          set -euo pipefail
+          TTL=""
+          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
+            TTL="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.name // .title // "")' "${AS_LINE}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          fi
+          if [ -z "$TTL" ]; then TTL="${BASE}"; fi
+          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
+
+          START_ISO=""
+          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
+            MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
+            if [[ "$MS" =~ ^[0-9]+$ ]]; then
+              if [ ${#MS} -gt 10 ]; then SECS=$((MS/1000)); else SECS=$MS; fi
+              START_ISO="$(date -u -d "@$SECS" +%Y-%m-%dT%H:%M:%SZ || true)"
+            fi
+          fi
+          if [ -z "$START_ISO" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+            START_ISO="$(head -n1 "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')"
+          fi
+          if [ -z "$START_ISO" ]; then
+            START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
 
       - name: Register assets in WP
         if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
@@ -625,7 +639,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts (always)
+      - name: Upload artifacts (always, no audio)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
@@ -637,16 +651,10 @@ jobs:
             !${{ env.ARTDIR }}/**/*.aac
             !${{ env.ARTDIR }}/**/*.wav
             !${{ env.ARTDIR }}/**/*.webm
-            !${{ env.ARTDIR }}/**/*.ogg
+            !${{ env.ARTDIR }}/**/*.mp4
             !${{ env.ARTDIR }}/**/*.ts
+            !${{ env.ARTDIR }}/**/*.ogg
             ${{ env.WORKDIR }}/**
-            !${{ env.WORKDIR }}/**/*.mp3
-            !${{ env.WORKDIR }}/**/*.m4a
-            !${{ env.WORKDIR }}/**/*.aac
-            !${{ env.WORKDIR }}/**/*.wav
-            !${{ env.WORKDIR }}/**/*.webm
-            !${{ env.WORKDIR }}/**/*.ogg
-            !${{ env.WORKDIR }}/**/*.ts
             .github/workflows/scripts/**
           retention-days: 14
 
