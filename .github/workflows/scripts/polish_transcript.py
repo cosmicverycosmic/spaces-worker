@@ -1,75 +1,58 @@
-# file: .github/workflows/scripts/polish_transcript.py
 #!/usr/bin/env python3
-import os, re, html
-from typing import List
+import os, re, html, unicodedata, json, time
 
 ARTDIR = os.environ.get("ARTDIR",".")
 BASE   = os.environ.get("BASE","space")
 INP    = os.path.join(ARTDIR, f"{BASE}_transcript.html")
 OUT    = os.path.join(ARTDIR, f"{BASE}_transcript_polished.html")
+REPORT = os.path.join(ARTDIR, f"{BASE}_transcript_polish_report.json")
 
-if not os.path.exists(INP) or os.path.getsize(INP) == 0:
+if not (os.path.exists(INP) and os.path.getsize(INP)>0):
     raise SystemExit(0)
 
-raw_html = open(INP, "r", encoding="utf-8", errors="ignore").read()
+t0=time.time()
+raw = open(INP,"r",encoding="utf-8",errors="ignore").read()
 
-TEXT_NODE = re.compile(r'(<(?:div|span)\s+class="ss3k-text"[^>]*>)(.*?)(</(?:div|span)>)', re.S | re.I)
-URL_RE = re.compile(r"https?://[^\s<>\"']+")
+# We only normalize spacing and remove pure-emoji lines accidentally emitted into text blocks.
+TEXT_NODE = re.compile(r'(<(?:div|span)\s+class="ss3k-text"[^>]*>)(.*?)(</(?:div|span)>)', re.S|re.I)
+EMOJI_RE  = re.compile("[" +
+    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
+    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
+    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+ONLY_PSPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
-FILLER_WORDS = [r"uh+", r"um+", r"er+", r"ah+", r"mm+h*", r"hmm+", r"eh+", r"uh\-huh", r"uhhuh", r"uh\-uh", r"uhuh"]
-FILLER_PHRASES = [r"you\s+know", r"i\s+mean", r"kind\s+of", r"sort\s+of", r"you\s+see"]
-FILLERS_RE = re.compile(r"\b(?:" + "|".join(FILLER_WORDS + FILLER_PHRASES) + r")\b", re.I)
-STUTTER_RE = re.compile(r"\b([A-Za-z])(?:\s+\1\b){1,5}")
-REPEAT_RE  = re.compile(r"\b([A-Za-z]{2,})\b(?:\s+\1\b){1,4}", re.I)
+def nfc(s:str)->str:
+    s = unicodedata.normalize("NFC", s or "")
+    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
 
-def sentence_case(s: str) -> str:
-    s = re.sub(r"\bi\b", "I", s)
-    def cap_first(m):
-        pre = m.group(1) or ""
-        ch  = m.group(2).upper()
-        return pre + ch
-    return re.sub(r"(^|\.\s+|\?\s+|!\s+)([a-z])", cap_first, s)
+def is_emoji_only(s: str)->bool:
+    if not s or not s.strip(): return False
+    t = ONLY_PSPACE.sub("", s)
+    t = EMOJI_RE.sub("", t)
+    return len(t.strip())==0
 
-def ensure_end_punct(s: str) -> str:
-    t = s.rstrip()
-    if not t: return s
-    if t[-1] in ".!?\":)””’'»]>": return s
-    if URL_RE.search(t[-80:]): return s
-    if len(re.findall(r"\b\w+\b", t)) >= 6:
-        return t + "."
-    return s
+def clean_text(s: str)->str:
+    s = nfc(html.unescape(s))
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = re.sub(r"([,;:])([^\s])", r"\1 \2", s)
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def apply_rules(txt: str) -> str:
-    if not txt.strip(): return txt
-    txt = FILLERS_RE.sub("", txt)
-    txt = STUTTER_RE.sub(lambda m: m.group(1), txt)
-    txt = REPEAT_RE.sub(lambda m: m.group(1), txt)
-    txt = re.sub(r"\s{2,}", " ", txt).strip()
-    txt = re.sub(r"\bi\b", "I", txt)
-    txt = re.sub(r"\s+([,.;:!?])", r"\1", txt)
-    txt = re.sub(r"([,;:])([^\s])", r"\1 \2", txt)
-    txt = sentence_case(txt)
-    txt = ensure_end_punct(txt)
-    txt = txt.replace("<","&lt;").replace(">","&gt;")
-    return txt
+stats={"nodes":0,"emoji_dropped":0,"changed":0}
 
-spans: List[str] = []
-def _collect(m):
-    spans.append(m.group(2))
-    return m.group(0)
-TEXT_NODE.sub(_collect, raw_html)
+def repl(m: re.Match)->str:
+    stats["nodes"] += 1
+    body = m.group(2)
+    plain = html.unescape(body)
+    if is_emoji_only(plain):
+        stats["emoji_dropped"] += 1
+        return m.group(1) + "" + m.group(3)
+    cleaned = clean_text(body)
+    if cleaned != body: stats["changed"] += 1
+    return m.group(1) + cleaned + m.group(3)
 
-cleaned = [apply_rules(t) for t in spans]
-it = iter(cleaned)
-def _replace(m):
-    open_tag, _, close_tag = m.group(1), m.group(2), m.group(3)
-    try:
-        new_text = next(it)
-    except StopIteration:
-        new_text = m.group(2)
-    return f"{open_tag}{new_text}{close_tag}"
+polished = TEXT_NODE.sub(repl, raw)
+polished = re.sub(r"\n{3,}", "\n\n", polished)
 
-polished_html = TEXT_NODE.sub(_replace, raw_html)
-polished_html = re.sub(r"\n{3,}", "\n\n", polished_html)
-with open(OUT, "w", encoding="utf-8") as f:
-    f.write(polished_html)
+open(OUT,"w",encoding="utf-8").write(polished)
+open(REPORT,"w",encoding="utf-8").write(json.dumps(stats,ensure_ascii=False,indent=2))
