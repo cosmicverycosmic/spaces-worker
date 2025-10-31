@@ -1,402 +1,414 @@
-# file: .github/workflows/scripts/gen_vtt.py
 #!/usr/bin/env python3
-import json, os, re, html, sys, math
+# -*- coding: utf-8 -*-
+"""
+gen_vtt.py
+Build WEBVTT (speech + emoji) and an interactive transcript HTML with clean
+one-row layout (avatar • Name: text). Timing is aligned to trimmed audio.
+
+ENV (read):
+  ARTDIR, BASE, CC_JSONL
+  SHIFT_SECS     - seconds to shift left (lead-silence)
+  TRIM_LEAD      - extra trim seconds (if your workflow also sets it)
+  START_ISO      - optional absolute start time (ISO) for .start.txt
+
+Outputs:
+  {BASE}.vtt
+  {BASE}_emoji.vtt
+  {BASE}_transcript.html
+  {BASE}.start.txt
+  {BASE}_speech.json      (speech segments for UI consumers)
+  {BASE}_reactions.json   (emoji/reactions on same clock)
+  {BASE}_meta.json        (diagnostics)
+"""
+import os, sys, re, json, html, unicodedata, math
 from datetime import datetime, timezone
+from statistics import median
+from typing import Any, Dict, List, Optional
 
-artdir = os.environ.get("ARTDIR") or ""
-base   = os.environ.get("BASE") or ""
-src    = os.environ.get("CC_JSONL") or ""
-shift_env  = float(os.environ.get("SHIFT_SECS") or "0")
-trim_lead  = float(os.environ.get("TRIM_LEAD") or "0")   # audio was trimmed by this many seconds
-START_ISO  = os.environ.get("START_ISO") or ""           # e.g., 2025-10-25T23:00:07Z
-TOTAL_SHIFT = shift_env + trim_lead
+# ---------- env ----------
+ARTDIR = (os.environ.get("ARTDIR") or ".").strip()
+BASE   = (os.environ.get("BASE") or "space").strip()
+SRC    = (os.environ.get("CC_JSONL") or "").strip()
+SHIFT  = float((os.environ.get("SHIFT_SECS") or "0").strip() or "0")
+TRIM   = float((os.environ.get("TRIM_LEAD")  or "0").strip() or "0")
+TOTAL_SHIFT = SHIFT + TRIM
 
-if not (artdir and base and src and os.path.isfile(src)):
-    os.makedirs(artdir, exist_ok=True)
-    open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(os.path.join(artdir,f"{base}_emoji.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
-    sys.exit(0)
+os.makedirs(ARTDIR, exist_ok=True)
 
-def parse_time_iso(s: str):
+VTT_PATH         = os.path.join(ARTDIR, f"{BASE}.vtt")
+EVTT_PATH        = os.path.join(ARTDIR, f"{BASE}_emoji.vtt")
+TRANSCRIPT_PATH  = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+START_PATH       = os.path.join(ARTDIR, f"{BASE}.start.txt")
+SPEECH_JSON_PATH = os.path.join(ARTDIR, f"{BASE}_speech.json")
+REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
+META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
+
+# ---------- utils ----------
+def esc(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+def nfc(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFC", s)
+    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
+
+def fmt_ts(t: float) -> str:
+    if t < 0: t = 0.0
+    ms = int(round((t - math.floor(t))*1000))
+    s  = int(math.floor(t))
+    h, rem = divmod(s, 3600)
+    m, ss  = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{ss:02d}.{ms:03d}"
+
+def parse_time_iso(s: Optional[str]) -> Optional[float]:
     if not s: return None
     s = s.strip()
     try:
-        # Allow trailing Z and compact +0000
-        if s.endswith('Z'): s = s[:-1] + '+00:00'
-        if re.search(r'[+-]\d{4}$', s):
-            s = s[:-5] + s[-5:-2] + ':' + s[-2:]
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        if re.search(r"[+-]\d{4}$", s):
+            s = s[:-5] + s[-5:-3] + ":" + s[-3:]
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
-    except:
+    except Exception:
         return None
 
-def parse_start_iso_env():
-    ts = parse_time_iso(START_ISO)
-    return ts
-
-def to_float_seconds(x):
-    """Heuristically parse numeric timestamps:
-       - >= 1e12 : milliseconds since epoch → /1000
-       - >= 1e9  : seconds since epoch      → as-is
-       - else    : already relative seconds → as-is
-    """
-    try:
-        if x is None: return None
-        f = float(x)
-        if f >= 1e12:   # ms epoch (e.g. 1690000000000)
-            return f / 1000.0
-        # Treat anything in [1e9, 1e12) as seconds-since-epoch (Unix time)
-        # Otherwise assume it's already relative seconds.
-        return f
-    except:
-        return None
-
-def fmt_ts(t):
-    if t < 0: t = 0.0
-    # WebVTT permits hours >= 2 digits
-    msec = int(round((t - math.floor(t)) * 1000))
-    secs_i = int(math.floor(t))
-    hh, rem = divmod(secs_i, 3600)
-    mm, ss = divmod(rem, 60)
-    return f"{hh:02d}:{mm:02d}:{ss:02d}.{msec:03d}"
-
-def clean_name(s):
-    s = (s or "").strip()
-    s = re.sub(r'[<>&]', '', s)
-    s = ''.join(ch for ch in s if (ord(ch) < 0x1F000 and not (0xD800 <= ord(ch) <= 0xDFFF)))
-    return s or "Speaker"
-
-def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-def norm_text(s):
-    if not s: return ""
-    s = s.replace("\u2028"," ").replace("\u2029"," ")
-    s = re.sub(r'\s+',' ',s).strip()
-    if s.lower() in {"n","uh","um"}: return ""
-    return s
+def to_secs(x: Any) -> Optional[float]:
+    if x in (None, ""): return None
+    try: v = float(x)
+    except Exception: return None
+    if v >= 1e12: v = v/1000.0  # epoch ms
+    return v
 
 def first(*vals):
     for v in vals:
-        if v not in (None, ""):
-            return v
+        if v not in (None, ""): return v
     return None
 
-raw_utts = []
-with open(src,'r',encoding='utf-8',errors='ignore') as f:
-    for line in f:
-        line = line.strip()
-        if not line: continue
-        try:
-            obj = json.loads(line)
-        except:
-            obj = None
+EMOJI_RE = re.compile("[" +
+    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
+    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
+    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+ONLY_PSPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
-        layer = None; sender = {}
-        if isinstance(obj, dict) and isinstance(obj.get("payload"), str):
-            try:
-                pl = json.loads(obj["payload"])
-                if isinstance(pl, dict) and isinstance(pl.get("body"), str):
-                    try:
-                        layer  = json.loads(pl["body"])
-                        sender = pl.get("sender") or {}
-                    except:
-                        layer = None
-            except:
-                pass
-        else:
-            layer = obj
+def is_emoji_only(s: str)->bool:
+    if not s or not s.strip(): return False
+    t = ONLY_PSPACE.sub("", s)
+    t = EMOJI_RE.sub("", t)
+    return len(t.strip())==0
 
-        def push(ts_abs, txt, disp, uname, avatar, te_abs=None):
-            if ts_abs is None or not txt: return
-            t2 = norm_text(txt)
-            if not t2: return
-            raw_utts.append({
-                "ts": float(ts_abs),
-                "text": t2,
-                "name": clean_name(disp or uname or "Speaker"),
-                "username": (uname or "").lstrip("@"),
-                "avatar": avatar or "",
-                "end_ts": float(te_abs) if te_abs is not None else None
-            })
+def has_az09(s: str)->bool:
+    return bool(re.search(r"[A-Za-z0-9]", s or ""))
 
-        if isinstance(layer, dict) and layer:
-            ttype = layer.get("type")
-            txt   = first(layer.get("body"), layer.get("text"), layer.get("caption"))
-            disp  = first(layer.get("displayName"), (sender or {}).get("display_name"), layer.get("speaker_name"), layer.get("speakerName"))
-            uname = first(layer.get("username"), (sender or {}).get("screen_name"), layer.get("user_id"))
-            avat  = first((sender or {}).get("profile_image_url_https"), (sender or {}).get("profile_image_url"))
-
-            ts_abs = first(
-                to_float_seconds(layer.get("timestamp")),
-                parse_time_iso(layer.get("programDateTime")),
-                to_float_seconds(layer.get("start")), to_float_seconds(layer.get("startSec")), to_float_seconds(layer.get("startMs")),
-                to_float_seconds(layer.get("ts")), to_float_seconds(layer.get("offset"))
-            )
-            te_abs = first(
-                to_float_seconds(layer.get("end")),
-                to_float_seconds(layer.get("endSec")),
-                to_float_seconds(layer.get("endMs"))
-            )
-
-            if txt and (ttype is None or ttype == 45 or any(k in layer for k in ("start","startMs","timestamp","programDateTime","ts","offset"))):
-                if ts_abs is not None:
-                    push(ts_abs, txt, disp, uname, avat, te_abs)
-                continue
-
-        if isinstance(obj, dict):
-            txt   = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"))
-            ts_abs = first(
-                to_float_seconds(obj.get("timestamp")),
-                parse_time_iso(obj.get("programDateTime")),
-                to_float_seconds(obj.get("start")), to_float_seconds(obj.get("startMs")), to_float_seconds(obj.get("ts"))
-            )
-            disp  = first(obj.get("displayName"), obj.get("speaker"), obj.get("user"), obj.get("name"))
-            uname = first(obj.get("username"), obj.get("handle"), obj.get("screen_name"))
-            avat  = first(obj.get("profile_image_url_https"), obj.get("profile_image_url"))
-            if txt and ts_abs is not None:
-                push(ts_abs, txt, disp, uname, avat)
-
-if not raw_utts:
-    os.makedirs(artdir, exist_ok=True)
-    open(os.path.join(artdir,f"{base}.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(os.path.join(artdir,f"{base}_emoji.vtt"),"w",encoding="utf-8").write("WEBVTT\n\n")
-    open(os.path.join(artdir,f"{base}_transcript.html"),"w",encoding="utf-8").write("")
+# ---------- early empty ----------
+if not (SRC and os.path.isfile(SRC)):
+    open(VTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
+    open(EVTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH,"w",encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH,"w",encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH,"w",encoding="utf-8").write("[]")
+    open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({"speech_segments":0,"reactions":0,"notes":"no input"},ensure_ascii=False))
+    open(START_PATH,"w",encoding="utf-8").write("")
     sys.exit(0)
 
-# ---------- Robust normalization: epoch vs relative ----------
-# Decide if the stream is epoch-based (Unix seconds) or relative.
-# Heuristic: if any timestamp >= 1e9, treat series as epoch seconds.
-any_epoch = any(u["ts"] >= 1e9 for u in raw_utts)
+# ---------- ingest ----------
+REL_KEYS  = ("offset","startSec","startMs","start")
+ABS_KEYS  = ("programDateTime","timestamp","ts")
 
-epoch_base = None
-if any_epoch:
-    # Prefer explicit START_ISO if provided; else base on the minimum epoch ts observed.
-    epoch_base = parse_start_iso_env()
-    if epoch_base is None:
-        epoch_base = min(u["ts"] for u in raw_utts if u["ts"] >= 1e9)
+raw_speech: List[Dict[str,Any]] = []
+raw_rx:     List[Dict[str,Any]] = []
+abs_candidates: List[float] = []
+idx = 0
 
-# Normalize absolute → relative (seconds from stream start), then subtract TOTAL_SHIFT.
-for u in raw_utts:
-    if any_epoch:
-        u["ts"] = max(0.0, u["ts"] - epoch_base)
-        if u.get("end_ts") is not None:
-            u["end_ts"] = max(0.0, u["end_ts"] - epoch_base)
-    # else: already relative seconds
-    # Guard against accidental millisecond leftovers (rare edge)
-    if u["ts"] > 86400 * 365 * 10:  # >10 years in seconds → clearly bad
-        u["ts"] = u["ts"] / 1000.0
-    if u.get("end_ts") and u["end_ts"] > 86400 * 365 * 10:
-        u["end_ts"] = u["end_ts"] / 1000.0
+def pick_rel_abs(d: Dict[str,Any]) -> (Optional[float], Optional[float]):
+    rel = None; abs_ts = None
+    for k in REL_KEYS:
+        if k in d and d[k] not in (None, ""):
+            v = to_secs(d[k]); 
+            if v is not None: rel = v; break
+    if "programDateTime" in d and d["programDateTime"] not in (None, ""):
+        abs_ts = parse_time_iso(d["programDateTime"])
+    for k in ("timestamp","ts"):
+        if k in d and d[k] not in (None,""):
+            v = to_secs(d[k]); 
+            if v is None: continue
+            if v >= 1e6: abs_ts = v
+            elif rel is None: rel = v
+    return rel, abs_ts
 
-# Ensure monotonic non-decreasing
-raw_utts.sort(key=lambda x: x["ts"])
-EPS = 0.0005
-last = -1e9
-for u in raw_utts:
-    if u["ts"] <= last:
-        u["ts"] = last + EPS
-    last = u["ts"]
+def harvest(d: Dict[str,Any]):
+    global idx
+    txt = first(d.get("body"), d.get("text"), d.get("caption"), d.get("payloadText"))
+    if not txt: return
+    txt = nfc(str(txt)).strip()
+    if not has_az09(txt) and not is_emoji_only(txt): return
 
-# Reference t0 is the earliest (now-relative) ts
-t0 = raw_utts[0]["ts"]
+    sender = d.get("sender") or {}
+    disp   = first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
+                   (sender or {}).get("display_name"), d.get("name"), d.get("user"))
+    uname  = first(d.get("username"), d.get("handle"), d.get("screen_name"),
+                   d.get("user_id"), (sender or {}).get("screen_name"))
+    avatar = first((sender or {}).get("profile_image_url_https"),
+                   (sender or {}).get("profile_image_url"),
+                   d.get("profile_image_url_https"), d.get("profile_image_url"))
+    name   = nfc(first(disp, uname, "Speaker") or "Speaker")
+    handle = (uname or "").lstrip("@")
+    rel, abs_ts = pick_rel_abs(d)
 
-# Build utterances with final relative timing (subtract TOTAL_SHIFT to align with trimmed audio)
-utts = []
-for u in raw_utts:
-    st = (u["ts"] - t0) - TOTAL_SHIFT
-    if st < 0: st = 0.0
-    et = None
-    if u.get("end_ts") is not None:
-        et = (u["end_ts"] - t0) - TOTAL_SHIFT
-        if et is not None and et <= st: et = None
-    utts.append({
-        "start_rel": st,
-        "end_rel": et,
-        "text": u["text"],
-        "name": u["name"],
-        "username": u["username"],
-        "avatar": u["avatar"],
-    })
-
-# If no end times, synthesize based on next start; clamp duration
-MIN_DUR = 0.80
-MAX_DUR = 10.0
-GUARD   = 0.020
-
-for i, u in enumerate(utts):
-    if u["end_rel"] is not None:
-        # Clamp provided end
-        dur = u["end_rel"] - u["start_rel"]
-        if dur < MIN_DUR: u["end_rel"] = u["start_rel"] + MIN_DUR
-        elif dur > MAX_DUR: u["end_rel"] = u["start_rel"] + MAX_DUR
-        continue
-
-    if i + 1 < len(utts):
-        nxt = utts[i+1]["start_rel"]
-        dur = max(MIN_DUR, min(MAX_DUR, (nxt - u["start_rel"]) - GUARD))
-        if dur <= 0: dur = MIN_DUR
-        u["end_rel"] = u["start_rel"] + dur
+    if is_emoji_only(txt):
+        raw_rx.append({"idx":idx,"rel":rel,"abs":abs_ts,"emoji":txt,"name":name,"handle":handle,"avatar":avatar or ""})
     else:
-        words = max(1, len(u["text"].split()))
-        dur = max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
-        u["end_rel"] = u["start_rel"] + dur
+        raw_speech.append({"idx":idx,"rel":rel,"abs":abs_ts,"text":txt,"name":name,"handle":handle,"avatar":avatar or ""})
+    if abs_ts is not None: abs_candidates.append(abs_ts)
+    idx += 1
 
-# Merge near-adjacent same-speaker segments
-MERGE_GAP = 3.0
-groups = []; cur = None
-for u in utts:
-    if (cur is not None and u["name"] == cur["name"] and u["username"] == cur["username"]
-        and (u["start_rel"] - cur["end_rel"]) <= MERGE_GAP):
-        sep = "" if re.search(r'[.!?]"?$', cur["text"]) else " "
-        cur["text"] = (cur["text"] + sep + u["text"]).strip()
-        cur["end_rel"] = max(cur["end_rel"], u["end_rel"])
+def ingest_line(ln: str):
+    ln = (ln or "").strip()
+    if not ln: return
+    try:
+        obj = json.loads(ln)
+    except Exception:
+        return
+    layers: List[Dict[str,Any]] = []
+    if isinstance(obj, dict):
+        layers.append(obj)
+        pl = obj.get("payload")
+        if isinstance(pl, str):
+            try:
+                pj = json.loads(pl); 
+                if isinstance(pj, dict):
+                    layers.append(pj)
+                    if isinstance(pj.get("body"), str):
+                        try:
+                            inner = json.loads(pj["body"])
+                            if isinstance(inner, dict):
+                                inner = dict(inner)
+                                if isinstance(pj.get("sender"), dict):
+                                    inner["sender"] = pj["sender"]
+                                layers.append(inner)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        elif isinstance(pl, dict):
+            layers.append(pl)
+            if isinstance(pl.get("body"), str):
+                try:
+                    inner = json.loads(pl["body"])
+                    if isinstance(inner, dict):
+                        inner = dict(inner)
+                        if isinstance(pl.get("sender"), dict):
+                            inner["sender"] = pl["sender"]
+                        layers.append(inner)
+                except Exception:
+                    pass
+    for d in layers:
+        if isinstance(d, dict): harvest(d)
+
+with open(SRC,"r",encoding="utf-8",errors="ignore") as fh:
+    for ln in fh: ingest_line(ln)
+
+if not raw_speech and not raw_rx:
+    open(VTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
+    open(EVTT_PATH,"w",encoding="utf-8").write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH,"w",encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH,"w",encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH,"w",encoding="utf-8").write("[]")
+    open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({"speech_segments":0,"reactions":0},ensure_ascii=False))
+    open(START_PATH,"w",encoding="utf-8").write("")
+    sys.exit(0)
+
+# ---------- clock alignment ----------
+abs0 = min(abs_candidates) if abs_candidates else None
+if abs0 is not None:
+    deltas = []
+    for it in raw_speech:
+        if it["abs"] is not None and it["rel"] is not None:
+            deltas.append((it["abs"] - abs0) - it["rel"])
+    for r in raw_rx:
+        if r["abs"] is not None and r["rel"] is not None:
+            deltas.append((r["abs"] - abs0) - r["rel"])
+    delta = median(deltas) if deltas else 0.0
+else:
+    delta = 0.0
+
+def rel_time(rel: Optional[float], abs_ts: Optional[float]) -> float:
+    if rel is not None:
+        t = rel + delta
+    elif abs_ts is not None and abs0 is not None:
+        t = abs_ts - abs0
     else:
-        cur = {"name":u["name"], "username":u["username"], "avatar":u["avatar"],
-               "start_rel":u["start_rel"], "end_rel":u["end_rel"], "text":u["text"]}
-        groups.append(cur)
+        t = 0.0
+    return max(0.0, t - TOTAL_SHIFT)
 
-# Final pass: enforce non-overlap and min duration
-prev = 0.0
-for g in groups:
-    if g["start_rel"] < prev + 0.02:
-        g["start_rel"] = prev + 0.02
-    if g["end_rel"] < g["start_rel"] + MIN_DUR:
-        g["end_rel"] = g["start_rel"] + MIN_DUR
-    prev = g["end_rel"]
+# map speech to normalized time
+norm = []
+for it in raw_speech:
+    t = rel_time(it["rel"], it["abs"])
+    norm.append({"t":float(t), **it})
 
-os.makedirs(artdir, exist_ok=True)
+# stable order
+norm.sort(key=lambda x: (x["t"], x["idx"]))
+EPS=5e-4; last=-1e9
+for u in norm:
+    if u["t"] <= last: u["t"] = last + EPS
+    last = u["t"]
 
-# -------- Write full captions VTT --------
-vtt_path = os.path.join(artdir, f"{base}.vtt")
-with open(vtt_path, "w", encoding="utf-8") as vf:
-    vf.write("WEBVTT\n\n")
-    for i, g in enumerate(groups, 1):
-        vf.write(f"{i}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
-        vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
+# ---------- build speech segments ----------
+MIN_DUR=0.80; MAX_DUR=10.0; GUARD=0.020; MERGE_GAP=3.0
 
-# -------- Emoji-only VTT --------
-EMOJI_RE = re.compile(
-    "["                       
-    "\U0001F1E6-\U0001F1FF"  # flags
-    "\U0001F300-\U0001FAD6"  # misc pictographs
-    "\U0001FAE0-\U0001FAFF"  # newer emoji
-    "\U00002700-\U000027BF"  # dingbats
-    "\U00002600-\U000026FF"  # misc symbols
-    "\U0001F900-\U0001F9FF"  # supplemental
-    "\U0001F680-\U0001F6FF"  # transport/map
-    "\U0001F100-\U0001F5FF"  # enclosed alphanum/symbols
-    "\U0001FA70-\U0001FAFF"  # more symbols
-    "\U00002300-\U000023FF"  # misc tech
-    "]+", flags=re.UNICODE
-)
-def only_emoji(s:str)->str:
-    if not s: return ""
-    return "".join(EMOJI_RE.findall(s))
+segs = [{"start":u["t"], "end":u["t"]+MIN_DUR, "text":u["text"],
+         "name":u["name"],"handle":u["handle"],"avatar":u["avatar"]} for u in norm]
 
-evtt_path = os.path.join(artdir, f"{base}_emoji.vtt")
-with open(evtt_path, "w", encoding="utf-8") as ef:
-    ef.write("WEBVTT\n\n")
-    j = 1
-    for g in groups:
-        em = only_emoji(g["text"])
-        if not em: continue
-        ef.write(f"{j}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
-        ef.write(f"{em}\n\n")
-        j += 1
+merged=[]; cur=None
+def ends_sentence(s:str)->bool: return bool(re.search(r'[.!?]"?$', (s or "").strip()))
+for s in segs:
+    if cur and s["name"]==cur["name"] and s["handle"]==cur["handle"] and s["start"]-cur["end"]<=MERGE_GAP:
+        cur["text"] = (cur["text"] + ("" if ends_sentence(cur["text"]) else " ") + s["text"]).strip()
+        cur["end"]  = max(cur["end"], s["end"])
+    else:
+        cur = dict(s); merged.append(cur)
 
-# -------- Rich transcript HTML (avatars + names) --------
-css = '''
+for i,g in enumerate(merged):
+    if i+1 < len(merged):
+        nxt = merged[i+1]["start"]
+        dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
+        g["end"] = g["start"] + (dur if dur>0 else MIN_DUR)
+    else:
+        words = max(1, len((g["text"] or "").split()))
+        g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33*words + 0.7))
+
+prev=0.0
+for g in merged:
+    if g["start"] < prev + GUARD: g["start"] = prev + GUARD
+    if g["end"]   < g["start"] + MIN_DUR: g["end"] = g["start"] + MIN_DUR
+    prev = g["end"]
+
+# ---------- write WEBVTT (speech) ----------
+with open(VTT_PATH,"w",encoding="utf-8") as f:
+    f.write("WEBVTT\n\n")
+    for i,g in enumerate(merged,1):
+        f.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n")
+        f.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
+
+# ---------- emoji VTT + JSON ----------
+rx_out=[]
+for r in raw_rx:
+    t = rel_time(r["rel"], r["abs"])
+    rx_out.append({"t":round(t,3),"emoji":r["emoji"],"name":r["name"],"handle":r["handle"],"avatar":r["avatar"]})
+
+with open(EVTT_PATH,"w",encoding="utf-8") as f:
+    f.write("WEBVTT\n\n")
+    for j,r in enumerate(sorted(rx_out, key=lambda x:x["t"]), 1):
+        st = max(0.0, r["t"])
+        en = st + 2.0
+        f.write(f"{j}\n{fmt_ts(st)} --> {fmt_ts(en)}\n{r['emoji']}\n\n")
+
+open(REACT_JSON_PATH,"w",encoding="utf-8").write(json.dumps(rx_out, ensure_ascii=False))
+
+# ---------- interactive transcript (no timestamps; single avatar; 50x50) ----------
+CSS = '''
 <style>
 .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px 6px;}
-.ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
-.ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
-.ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e5e7eb}
-.ss3k-meta{font-size:12px;color:#64748b;margin-bottom:2px}
-.ss3k-name a{color:#0f172a;text-decoration:none}
-.ss3k-text{white-space:pre-wrap;word-break:break-word;cursor:pointer}
+  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px}
+.ss3k-row{display:flex; align-items:flex-start; gap:10px; padding:8px 10px; border-radius:10px; margin:6px 0}
+.ss3k-row.active{background:#eef6ff; outline:1px solid #bfdbfe}
+.ss3k-avatar{width:50px; height:50px; border-radius:50%; flex:0 0 50px; background:#e5e7eb}
+.ss3k-line{display:flex; flex-wrap:wrap; gap:6px; min-width:0}
+.ss3k-name{font-weight:700; color:#0f172a; white-space:nowrap}
+.ss3k-text{white-space:pre-wrap; word-break:break-word; cursor:pointer; min-width:0}
+.ss3k-name a{color:inherit; text-decoration:none}
 </style>
-'''
-js = '''
+'''.strip()
+
+JS = r'''
 <script>
 (function(){
-  function time(s){return parseFloat(s||'0')||0}
-  function within(t,seg){return t>=time(seg.dataset.start) && t<time(seg.dataset.end)}
+  function tnum(s){return parseFloat(s||'0')||0}
+  function inwin(t,el){return t>=tnum(el.dataset.start)&&t<tnum(el.dataset.end)}
   function bind(){
     var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
-    var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
-    var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg')); var lastId="";
+    var box=document.querySelector('.ss3k-transcript'); if(!audio||!box) return;
+    var rows=[].slice.call(box.querySelectorAll('.ss3k-row'));
+    var userScrolling=false, scrollTimer=null;
+
+    box.addEventListener('scroll', function(){
+      userScrolling = true;
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(function(){ userScrolling=false; }, 1200);
+    });
+
+    function ensureVisible(el){
+      if(userScrolling) return;
+      var top = el.offsetTop - box.offsetTop;
+      var desired = top - 8; // keep near top
+      if (Math.abs(box.scrollTop - desired) > 6) box.scrollTop = desired;
+    }
     function tick(){
       var t=audio.currentTime||0, found=null;
-      for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
-      segs.forEach(function(s){ s.classList.toggle('active', s===found); });
-      if(found){
-        var id=found.id||"";
-        if(id!==lastId){
-          var top = found.offsetTop - cont.offsetTop;
-          if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
-          lastId=id;
-        }
-      }
+      for(var i=0;i<rows.length;i++){ if(inwin(t,rows[i])){ found=rows[i]; break; } }
+      rows.forEach(function(r){ r.classList.toggle('active', r===found); });
+      if(found) ensureVisible(found);
     }
-    audio.addEventListener('timeupdate', tick);
-    audio.addEventListener('seeked', tick);
-    segs.forEach(function(s){
-      s.addEventListener('click', function(){
-        audio.currentTime = time(s.dataset.start)+0.05; audio.play().catch(function(){});
+    rows.forEach(function(r){
+      r.addEventListener('click', function(){
+        audio.currentTime = tnum(r.dataset.start) + 0.05;
+        if(audio.play) audio.play().catch(function(){});
       });
     });
+    audio.addEventListener('timeupdate', tick);
+    audio.addEventListener('seeked', tick);
     tick();
   }
   if(document.readyState!=="loading") bind(); else document.addEventListener('DOMContentLoaded', bind);
 })();
 </script>
-'''
+'''.strip()
 
-tr_path = os.path.join(artdir, f"{base}_transcript.html")
-with open(tr_path, "w", encoding="utf-8") as tf:
-    tf.write(css)
-    tf.write('<div class="ss3k-transcript">\n')
-    for i, g in enumerate(groups, 1):
-        name  = g["name"]
-        uname = (g.get("username") or "").strip().lstrip("@")
+with open(TRANSCRIPT_PATH,"w",encoding="utf-8") as tf:
+    tf.write(CSS+"\n<div class=\"ss3k-transcript\">\n")
+    for i,g in enumerate(merged,1):
+        uname = (g.get("handle") or "").lstrip("@")
         prof  = f"https://x.com/{html.escape(uname, True)}" if uname else ""
         avatar= g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
         if avatar and prof:
-            avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
+            av = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
         elif avatar:
-            avtag = f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
+            av = f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
         else:
-            avtag = '<div class="ss3k-avatar" aria-hidden="true"></div>'
-        name_html = f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
-        if prof:
-            name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a></span>'
-
-        tf.write(f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start_rel"]:.3f}" data-end="{g["end_rel"]:.3f}" data-speaker="{html.escape(name, True)}"')
-        if uname: tf.write(f' data-handle="@{html.escape(uname, True)}"')
-        tf.write('>')
-        tf.write(avtag)
-        tf.write('<div class="ss3k-body">')
-        tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
-        tf.write(f'<div class="ss3k-text">{html.escape(g["text"], True)}</div>')
+            av = '<div class="ss3k-avatar" aria-hidden="true"></div>'
+        name_html = html.escape(g["name"], True)
+        if prof: name_html = f'<a href="{prof}" target="_blank" rel="noopener">{name_html}</a>'
+        tf.write(f'<div class="ss3k-row" id="seg-{i:04d}" data-start="{g["start"]:.3f}" data-end="{g["end"]:.3f}">')
+        tf.write(av)
+        tf.write('<div class="ss3k-line">')
+        tf.write(f'<span class="ss3k-name">{name_html}:</span> ')
+        tf.write(f'<span class="ss3k-text">{esc(g["text"])}</span>')
         tf.write('</div></div>\n')
-    tf.write('</div>\n')
-    tf.write(js)
+    tf.write("</div>\n"+JS+"\n")
 
-# Start marker for external consumers:
-# Prefer START_ISO; else if we had epoch input, use computed epoch_base; else derive from "now" minus TOTAL_SHIFT.
-start_epoch = None
-if START_ISO:
-    start_epoch = parse_start_iso_env()
-elif any_epoch and epoch_base is not None:
-    start_epoch = epoch_base
-else:
-    # best-effort: not epoch-based, fabricate from current UTC (not ideal, but keeps file present)
-    start_epoch = datetime.now(timezone.utc).timestamp()
+# ---------- sidecars + start ----------
+speech_out = [{
+    "start": round(g["start"],3), "end": round(g["end"],3),
+    "text": g["text"], "name": g["name"], "handle": g["handle"], "avatar": g["avatar"]
+} for g in merged]
+open(SPEECH_JSON_PATH,"w",encoding="utf-8").write(json.dumps(speech_out, ensure_ascii=False))
 
-start_iso_out = datetime.fromtimestamp(start_epoch, timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-with open(os.path.join(artdir, f"{base}.start.txt"), "w", encoding="utf-8") as sf:
-    sf.write(start_iso_out + "\n")
+open(META_JSON_PATH,"w",encoding="utf-8").write(json.dumps({
+    "speech_segments": len(merged),
+    "reactions": len(rx_out),
+    "timing": {
+        "shift_secs": SHIFT, "trim_lead": TRIM, "total_shift": TOTAL_SHIFT,
+        "abs0_present": abs0 is not None, "delta_used": round(delta,6)
+    }
+}, ensure_ascii=False, indent=2))
+
+start_iso = ""
+env_start = os.environ.get("START_ISO") or ""
+if env_start:
+    start_iso = (datetime.fromtimestamp(parse_time_iso(env_start), timezone.utc)
+                 .isoformat(timespec="seconds").replace("+00:00","Z")) if parse_time_iso(env_start) else ""
+elif abs0 is not None:
+    start_iso = datetime.fromtimestamp(abs0, timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
+open(START_PATH,"w",encoding="utf-8").write((start_iso or "")+"\n")
