@@ -1,48 +1,45 @@
 #!/usr/bin/env python3
-# Light polishing pass:
-# - ensure no emoji in transcript text nodes
-# - normalize whitespace
-# - keep markup minimal (no timestamps added here)
+import os, re, html, unicodedata, json, time
 
-import os, re
-from pathlib import Path
+ARTDIR=os.environ.get("ARTDIR",".")
+BASE=os.environ.get("BASE","space")
+INP=os.path.join(ARTDIR,f"{BASE}_transcript.html")
+OUT=os.path.join(ARTDIR,f"{BASE}_transcript_polished.html")
+REPORT=os.path.join(ARTDIR,f"{BASE}_transcript_polish_report.json")
 
-ARTDIR = Path(os.environ.get("ARTDIR","."))
-BASE   = os.environ.get("BASE","space")
-
-INP = ARTDIR / f"{BASE}_transcript.html"
-OUT = ARTDIR / f"{BASE}_transcript_polished.html"
-if not INP.is_file():
+if not os.path.exists(INP) or os.path.getsize(INP)==0:
     raise SystemExit(0)
 
-EMOJI_RE = re.compile(
-    r"[\U0001F300-\U0001F5FF"
-    r"\U0001F600-\U0001F64F"
-    r"\U0001F680-\U0001F6FF"
-    r"\U0001F700-\U0001F77F"
-    r"\U0001F780-\U0001F7FF"
-    r"\U0001F800-\U0001F8FF"
-    r"\U0001F900-\U0001F9FF"
-    r"\U0001FA00-\U0001FA6F"
-    r"\U0001FA70-\U0001FAFF"
-    r"\U00002700-\U000027BF"
-    r"\U00002600-\U000026FF"
-    r"\U00002B00-\U00002BFF"
-    r"]+", flags=re.UNICODE
-)
+t0=time.time()
+raw=open(INP,"r",encoding="utf-8",errors="ignore").read()
 
-s = INP.read_text(encoding="utf-8")
+TEXT_NODE=re.compile(r'(<div class="ss3k-text"[^>]*>)(.*?)(</div>)',re.S)
+EMOJI_RE=re.compile("["+"\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAD6\u2600-\u26FF\u2700-\u27BF"+"]+")
+ONLY_PUNCT_SPACE=re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
-def strip_emojis(t): return EMOJI_RE.sub("", t)
+def nfc(s): return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]","",unicodedata.normalize("NFC",s or ""))
+def is_emoji_only(s):
+    t=ONLY_PUNCT_SPACE.sub("",s or "")
+    return len(EMOJI_RE.sub("",t).strip())==0
 
-# Remove any emojis in visible text nodes
-s = re.sub(r'(<div class="ss3k-text">)(.*?)(</div>)',
-           lambda m: m.group(1) + strip_emojis(m.group(2)) + m.group(3),
-           s, flags=re.S)
+def clean(s):
+    s=nfc(html.unescape(s))
+    s=re.sub(r"\s+"," ",s).strip()
+    s=re.sub(r"\s+([,.;:!?])",r"\1",s)
+    s=re.sub(r"([,;:])([^\s])",r"\1 \2",s)
+    return s
 
-# compact whitespace
-s = re.sub(r'[ \t]+', ' ', s)
-s = re.sub(r'\n{3,}', '\n\n', s)
-
-OUT.write_text(s, encoding="utf-8")
-print(f"Polished transcript -> {OUT}")
+nodes=TEXT_NODE.findall(raw)
+stats={"total":len(nodes),"changed":0,"emoji_dropped":0}
+for o,b,c in nodes:
+    plain=html.unescape(b)
+    if is_emoji_only(plain):
+        raw=raw.replace(o+b+c,"")
+        stats["emoji_dropped"]+=1
+    else:
+        new=clean(plain)
+        if new!=plain: stats["changed"]+=1
+        raw=raw.replace(o+b+c,o+html.escape(new)+c)
+open(OUT,"w",encoding="utf-8").write(raw)
+stats["duration_sec"]=round(time.time()-t0,3)
+open(REPORT,"w",encoding="utf-8").write(json.dumps(stats,ensure_ascii=False,indent=2))
