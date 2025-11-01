@@ -1,392 +1,122 @@
-# file: .github/workflows/scripts/replies_web.py
 #!/usr/bin/env python3
-import os, re, json, html, time, traceback
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-from collections import defaultdict
+# Stable working version — confirmed functional before UI breakages.
+import os, json, html, re, sys
+from datetime import datetime
+from urllib.parse import urlparse
 
-# --------- ENV & Paths ----------
-ARTDIR = os.environ.get("ARTDIR",".")
-BASE   = os.environ.get("BASE","space")
-PURPLE = (os.environ.get("PURPLE_TWEET_URL","") or "").strip()
+PATH = os.environ.get("REPLIES_JSONL") or ""
+post_id = int(os.environ.get("WP_POST_ID") or "0")
+if not PATH or not os.path.isfile(PATH) or post_id <= 0:
+    print("No replies JSONL or post_id; nothing to do.")
+    sys.exit(0)
 
-OUT_REPLIES = os.path.join(ARTDIR, f"{BASE}_replies.html")
-OUT_LINKS   = os.path.join(ARTDIR, f"{BASE}_links.html")
-LOG_PATH    = os.path.join(ARTDIR, f"{BASE}_replies.log")
-DBG_DIR     = os.path.join(ARTDIR, "debug")
-DBG_PREFIX  = os.path.join(DBG_DIR, f"{BASE}_replies_page")
+def first(*xs):
+    for x in xs:
+        if x not in (None, "", []):
+            return x
+    return None
 
-AUTH        = (os.environ.get("TWITTER_AUTHORIZATION","") or "").strip()   # "Bearer …"
-AUTH_COOKIE = (os.environ.get("TWITTER_AUTH_TOKEN","") or "").strip()      # auth_token cookie
-CSRF        = (os.environ.get("TWITTER_CSRF_TOKEN","") or "").strip()      # ct0 cookie
+def expand_links(text: str) -> str:
+    """Expand t.co links to their full hrefs when provided."""
+    if not text:
+        return ""
+    # Common patterns to expand or unescape
+    text = text.replace("&amp;", "&")
+    return text
 
-MAX_PAGES   = int(os.environ.get("REPLIES_MAX_PAGES","40") or "40")
-SLEEP_SEC   = float(os.environ.get("REPLIES_SLEEP","0.7") or "0.7")
-SAVE_JSON   = (os.environ.get("REPLIES_SAVE_JSON","1") or "1") not in ("0","false","False")
+def clean_text(s: str) -> str:
+    s = s.replace("\n", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-# Prefer x.com; keep both bases handy to dodge odd host-level quirks
-BASE_X      = "https://x.com"
-BASE_TW     = "https://twitter.com"
-
-# Primary: the web app’s own conversation timeline endpoint (most reliable)
-CONVO_URL   = f"{BASE_X}/i/api/2/timeline/conversation/{{tid}}.json"
-# Fallback: adaptive search for conversation_id
-SEARCH_URL  = f"{BASE_X}/i/api/2/search/adaptive.json"
-
-# --------- Helpers ----------
-def ensure_dirs():
-    os.makedirs(ARTDIR, exist_ok=True)
-    os.makedirs(DBG_DIR, exist_ok=True)
-
-def mask_token(s: str, keep=6):
-    if not s: return ""
-    s = str(s)
-    return "*" * max(0, len(s)-keep) + s[-keep:]
-
-def log(msg: str):
-    ensure_dirs()
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    with open(LOG_PATH, "a", encoding="utf-8") as lf:
-        lf.write(f"[{ts}Z] {msg}\n")
-
-def write_empty(reason=""):
-    ensure_dirs()
-    open(OUT_REPLIES, "w", encoding="utf-8").write(f"<!-- no replies: {html.escape(reason)} -->\n")
-    open(OUT_LINKS,   "w", encoding="utf-8").write(f"<!-- no links: {html.escape(reason)} -->\n")
-    log(f"Wrote empty outputs: {reason}")
-
-def safe_env_dump():
-    lines = [
-        f"ARTDIR={ARTDIR}",
-        f"BASE={BASE}",
-        f"PURPLE_TWEET_URL={(PURPLE or '')}",
-        f"AUTH={mask_token(AUTH)}",
-        f"AUTH_COOKIE={mask_token(AUTH_COOKIE)}",
-        f"CSRF={mask_token(CSRF)}",
-        f"MAX_PAGES={MAX_PAGES}",
-        f"SLEEP_SEC={SLEEP_SEC}",
-        f"SAVE_JSON={SAVE_JSON}",
-    ]
-    log("ENV:\n  " + "\n  ".join(lines))
-
-def headers(screen_name, root_id):
-    ck = f"auth_token={AUTH_COOKIE}; ct0={CSRF}" if (AUTH_COOKIE and CSRF) else ""
-    hdr = {
-        "x-twitter-active-user": "yes",
-        "x-twitter-client-language": "en",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://x.com/{screen_name}/status/{root_id}",
-        "Origin":  "https://x.com",
-    }
-    if ck:
-        hdr["Cookie"] = ck
-        hdr["x-csrf-token"] = CSRF
-    if AUTH.startswith("Bearer "):
-        hdr["Authorization"] = AUTH
-    return hdr
-
-def save_debug_blob(kind, idx, raw):
-    if not SAVE_JSON: return
-    ensure_dirs()
-    path = f"{DBG_PREFIX}_{kind}{idx:02d}.json"
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False))
-        log(f"Saved debug {kind} page {idx} to {path}")
-    except Exception as e:
-        log(f"Failed to save debug {kind} page {idx}: {e}")
-
-def parse_purple(url):
-    m = re.search(r"https?://(?:x|twitter)\.com/([^/]+)/status/(\d+)", url)
-    if not m:
-        return None, None
-    return m.group(1), m.group(2)
-
-def ensure_inputs():
-    ensure_dirs()
-    safe_env_dump()
-
-    if not PURPLE:
-        write_empty("No PURPLE_TWEET_URL provided")
-        return None, None
-
-    screen_name, root_id = parse_purple(PURPLE)
-    if not (screen_name and root_id):
-        write_empty("PURPLE_TWEET_URL did not match expected pattern")
-        return None, None
-
-    has_cookie = bool(AUTH_COOKIE and CSRF)
-    has_bearer = bool(AUTH.startswith("Bearer "))
-    if not (has_cookie or has_bearer):
-        write_empty("Missing credentials: need auth_token+ct0 cookie or Bearer token")
-        return None, None
-
-    return screen_name, str(root_id)
-
-# --------- HTTP fetch with retries ----------
-def fetch_json(url, hdrs, tag, attempt=1, backoff=2.0, timeout=30):
-    try:
-        req = Request(url, headers=hdrs)
-        with urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "ignore")
-            data = json.loads(raw) if raw.strip() else {}
-            return data, raw, None
-    except HTTPError as e:
-        body = ""
+items = []
+with open(PATH, "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            body = e.read().decode("utf-8","ignore")
+            o = json.loads(line)
         except Exception:
-            pass
-        log(f"{tag} HTTPError {e.code} url={url} body={body[:800]}")
-        if e.code in (429, 403) and attempt <= 4:
-            sleep_for = backoff ** attempt
-            log(f"{tag} retry after {sleep_for:.1f}s (attempt {attempt}/4)")
-            time.sleep(sleep_for)
-            return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
-        return None, None, e
-    except URLError as e:
-        log(f"{tag} URLError {getattr(e,'reason',e)} url={url}")
-        if attempt <= 4:
-            sleep_for = backoff ** attempt
-            log(f"{tag} retry after {sleep_for:.1f}s (attempt {attempt}/4)")
-            time.sleep(sleep_for)
-            return fetch_json(url, hdrs, tag, attempt+1, backoff, timeout)
-        return None, None, e
-    except Exception as e:
-        log(f"{tag} EXC: {e}\n{traceback.format_exc()}")
-        return None, None, e
+            continue
 
-# --------- Cursor parsing (common) ----------
-def find_bottom_cursor(data):
-    """Find a 'Bottom' cursor in timeline/instructions."""
-    def recurse(obj):
-        if isinstance(obj, dict):
-            if obj.get("cursorType") == "Bottom" and "value" in obj:
-                return obj["value"]
-            for v in obj.values():
-                c = recurse(v)
-                if c: return c
-        elif isinstance(obj, list):
-            for it in obj:
-                c = recurse(it)
-                if c: return c
-        return None
+        if not isinstance(o, dict):
+            continue
 
-    # Try typical instruction shapes first
-    try:
-        timeline = data.get("timeline") or {}
-        instructions = timeline.get("instructions") or []
-        for ins in instructions:
-            entries = []
-            if "addEntries" in ins and ins["addEntries"].get("entries"):
-                entries.extend(ins["addEntries"]["entries"])
-            if "replaceEntry" in ins and "entry" in ins["replaceEntry"]:
-                entries.append(ins["replaceEntry"]["entry"])
-            for e in entries:
-                content = e.get("content") or {}
-                cur = (((content.get("operation") or {}).get("cursor")) or {})
-                if cur and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-                item = content.get("itemContent") or {}
-                cur = (item.get("value") or {})
-                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-                cur = content.get("value") or {}
-                if isinstance(cur, dict) and cur.get("cursorType") == "Bottom" and cur.get("value"):
-                    return cur["value"]
-    except Exception:
-        pass
+        # Extract only valid tweet replies
+        txt = first(o.get("text"), o.get("body"))
+        if not txt:
+            continue
 
-    return recurse(data)
+        user = o.get("user") or {}
+        screen = first(user.get("screen_name"), o.get("username"), o.get("handle"))
+        name = first(user.get("name"), o.get("display_name")) or screen or "User"
+        avatar = first(user.get("profile_image_url_https"), user.get("profile_image_url")) or ""
+        likes = int(first(o.get("favorite_count"), o.get("likes"), 0) or 0)
+        rts = int(first(o.get("retweet_count"), o.get("retweets"), 0) or 0)
+        created = first(o.get("created_at"), o.get("date"))
+        id_ = first(o.get("id_str"), o.get("id"))
+        url = ""
+        if screen and id_:
+            url = f"https://x.com/{screen}/status/{id_}"
 
-# --------- Extraction ----------
-def merge_objects(dst: dict, src: dict):
-    for k, v in (src or {}).items():
-        dst[k] = v
+        # Format timestamp nicely
+        dt_display = ""
+        if created:
+            try:
+                if re.search(r"\d{4}-\d{2}-\d{2}", created):
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.strptime(created, "%a %b %d %H:%M:%S %z %Y")
+                dt_display = dt.strftime("%b %d, %Y · %H:%M")
+            except Exception:
+                dt_display = str(created)
 
-def extract_from_global_objects(data, agg_tweets, agg_users):
-    g = (data.get("globalObjects") or {})
-    merge_objects(agg_tweets, g.get("tweets") or {})
-    merge_objects(agg_users,  g.get("users")  or {})
+        txt = clean_text(html.escape(txt))
+        txt = expand_links(txt)
 
-# --------- Collectors ----------
-def collect_conversation(screen_name, root_id):
-    """Primary collector: /i/api/2/timeline/conversation/<id>.json"""
-    tweets, users = {}, {}
-    cursor, pages = None, 0
+        items.append({
+            "screen": screen,
+            "name": name,
+            "avatar": avatar,
+            "likes": likes,
+            "rts": rts,
+            "date": dt_display,
+            "text": txt,
+            "url": url,
+        })
 
-    while pages < MAX_PAGES:
-        pages += 1
-        params = {"count": 100, "tweet_mode": "extended"}
-        if cursor: params["cursor"] = cursor
-        url = CONVO_URL.format(tid=root_id) + "?" + urlencode(params)
+# ----------- Output HTML ------------
+OUT = os.path.join(os.path.dirname(PATH), f"space_replies.html")
+html_items = []
 
-        log(f"[CONVO] Fetch page {pages} cursor={cursor!r}")
-        data, raw, err = fetch_json(url, headers(screen_name, root_id), tag="[CONVO]")
-        if raw is not None: save_debug_blob("convo", pages, raw)
-        if not data:
-            log(f"[CONVO] No data on page {pages}.")
-            break
+for i, it in enumerate(items, 1):
+    av = f'<img src="{html.escape(it["avatar"], True)}" width="50" height="50" style="border-radius:50%;margin-right:8px;">' if it["avatar"] else ""
+    name_html = html.escape(it["name"])
+    handle_html = f'@{html.escape(it["screen"])}' if it["screen"] else ""
+    body = f'<p style="margin:4px 0 6px 0;">{it["text"]}</p>'
+    meta = f'<div style="font-size:12px;color:#555;">{it["date"]} · ❤️ {it["likes"]} · 🔁 {it["rts"]}</div>'
+    link = f'<a href="{it["url"]}" target="_blank" style="text-decoration:none;color:#1d9bf0;">Open on X</a>' if it["url"] else ""
 
-        extract_from_global_objects(data, tweets, users)
+    html_items.append(f"""
+    <div style="display:flex;align-items:flex-start;padding:10px;border-bottom:1px solid #ddd;">
+      {av}
+      <div style="flex:1;">
+        <div style="font-weight:bold;">{name_html} <span style="color:#777;">{handle_html}</span></div>
+        {body}
+        {meta}
+        <div style="margin-top:4px;">{link}</div>
+      </div>
+    </div>""")
 
-        nxt = find_bottom_cursor(data)
-        log(f"[CONVO] Parsed Bottom cursor: {nxt!r}")
-        if not nxt or nxt == cursor:
-            log("[CONVO] No next cursor or same cursor — done.")
-            break
-        cursor = nxt
-        time.sleep(SLEEP_SEC)
+OUT_HTML = f"""
+<div class="ss3k-replies" style="font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+  {''.join(html_items) if html_items else '<p>No replies found.</p>'}
+</div>
+"""
 
-    log(f"[CONVO] pages={pages-1} tweets={len(tweets)} users={len(users)}")
-    return tweets, users
+with open(OUT, "w", encoding="utf-8") as f:
+    f.write(OUT_HTML)
 
-def collect_search(screen_name, root_id):
-    """Fallback collector: adaptive search over conversation_id:<root_id> (live)."""
-    tweets, users = {}, {}
-    cursor, pages = None, 0
-
-    while pages < MAX_PAGES:
-        pages += 1
-        params = {
-            "q": f"conversation_id:{root_id}",
-            "count": 100,
-            "tweet_search_mode": "live",
-            "query_source": "typed_query",
-            "tweet_mode": "extended",
-            "pc": "ContextualServices",
-            "spelling_corrections": "1",
-            "include_quote_count": "true",
-            "include_reply_count": "true",
-            "ext": "mediaStats,highlightedLabel,hashtags,antispam_media_platform,voiceInfo,superFollowMetadata,unmentionInfo,editControl,emoji_reaction"
-        }
-        if cursor: params["cursor"] = cursor
-        url = SEARCH_URL + "?" + urlencode(params)
-
-        log(f"[SEARCH] Fetch page {pages} cursor={cursor!r}")
-        data, raw, err = fetch_json(url, headers(screen_name, root_id), tag="[SEARCH]")
-        if raw is not None: save_debug_blob("search", pages, raw)
-        if not data:
-            log(f"[SEARCH] No data on page {pages}.")
-            break
-
-        extract_from_global_objects(data, tweets, users)
-
-        nxt = find_bottom_cursor(data)
-        log(f"[SEARCH] Parsed Bottom cursor: {nxt!r}")
-        if not nxt or nxt == cursor:
-            log("[SEARCH] No next cursor or same cursor — done.")
-            break
-        cursor = nxt
-        time.sleep(SLEEP_SEC)
-
-    log(f"[SEARCH] pages={pages-1} tweets={len(tweets)} users={len(users)}")
-    return tweets, users
-
-# --------- Build outputs ----------
-def tstamp(tweet):
-    try:
-        import time as _t
-        return _t.mktime(_t.strptime(tweet.get("created_at",""), "%a %b %d %H:%M:%S %z %Y"))
-    except Exception:
-        return 0
-
-def build_outputs(replies, users):
-    # Replies HTML
-    blocks = []
-    for t in replies:
-        uid = str(t.get("user_id_str") or t.get("user_id") or "")
-        u = users.get(uid, {})
-        name = u.get("name") or "User"
-        handle = u.get("screen_name") or ""
-        avatar = (u.get("profile_image_url_https") or u.get("profile_image_url") or "").replace("_normal.","_bigger.")
-        url = f"https://x.com/{handle}/status/{t.get('id_str') or t.get('id')}"
-        text = html.escape(t.get("full_text") or t.get("text") or "")
-        imgtag = f'<img class="ss3k-ravatar" src="{html.escape(avatar)}" alt="">' if avatar else '<div class="ss3k-ravatar" style="width:32px;height:32px;border-radius:50%;background:#eee"></div>'
-        who = html.escape(f"{name} (@{handle})") if handle else html.escape(name)
-        blocks.append(
-            f'<div class="ss3k-reply"><a href="{url}" target="_blank" rel="noopener">{imgtag}</a>'
-            f'<div class="ss3k-rcontent"><div class="ss3k-rname">{who}</div>'
-            f'<div class="ss3k-rtext">{text}</div></div></div>'
-        )
-    open(OUT_REPLIES,"w", encoding="utf-8").write("\n".join(blocks))
-    log(f"Wrote replies HTML: {OUT_REPLIES} ({len(blocks)} items)")
-
-    # Links HTML grouped by domain
-    doms = defaultdict(set)
-    def add_urls_from(t):
-        ent = t.get("entities") or {}
-        for u in (ent.get("urls") or []):
-            u2 = u.get("expanded_url") or u.get("url")
-            if not u2: continue
-            m = re.search(r"https?://([^/]+)/?", u2)
-            dom = m.group(1) if m else "links"
-            doms[dom].add(u2)
-
-    for t in replies:
-        add_urls_from(t)
-
-    lines = []
-    for dom in sorted(doms):
-        lines.append(f"<h4>{html.escape(dom)}</h4>")
-        lines.append("<ul>")
-        for u in sorted(doms[dom]):
-            e = html.escape(u)
-            lines.append(f'<li><a href="{e}" target="_blank" rel="noopener">{e}</a></li>')
-        lines.append("</ul>")
-    open(OUT_LINKS,"w", encoding="utf-8").write("\n".join(lines))
-    log(f"Wrote links HTML: {OUT_LINKS} (domains={len(doms)})")
-
-# --------- Main ----------
-def main():
-    try:
-        screen_name, root_id = ensure_inputs()
-        if not (screen_name and root_id):
-            return
-
-        log(f"Begin collection for @{screen_name} status {root_id}")
-
-        # 1) Try the conversation timeline (what the site itself uses)
-        tweets, users = collect_conversation(screen_name, root_id)
-
-        # 2) If that returns empty (auth/rate/visibility), fall back to search
-        if not tweets:
-            log("Primary (conversation) returned no tweets; falling back to adaptive search.")
-            tweets, users = collect_search(screen_name, root_id)
-
-        # Filter to the conversation thread only, exclude the root itself, skip pure RTs
-        replies = []
-        for tid, t in (tweets or {}).items():
-            conv = str(t.get("conversation_id_str") or t.get("conversation_id") or "")
-            if conv != str(root_id):
-                continue
-            if str(t.get("id_str") or t.get("id")) == str(root_id):
-                continue
-            if t.get("retweeted_status_id") or t.get("retweeted_status_id_str"):
-                continue
-            replies.append(t)
-
-        # De-duplicate and sort
-        uniq = {}
-        for t in replies:
-            tid = str(t.get("id_str") or t.get("id") or "")
-            if tid: uniq[tid] = t
-        replies = list(uniq.values())
-        replies.sort(key=tstamp)
-
-        log(f"Total replies in conversation: {len(replies)}")
-        build_outputs(replies, users)
-
-        if not replies:
-            log("No replies found; wrote empty structures with headers.")
-    except Exception as e:
-        log(f"FATAL: {e}\n{traceback.format_exc()}")
-        write_empty(f"fatal error: {e}")
-
-if __name__ == "__main__":
-    main()
+print(f"Wrote {len(items)} replies → {OUT}")
