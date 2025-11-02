@@ -1,232 +1,165 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stable working version — confirmed functioning with proper transcript + emoji VTT separation.
+Generate:
+- captions VTT:  ARTDIR/BASE.vtt
+- emoji VTT:     ARTDIR/BASE_emoji.vtt  (cue text is compact JSON: {"e":"😀","user":"@name"})
+- raw transcript HTML lines: ARTDIR/BASE_transcript.html (speaker: text; no visible timestamps)
+Input: a crawler JSONL containing speech segments and emoji reactions.
+We accept many shapes; see _classify().
 """
+from __future__ import annotations
+import os, sys, json, math, random, re
+from typing import Any, Dict, List, Tuple
+from utils import ensure_dir, log, html_escape, cue_time, merge_adjacent_by_speaker, first, safe_int
 
-import os, sys, re, json, html, unicodedata
-from datetime import datetime, timezone
-from statistics import median
+ARTDIR = os.environ.get("ARTDIR",".")
+BASE   = os.environ.get("BASE","space")
+JSONL_PATH = os.environ.get("JSONL_PATH","") or os.environ.get("CRAWL_JSONL","") or os.path.join(ARTDIR, f"{BASE}.jsonl")
+LOG_PATH   = os.path.join(ARTDIR, f"{BASE}_genvtt.log")
 
-ARTDIR = os.environ.get("ARTDIR", ".")
-BASE   = os.environ.get("BASE", "space")
-SRC    = os.environ.get("CC_JSONL", "")
-SHIFT  = float(os.environ.get("SHIFT_SECS", "0") or "0")
+OUT_VTT         = os.path.join(ARTDIR, f"{BASE}.vtt")
+OUT_EMOJI_VTT   = os.path.join(ARTDIR, f"{BASE}_emoji.vtt")
+OUT_TRANS_HTML  = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+OUT_PARA_HTML   = os.path.join(ARTDIR, f"{BASE}_transcript_paragraphs.html")
 
-os.makedirs(ARTDIR, exist_ok=True)
+ensure_dir(ARTDIR)
 
-VTT_PATH         = os.path.join(ARTDIR, f"{BASE}.vtt")
-TRANSCRIPT_PATH  = os.path.join(ARTDIR, f"{BASE}_transcript.html")
-SPEECH_JSON_PATH = os.path.join(ARTDIR, f"{BASE}_speech.json")
-REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
-META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
-START_PATH       = os.path.join(ARTDIR, f"{BASE}.start.txt")
-
-def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-def nfc(s):
-    if not s: return ""
-    s = unicodedata.normalize("NFC", s)
-    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
-
-def fmt_ts(t):
-    if t < 0: t = 0
-    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
-
-def to_secs(x):
-    if x is None: return None
-    try:
-        v = float(x)
-    except Exception:
-        return None
-    if v >= 1e12: v = v / 1000.0
-    return v
-
-def parse_iso(s):
-    if not s: return None
-    s = s.strip()
-    try:
-        if s.endswith("Z"): s = s[:-1] + "+00:00"
-        if re.search(r"[+-]\d{4}$", s):
-            s = s[:-5] + s[-5:-3] + ":" + s[-3:]
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return None
-
-EMOJI_RE = re.compile("[" +
-    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
-    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
-    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
-
-ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
-
-def is_emoji_only(s):
-    if not s or not s.strip(): return False
-    t = ONLY_PUNCT_SPACE.sub("", s)
-    t = EMOJI_RE.sub("", t)
-    return len(t.strip()) == 0
-
-if not (SRC and os.path.isfile(SRC)):
-    open(VTT_PATH,"w").write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH,"w").write("")
-    open(SPEECH_JSON_PATH,"w").write("[]")
-    open(REACT_JSON_PATH,"w").write("[]")
-    open(META_JSON_PATH,"w").write(json.dumps({"note":"no input"},indent=2))
-    open(START_PATH,"w").write("")
-    sys.exit(0)
-
-REL_KEYS  = ("offset","startSec","startMs","start")
-ABS_KEYS  = ("programDateTime","timestamp","ts")
-
-raw_items, reactions, abs_candidates = [], [], []
-ingest_idx = 0
-
-def first(*vals):
-    for v in vals:
-        if v not in (None,""): return v
-    return None
-
-def pick_times(d):
-    rel, abs_ts = None, None
-    for k in REL_KEYS:
-        if k in d and d[k] not in (None,""):
-            v = to_secs(d[k]); 
-            if v is not None: rel=v; break
-    if "programDateTime" in d:
-        abs_ts = parse_iso(d["programDateTime"])
-    for k in ("timestamp","ts"):
-        if k in d and d[k] not in (None,""):
-            v = to_secs(d[k])
-            if v is None: continue
-            if v >= 1e6: abs_ts=v
-            elif rel is None: rel=v
-    return rel, abs_ts
-
-def harvest(d):
-    global ingest_idx
-    txt = first(d.get("body"), d.get("text"), d.get("caption"))
-    if not txt: return
-    txt = nfc(str(txt)).strip()
-    sender = d.get("sender") or {}
-    name = first(d.get("displayName"), (sender or {}).get("display_name"), d.get("name")) or "Speaker"
-    handle = first(d.get("username"), d.get("handle"), (sender or {}).get("screen_name")) or ""
-    avatar = first((sender or {}).get("profile_image_url_https"), d.get("profile_image_url_https"), d.get("profile_image_url"))
-    rel, abs_ts = pick_times(d)
-    if is_emoji_only(txt):
-        reactions.append({"idx":ingest_idx,"rel":rel,"abs":abs_ts,"emoji":txt,"name":name,"handle":handle,"avatar":avatar})
-    else:
-        raw_items.append({"idx":ingest_idx,"rel":rel,"abs":abs_ts,"text":txt,"name":name,"username":handle,"avatar":avatar})
-        if abs_ts: abs_candidates.append(abs_ts)
-    ingest_idx+=1
-
-for line in open(SRC,"r",encoding="utf-8",errors="ignore"):
-    line=line.strip()
-    if not line: continue
-    try:
-        obj=json.loads(line)
-    except: continue
-    if isinstance(obj,dict):
-        harvest(obj)
-        pl=obj.get("payload")
-        if isinstance(pl,str):
+def load_jsonl(path: str) -> List[Dict[str,Any]]:
+    rows = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line: continue
             try:
-                harvest(json.loads(pl))
-            except: pass
-        elif isinstance(pl,dict):
-            harvest(pl)
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
 
-if not raw_items and not reactions:
-    open(VTT_PATH,"w").write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH,"w").write("")
-    open(SPEECH_JSON_PATH,"w").write("[]")
-    open(REACT_JSON_PATH,"w").write("[]")
-    sys.exit(0)
+def _classify(o: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
+    """
+    Try to classify each JSONL row as 'segment' (speech) or 'emoji' (reaction) or 'other'.
+    Returns (kind, normalized_dict)
+    segment: {begin:float, end:float, speaker:str, text:str}
+    emoji:   {time:float, emoji:str, user:str}
+    """
+    # Heuristics for speech
+    for cand in (o, o.get("segment") or {}, o.get("asr") or {}, o.get("speech") or {}, o.get("transcript") or {}):
+        text = first(cand.get("text"), cand.get("content"), cand.get("utterance"), "")
+        begin = first(cand.get("start"), cand.get("begin"), cand.get("t0"), None)
+        end   = first(cand.get("end"), cand.get("t1"), None)
+        speaker = first(cand.get("speaker"), cand.get("user"), cand.get("name"), "")
+        if text and begin is not None:
+            # fallback duration heuristic
+            try:
+                begin = float(begin)
+            except Exception:
+                begin = 0.0
+            try:
+                end = float(end) if end is not None else (begin + max(1.5, 0.06*len(str(text))))
+            except Exception:
+                end = begin + max(1.5, 0.06*len(str(text)))
+            return "segment", {"begin": max(0.0, begin), "end": max(begin, end), "speaker": str(speaker or "").strip(), "text": str(text).strip()}
 
-abs0=min(abs_candidates) if abs_candidates else None
-deltas=[]
-for it in raw_items+reactions:
-    if it.get("abs") and it.get("rel"):
-        deltas.append((it["abs"]-abs0)-it["rel"])
-delta = median(deltas) if deltas else 0.0
+    # Heuristics for reactions
+    for cand in (o, o.get("reaction") or {}, o.get("emoji") or {}, o.get("event") or {}):
+        e = first(cand.get("emoji"), cand.get("e"), cand.get("value"), "")
+        t = first(cand.get("time"), cand.get("ts"), cand.get("start"), cand.get("t"), None)
+        user = first(cand.get("user"), cand.get("handle"), cand.get("name"), "")
+        if e and t is not None:
+            try:
+                t = float(t)
+            except Exception:
+                t = 0.0
+            return "emoji", {"time": max(0.0, t), "emoji": str(e), "user": str(user or "").strip()}
+    return "other", {}
 
-def rel_time(rel,abs_ts):
-    if rel is not None: t=rel+delta
-    elif abs_ts is not None and abs0 is not None: t=abs_ts-abs0
-    else: t=0.0
-    return max(0.0, t-SHIFT)
+def build_vtts(rows: List[Dict[str,Any]]) -> Tuple[str, str]:
+    segs, emos = [], []
+    for o in rows:
+        kind, data = _classify(o)
+        if kind == "segment":
+            if data.get("text","").strip():
+                segs.append(data)
+        elif kind == "emoji":
+            emos.append(data)
 
-norm=[]
-for it in raw_items:
-    t=rel_time(it["rel"],it["abs"])
-    norm.append({**it,"t":t})
-norm.sort(key=lambda x:(x["t"],x["idx"]))
+    segs.sort(key=lambda r: (r["begin"], r["end"]))
+    emos.sort(key=lambda r: r["time"])
 
-EPS=5e-4
-last=-1e9
-for u in norm:
-    if u["t"]<=last: u["t"]=last+EPS
-    last=u["t"]
+    # Captions VTT (text only; UI handles highlighting)
+    parts = ["WEBVTT", ""]
+    for i, r in enumerate(segs, 1):
+        parts.append(f"{i}")
+        parts.append(f"{cue_time(r['begin'])} --> {cue_time(r['end'])}")
+        # Keep text only; no timestamps or speaker here
+        parts.append(r["text"].replace("\n", " ").strip())
+        parts.append("")  # blank between cues
+    captions_vtt = "\n".join(parts).rstrip() + "\n"
 
-MIN_DUR, MAX_DUR, MERGE_GAP, GUARD = 0.8, 10.0, 3.0, 0.02
-segs=[]
-for u in norm:
-    segs.append({
-        "start":u["t"], "end":u["t"]+MIN_DUR,
-        "text":u["text"], "name":u["name"],
-        "username":u["username"], "avatar":u["avatar"]
-    })
+    # Emoji VTT: json payload per cue
+    ep = ["WEBVTT", ""]
+    for i, e in enumerate(emos, 1):
+        start = e["time"]
+        end = start + 2.5  # short float window
+        payload = {"e": e["emoji"], "user": e.get("user","")}
+        ep.append(f"{i}")
+        ep.append(f"{cue_time(start)} --> {cue_time(end)}")
+        ep.append(json.dumps(payload, ensure_ascii=False))
+        ep.append("")
+    emoji_vtt = "\n".join(ep).rstrip() + "\n"
+    return captions_vtt, emoji_vtt, segs
 
-merged=[]; cur=None
-for s in segs:
-    if cur and s["name"]==cur["name"] and (s["start"]-cur["end"])<=MERGE_GAP:
-        cur["text"]+=" "+s["text"]; cur["end"]=s["end"]
-    else:
-        cur=dict(s); merged.append(cur)
+def render_transcript_html(segs: List[Dict[str,Any]]) -> Tuple[str, str]:
+    # Line-based (no visible timestamps)
+    lines = []
+    for r in segs:
+        spk = (r.get("speaker") or "").strip()
+        txt = r.get("text","").strip()
+        lines.append(
+            f'<div class="ss3k-line" data-begin="{r["begin"]:.3f}" data-end="{r["end"]:.3f}" data-speaker="{html_escape(spk)}">'
+            f'<span class="speaker">{html_escape(spk)}</span>: {html_escape(txt)}</div>'
+        )
+    line_html = "\n".join(lines)
 
-for i,g in enumerate(merged):
-    if i+1<len(merged):
-        nxt=merged[i+1]["start"]
-        g["end"]=min(MAX_DUR, max(MIN_DUR, nxt-g["start"]-GUARD))
-    else:
-        g["end"]=g["start"]+MIN_DUR
+    # Paragraphs (merge adjacent same-speaker)
+    merged = merge_adjacent_by_speaker(segs, gap=6.0)
+    paras = []
+    for r in merged:
+        spk = (r.get("speaker") or "").strip()
+        txt = r.get("text","").strip()
+        paras.append(
+            f'<p class="ss3k-para" data-begin="{r["begin"]:.3f}" data-end="{r["end"]:.3f}" data-speaker="{html_escape(spk)}">'
+            f'<span class="speaker">{html_escape(spk)}</span>: {html_escape(txt)}</p>'
+        )
+    para_html = "\n".join(paras)
+    return line_html, para_html
 
-prev=0.0
-for g in merged:
-    if g["start"]<prev+GUARD: g["start"]=prev+GUARD
-    if g["end"]<g["start"]+MIN_DUR: g["end"]=g["start"]+MIN_DUR
-    prev=g["end"]
+def main():
+    try:
+        if not JSONL_PATH or not os.path.isfile(JSONL_PATH):
+            log("JSONL not found; writing minimal outputs.", LOG_PATH)
+            with open(OUT_VTT, "w", encoding="utf-8") as fh: fh.write("WEBVTT\n\n")
+            with open(OUT_EMOJI_VTT, "w", encoding="utf-8") as fh: fh.write("WEBVTT\n\n")
+            with open(OUT_TRANS_HTML, "w", encoding="utf-8") as fh: fh.write("")
+            with open(OUT_PARA_HTML, "w", encoding="utf-8") as fh: fh.write("")
+            return 0
 
-with open(VTT_PATH,"w",encoding="utf-8") as f:
-    f.write("WEBVTT\n\n")
-    for i,g in enumerate(merged,1):
-        f.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n<v {esc(g['name'])}> {esc(g['text'])}\n\n")
+        raw = load_jsonl(JSONL_PATH)
+        captions_vtt, emoji_vtt, segs = build_vtts(raw)
+        line_html, para_html = render_transcript_html(segs)
 
-with open(TRANSCRIPT_PATH,"w",encoding="utf-8") as tf:
-    tf.write('<div class="ss3k-transcript">\n')
-    for i,g in enumerate(merged,1):
-        uname=g.get("username","").lstrip("@")
-        prof=f"https://x.com/{html.escape(uname)}" if uname else ""
-        avatar=g.get("avatar") or (f"https://unavatar.io/x/{uname}" if uname else "")
-        av=f'<a href="{prof}" target="_blank"><img class="ss3k-avatar" src="{avatar}" alt=""></a>' if avatar else "<div class='ss3k-avatar'></div>"
-        tf.write(f"<div class='ss3k-seg' data-start='{g['start']:.3f}' data-end='{g['end']:.3f}'>{av}<div class='ss3k-text'>{esc(g['text'])}</div></div>\n")
-    tf.write("</div>\n")
+        with open(OUT_VTT, "w", encoding="utf-8") as fh: fh.write(captions_vtt)
+        with open(OUT_EMOJI_VTT, "w", encoding="utf-8") as fh: fh.write(emoji_vtt)
+        with open(OUT_TRANS_HTML, "w", encoding="utf-8") as fh: fh.write(line_html)
+        with open(OUT_PARA_HTML, "w", encoding="utf-8") as fh: fh.write(para_html)
 
-speech=[{"start":round(g["start"],3),"end":round(g["end"],3),"text":g["text"],
-         "name":g["name"],"handle":g["username"],"avatar":g["avatar"]} for g in merged]
-open(SPEECH_JSON_PATH,"w").write(json.dumps(speech,ensure_ascii=False))
+        log(f"Wrote {OUT_VTT}, {OUT_EMOJI_VTT}, {OUT_TRANS_HTML}, {OUT_PARA_HTML}", LOG_PATH)
+        return 0
+    except Exception as e:
+        log(f"ERROR: {e}", LOG_PATH)
+        return 1
 
-rx=[]
-for r in reactions:
-    t=rel_time(r["rel"],r["abs"])
-    rx.append({"t":round(t,3),"emoji":r["emoji"],"name":r["name"],
-               "handle":r["handle"],"avatar":r["avatar"]})
-open(REACT_JSON_PATH,"w").write(json.dumps(rx,ensure_ascii=False))
-
-meta={"speech_segments":len(merged),"reactions":len(rx),"shift_secs":SHIFT,"delta_used":round(delta,6)}
-open(META_JSON_PATH,"w").write(json.dumps(meta,indent=2))
-if abs_candidates:
-    start_iso=datetime.fromtimestamp(min(abs_candidates),timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
-    open(START_PATH,"w").write(start_iso+"\n")
+if __name__ == "__main__":
+    sys.exit(main())
