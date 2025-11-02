@@ -297,11 +297,9 @@ jobs:
           SR="${SRC_SR:-48000}"
 
           if [ "${PROF}" = "transparent" ]; then
-            # Preserve tone; no denoise/EQ/comp; transparent VBR
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -map a:0 -c:a libmp3lame -q:a 0 -ar "$SR" -ac "$CH" "$OUT"
 
           elif [ "${PROF}" = "radio" ]; then
-            # Clean & even loudness (two-pass loudnorm), no hollow/echo
             PRE="highpass=f=60,lowpass=f=14000,afftdn=nr=4:nf=-28,deesser=i=0.12,acompressor=threshold=-18dB:ratio=2:attack=12:release=220:makeup=2"
             PASS1_JSON="${WORKDIR}/loudnorm1.json"
             ffmpeg -hide_banner -y -i "$AUDIO_IN" -af "${PRE},loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>"${WORKDIR}/pass1.log" || true
@@ -321,7 +319,6 @@ jobs:
             fi
 
           else
-            # aggressive profile: optional RNNoise + stronger comp + two-pass loudnorm
             PRE="highpass=f=70,lowpass=f=11500,afftdn=nr=8:nf=-25,deesser=i=0.2,acompressor=threshold=-18dB:ratio=2.8:attack=8:release=200:makeup=3"
             if [ "${{ github.event.inputs.aggressive_denoise }}" = "true" ]; then
               M="${WORKDIR}/rnnoise.rnnn"
@@ -850,9 +847,9 @@ jobs:
           OUT_REPLIES = os.path.join(ARTDIR, f"{BASE}_replies.html")
           OUT_LINKS   = os.path.join(ARTDIR, f"{BASE}_links.html")
 
-          AUTH = os.environ.get("TWITTER_AUTHORIZATION","").strip()  # must start with "Bearer "
-          AUTH_COOKIE = os.environ.get("TWITTER_AUTH_TOKEN","").strip()  # auth_token cookie
-          CSRF = os.environ.get("TWITTER_CSRF_TOKEN","").strip()         # ct0 cookie
+          AUTH = os.environ.get("TWITTER_AUTHORIZATION","").strip()
+          AUTH_COOKIE = os.environ.get("TWITTER_AUTH_TOKEN","").strip()
+          CSRF = os.environ.get("TWITTER_CSRF_TOKEN","").strip()
 
           def write_empty():
               open(OUT_REPLIES, "w").write("")
@@ -1025,31 +1022,6 @@ jobs:
             echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
           fi
 
-      - name: Build VTT and transcript after trim
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
-        shell: bash
-        env:
-          CC_JSONL: ${{ env.CRAWLER_CC }}
-          SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
-        run: |
-          set -euxo pipefail
-          if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
-              python3 ".github/workflows/scripts/gen_vtt.py"
-            [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
-          fi
-
-      - name: Polish transcript (optional)
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.TRANSCRIPT_PATH != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 ".github/workflows/scripts/polish_transcript.py" || true
-          if [ -s "${ARTDIR}/${BASE}_transcript_polished.html" ]; then
-            echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
-          fi
-
       - name: VTT via Deepgram fallback
         id: deepgram
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.VTT_PATH == '' && env.DEEPGRAM_API_KEY != '' && github.event.inputs.do_transcript == 'true' && env.MP3_PATH != '' }}
@@ -1153,7 +1125,6 @@ jobs:
           if [ -z "$TTL" ]; then TTL="${BASE}"; fi
           echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
 
-          # Start time from crawler metadata in ms (preferred) or transcript start.txt
           START_ISO=""
           if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
             MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
