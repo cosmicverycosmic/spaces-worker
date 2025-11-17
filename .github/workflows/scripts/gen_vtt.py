@@ -84,49 +84,150 @@ def first(*vals):
             return v
     return None
 
+# ---------- Deep-search helpers for generic crawler output ----------
+
+TEXT_KEYS_PRI = ["payloadText", "body", "text", "caption", "message", "msg"]
+NAME_KEYS_PRI = ["displayName", "display_name", "speaker_name", "speakerName", "name"]
+UNAME_KEYS_PRI = ["username", "screen_name", "handle", "user_id"]
+AVATAR_KEYS_PRI = ["profile_image_url_https", "profile_image_url", "avatar_url"]
+
+def deep_first_str(d, keys):
+    """Breadth-first search for the first non-empty string in any of the given keys."""
+    if not isinstance(d, (dict, list)):
+        return None
+    queue = [d]
+    while queue:
+        cur = queue.pop(0)
+        if isinstance(cur, dict):
+            for k in keys:
+                if k in cur and isinstance(cur[k], str):
+                    v = cur[k].strip()
+                    if v:
+                        return v
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+    return None
+
+def deep_first_time(d):
+    """Breadth-first search for something that looks like a timestamp."""
+    if not isinstance(d, (dict, list)):
+        return None
+    queue = [d]
+    while queue:
+        cur = queue.pop(0)
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                kl = k.lower()
+                if isinstance(v, (int, float, str)):
+                    # Numeric-ish fields with obvious time-ish keys
+                    if any(kw in kl for kw in ("offset","timestamp","start","time","ts","created_at")):
+                        tf = to_float_seconds(v)
+                        if tf is not None:
+                            return tf
+                    # ISO-ish strings
+                    if isinstance(v, str) and "T" in v and ":" in v:
+                        ts = parse_time_iso(v)
+                        if ts is not None:
+                            return ts
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+    return None
+
+def deep_first_name(d):
+    return clean_name(deep_first_str(d, NAME_KEYS_PRI))
+
+def deep_first_uname(d):
+    u = deep_first_str(d, UNAME_KEYS_PRI)
+    return (u or "").lstrip("@")
+
+def deep_first_avatar(d):
+    return deep_first_str(d, AVATAR_KEYS_PRI)
+
 raw_utts = []
+
+def push(ts_abs, txt, disp, uname, avatar, te_abs=None):
+    if ts_abs is None or not txt:
+        return
+    t2 = norm_text(txt)
+    if not t2:
+        return
+    raw_utts.append({
+        "ts": float(ts_abs),
+        "text": t2,  # full text including emoji (we'll strip emoji later where needed)
+        "name": clean_name(disp or uname or "Speaker"),
+        "username": (uname or "").lstrip("@"),
+        "avatar": avatar or "",
+        "end_ts": float(te_abs) if te_abs is not None else None
+    })
+
+def generic_from_obj(obj):
+    """Very forgiving path: look anywhere in the JSON for text+time."""
+    if not isinstance(obj, (dict, list)):
+        return
+    txt = deep_first_str(obj, TEXT_KEYS_PRI)
+    ts_abs = deep_first_time(obj)
+    if not txt or ts_abs is None:
+        return
+    disp = deep_first_name(obj)
+    uname = deep_first_uname(obj)
+    avatar = deep_first_avatar(obj)
+    push(ts_abs, txt, disp, uname, avatar, None)
+
+# ---------- Parse CC JSONL from crawler ----------
+
 with open(src,'r',encoding='utf-8',errors='ignore') as f:
     for line in f:
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         try:
             obj = json.loads(line)
         except:
             obj = None
 
-        layer = None; sender = {}
+        layer = None
+        sender = {}
+
         if isinstance(obj, dict) and isinstance(obj.get("payload"), str):
             try:
                 pl = json.loads(obj["payload"])
-                if isinstance(pl, dict) and isinstance(pl.get("body"), str):
-                    try:
-                        layer  = json.loads(pl["body"])
-                        sender = pl.get("sender") or {}
-                    except:
-                        layer = None
+                if isinstance(pl, dict):
+                    sender = pl.get("sender") or {}
+                    if isinstance(pl.get("body"), str):
+                        try:
+                            layer = json.loads(pl["body"])
+                        except:
+                            layer = None
+                    else:
+                        # payload is dict-like already
+                        layer = pl.get("body") or pl
             except:
-                pass
+                layer = None
         else:
             layer = obj
 
-        def push(ts_abs, txt, disp, uname, avatar, te_abs=None):
-            if ts_abs is None or not txt: return
-            t2 = norm_text(txt)
-            if not t2: return
-            raw_utts.append({
-                "ts": float(ts_abs),
-                "text": t2,  # full text including emoji (we'll strip emoji later where needed)
-                "name": clean_name(disp or uname or "Speaker"),
-                "username": (uname or "").lstrip("@"),
-                "avatar": avatar or "",
-                "end_ts": float(te_abs) if te_abs is not None else None
-            })
+        prev_len = len(raw_utts)
 
-        # -------- inner layer path (payload/body JSON) --------
+        # -------- primary: inner "layer" path (payload/body JSON) --------
         if isinstance(layer, dict) and layer:
             ttype = layer.get("type")
-            # IMPORTANT: include payloadText here so speech text is actually picked up
-            txt   = first(layer.get("body"), layer.get("text"), layer.get("caption"), layer.get("payloadText"))
+            # Include payloadText here so speech text is actually picked up
+            txt   = first(
+                layer.get("body"),
+                layer.get("text"),
+                layer.get("caption"),
+                layer.get("payloadText")
+            )
             disp  = first(
                 layer.get("displayName"),
                 (sender or {}).get("display_name"),
@@ -140,14 +241,18 @@ with open(src,'r',encoding='utf-8',errors='ignore') as f:
             )
             avat  = first(
                 (sender or {}).get("profile_image_url_https"),
-                (sender or {}).get("profile_image_url")
+                (sender or {}).get("profile_image_url"),
+                layer.get("avatar_url")
             )
 
             ts_abs = first(
                 to_float_seconds(layer.get("timestamp")),
                 parse_time_iso(layer.get("programDateTime")),
-                to_float_seconds(layer.get("start")), to_float_seconds(layer.get("startSec")), to_float_seconds(layer.get("startMs")),
-                to_float_seconds(layer.get("ts")), to_float_seconds(layer.get("offset"))
+                to_float_seconds(layer.get("start")),
+                to_float_seconds(layer.get("startSec")),
+                to_float_seconds(layer.get("startMs")),
+                to_float_seconds(layer.get("ts")),
+                to_float_seconds(layer.get("offset"))
             )
             te_abs = first(
                 to_float_seconds(layer.get("end")),
@@ -158,21 +263,27 @@ with open(src,'r',encoding='utf-8',errors='ignore') as f:
             if txt and (ttype is None or ttype == 45 or any(k in layer for k in ("start","startMs","timestamp","programDateTime","ts","offset"))):
                 if ts_abs is not None:
                     push(ts_abs, txt, disp, uname, avat, te_abs)
-                continue
 
         # -------- fallback: flat obj path --------
-        if isinstance(obj, dict):
-            txt   = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"))
+        if isinstance(obj, dict) and len(raw_utts) == prev_len:
+            txt   = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"), obj.get("body"))
             ts_abs = first(
                 to_float_seconds(obj.get("timestamp")),
                 parse_time_iso(obj.get("programDateTime")),
-                to_float_seconds(obj.get("start")), to_float_seconds(obj.get("startMs")), to_float_seconds(obj.get("ts"))
+                to_float_seconds(obj.get("start")),
+                to_float_seconds(obj.get("startMs")),
+                to_float_seconds(obj.get("ts")),
+                to_float_seconds(obj.get("offset"))
             )
             disp  = first(obj.get("displayName"), obj.get("speaker"), obj.get("user"), obj.get("name"))
-            uname = first(obj.get("username"), obj.get("handle"), obj.get("screen_name"))
-            avat  = first(obj.get("profile_image_url_https"), obj.get("profile_image_url"))
+            uname = first(obj.get("username"), obj.get("handle"), obj.get("screen_name"), obj.get("user_id"))
+            avat  = first(obj.get("profile_image_url_https"), obj.get("profile_image_url"), obj.get("avatar_url"))
             if txt and ts_abs is not None:
                 push(ts_abs, txt, disp, uname, avat)
+
+        # -------- last-resort: deep generic scan over the whole object --------
+        if len(raw_utts) == prev_len and isinstance(obj, (dict, list)):
+            generic_from_obj(obj)
 
 if not raw_utts:
     os.makedirs(artdir, exist_ok=True)
