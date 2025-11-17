@@ -626,16 +626,26 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts (always)
+      # --- Artifact minimization: upload captions only (no audio) ---
+      - name: Collect caption files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$ARTDIR/captions"
+          find "$ARTDIR" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -exec cp -a {} "$ARTDIR/captions/" \;
+          find "$ARTDIR" -type f \( -iname '*cc.txt'   -o -iname '*caption*.txt'   -o -iname '*captions*.txt'   \) -exec cp -a {} "$ARTDIR/captions/" \;
+          ls -lah "$ARTDIR/captions" || true
+
+      - name: Upload captions (jsonl + txt only)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: space-run-${{ github.run_id }}
-          path: |
-            ${{ env.ARTDIR }}/**
-            ${{ env.WORKDIR }}/**
-            .github/workflows/scripts/**
-          retention-days: 14
+          name: captions-${{ steps.ids.outputs.space_id }}-${{ github.run_id }}
+          path: ${{ env.ARTDIR }}/captions/**
+          if-no-files-found: ignore
+          retention-days: 10
+          compression-level: 0
 
       - name: Tail logs to summary (always)
         if: ${{ always() }}
