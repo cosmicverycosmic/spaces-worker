@@ -195,7 +195,6 @@ jobs:
           echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
           [ -n "$AUTH" ] && echo "TWITTER_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
 
-      # NEW: allow transcript_only from an existing MP3 URL (no crawler needed)
       - name: Use existing MP3 if provided
         id: use_existing
         if: ${{ github.event.inputs.mode == 'transcript_only' && github.event.inputs.existing_mp3_url != '' }}
