@@ -115,19 +115,33 @@ with open(src,'r',encoding='utf-8',errors='ignore') as f:
             if not t2: return
             raw_utts.append({
                 "ts": float(ts_abs),
-                "text": t2,
+                "text": t2,  # full text including emoji (we'll strip emoji later where needed)
                 "name": clean_name(disp or uname or "Speaker"),
                 "username": (uname or "").lstrip("@"),
                 "avatar": avatar or "",
                 "end_ts": float(te_abs) if te_abs is not None else None
             })
 
+        # -------- inner layer path (payload/body JSON) --------
         if isinstance(layer, dict) and layer:
             ttype = layer.get("type")
-            txt   = first(layer.get("body"), layer.get("text"), layer.get("caption"))
-            disp  = first(layer.get("displayName"), (sender or {}).get("display_name"), layer.get("speaker_name"), layer.get("speakerName"))
-            uname = first(layer.get("username"), (sender or {}).get("screen_name"), layer.get("user_id"))
-            avat  = first((sender or {}).get("profile_image_url_https"), (sender or {}).get("profile_image_url"))
+            # IMPORTANT: include payloadText here so speech text is actually picked up
+            txt   = first(layer.get("body"), layer.get("text"), layer.get("caption"), layer.get("payloadText"))
+            disp  = first(
+                layer.get("displayName"),
+                (sender or {}).get("display_name"),
+                layer.get("speaker_name"),
+                layer.get("speakerName")
+            )
+            uname = first(
+                layer.get("username"),
+                (sender or {}).get("screen_name"),
+                layer.get("user_id")
+            )
+            avat  = first(
+                (sender or {}).get("profile_image_url_https"),
+                (sender or {}).get("profile_image_url")
+            )
 
             ts_abs = first(
                 to_float_seconds(layer.get("timestamp")),
@@ -146,6 +160,7 @@ with open(src,'r',encoding='utf-8',errors='ignore') as f:
                     push(ts_abs, txt, disp, uname, avat, te_abs)
                 continue
 
+        # -------- fallback: flat obj path --------
         if isinstance(obj, dict):
             txt   = first(obj.get("text"), obj.get("caption"), obj.get("payloadText"))
             ts_abs = first(
@@ -215,7 +230,7 @@ for u in raw_utts:
     utts.append({
         "start_rel": st,
         "end_rel": et,
-        "text": u["text"],
+        "text": u["text"],          # still full text (with emoji)
         "name": u["name"],
         "username": u["username"],
         "avatar": u["avatar"],
@@ -254,8 +269,14 @@ for u in utts:
         cur["text"] = (cur["text"] + sep + u["text"]).strip()
         cur["end_rel"] = max(cur["end_rel"], u["end_rel"])
     else:
-        cur = {"name":u["name"], "username":u["username"], "avatar":u["avatar"],
-               "start_rel":u["start_rel"], "end_rel":u["end_rel"], "text":u["text"]}
+        cur = {
+            "name":u["name"],
+            "username":u["username"],
+            "avatar":u["avatar"],
+            "start_rel":u["start_rel"],
+            "end_rel":u["end_rel"],
+            "text":u["text"]
+        }
         groups.append(cur)
 
 # Final pass: enforce non-overlap and min duration
@@ -269,15 +290,7 @@ for g in groups:
 
 os.makedirs(artdir, exist_ok=True)
 
-# -------- Write full captions VTT --------
-vtt_path = os.path.join(artdir, f"{base}.vtt")
-with open(vtt_path, "w", encoding="utf-8") as vf:
-    vf.write("WEBVTT\n\n")
-    for i, g in enumerate(groups, 1):
-        vf.write(f"{i}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
-        vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
-
-# -------- Emoji-only VTT --------
+# -------- Emoji detection helpers --------
 EMOJI_RE = re.compile(
     "["                       
     "\U0001F1E6-\U0001F1FF"  # flags
@@ -292,22 +305,50 @@ EMOJI_RE = re.compile(
     "\U00002300-\U000023FF"  # misc tech
     "]+", flags=re.UNICODE
 )
-def only_emoji(s:str)->str:
+
+def only_emoji(s: str) -> str:
     if not s: return ""
     return "".join(EMOJI_RE.findall(s))
 
+def strip_emoji(s: str) -> str:
+    if not s: return ""
+    return EMOJI_RE.sub("", s)
+
+# -------- Build speech-only groups (no emoji) --------
+speech_groups = []
+for g in groups:
+    text_no_emoji = strip_emoji(g["text"]).strip()
+    if not text_no_emoji:
+        # purely emoji → no transcript entry
+        continue
+    ng = g.copy()
+    ng["text_no_emoji"] = text_no_emoji
+    speech_groups.append(ng)
+
+# -------- Write full captions VTT (no emoji) --------
+vtt_path = os.path.join(artdir, f"{base}.vtt")
+with open(vtt_path, "w", encoding="utf-8") as vf:
+    vf.write("WEBVTT\n\n")
+    for i, g in enumerate(speech_groups, 1):
+        vf.write(f"{i}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
+        vf.write(f"<v {esc(g['name'])}> {esc(g['text_no_emoji'])}\n\n")
+
+# -------- Emoji-only VTT (timestamp + username + emoji) --------
 evtt_path = os.path.join(artdir, f"{base}_emoji.vtt")
 with open(evtt_path, "w", encoding="utf-8") as ef:
     ef.write("WEBVTT\n\n")
     j = 1
     for g in groups:
         em = only_emoji(g["text"])
-        if not em: continue
+        if not em:
+            continue
+        handle = (g.get("username") or "").strip().lstrip("@")
+        label = f"@{handle}" if handle else g.get("name") or "Listener"
         ef.write(f"{j}\n{fmt_ts(g['start_rel'])} --> {fmt_ts(g['end_rel'])}\n")
-        ef.write(f"{em}\n\n")
+        ef.write(f"{esc(label)} {esc(em)}\n\n")
         j += 1
 
-# -------- Rich transcript HTML (avatars + names) --------
+# -------- Rich transcript HTML (no emoji text) --------
 css = '''
 <style>
 .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
@@ -360,7 +401,7 @@ tr_path = os.path.join(artdir, f"{base}_transcript.html")
 with open(tr_path, "w", encoding="utf-8") as tf:
     tf.write(css)
     tf.write('<div class="ss3k-transcript">\n')
-    for i, g in enumerate(groups, 1):
+    for i, g in enumerate(speech_groups, 1):
         name  = g["name"]
         uname = (g.get("username") or "").strip().lstrip("@")
         prof  = f"https://x.com/{html.escape(uname, True)}" if uname else ""
@@ -381,7 +422,7 @@ with open(tr_path, "w", encoding="utf-8") as tf:
         tf.write(avtag)
         tf.write('<div class="ss3k-body">')
         tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start_rel"])}</time>–<time>{fmt_ts(g["end_rel"])}</time></div>')
-        tf.write(f'<div class="ss3k-text">{html.escape(g["text"], True)}</div>')
+        tf.write(f'<div class="ss3k-text">{html.escape(g["text_no_emoji"], True)}</div>')
         tf.write('</div></div>\n')
     tf.write('</div>\n')
     tf.write(js)
