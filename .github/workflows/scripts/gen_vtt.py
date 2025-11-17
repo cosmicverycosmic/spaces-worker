@@ -1,187 +1,194 @@
 #!/usr/bin/env python3
-import os, sys, json, math, re
-from collections import defaultdict, Counter
+"""
+gen_vtt.py — Parse X/Twitter Spaces CC.jsonl into WebVTT + HTML transcript.
+
+Env:
+  CC_JSONL, ARTDIR, BASE, SHIFT_SECS (float, default 0)
+  JOIN_GAP_SECS (float, default 1.2), PAD_SECS (float, default 0.08)
+
+Outputs:
+  {ARTDIR}/{BASE}.vtt
+  {ARTDIR}/{BASE}_emoji.vtt  (if any emoji found)
+  {ARTDIR}/{BASE}_transcript.html
+"""
+from __future__ import annotations
+import os, json, re, html
 from datetime import datetime, timezone
 
-ARTDIR = os.environ.get("ARTDIR", os.getcwd())
-BASE   = os.environ.get("BASE", "space")
-CC_JSONL = os.environ.get("CC_JSONL")
-SHIFT_SECS = float(os.environ.get("SHIFT_SECS", "0") or "0")
+def _parse_iso(s: str | None):
+    if not s: return None
+    try:
+        if s.endswith('Z'): s = s[:-1] + '+00:00'
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
-out_vtt_path       = os.path.join(ARTDIR, f"{BASE}.vtt")
-out_emoji_vtt_path = os.path.join(ARTDIR, f"{BASE}_emoji.vtt")
-out_html_path      = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+def _decode(line: str):
+    """Return (top, payload, body) where body is dict or None."""
+    try:
+        top = json.loads(line)
+    except Exception:
+        return None, None, None
+    payload = top.get("payload")
+    if isinstance(payload, str):
+        try: payload = json.loads(payload)
+        except Exception: payload = None
+    if isinstance(payload, dict):
+        body = payload.get("body")
+        if isinstance(body, str):
+            try: body = json.loads(body)
+            except Exception: body = None
+    else:
+        body = None
+    return top, payload, body
 
-def fmt_time(sec: float) -> str:
+def _speaker(username: str | None, display: str | None) -> str:
+    return "@"+username if username else (display or "Speaker")
+
+def _norm_text(t: str) -> str:
+    t = t.replace('\r', ' ').replace('\n', ' ').strip()
+    t = re.sub(r'\s+', ' ', t)
+    t = re.sub(r'\s*-\s*$', '', t)
+    return t
+
+def _fmt_ts(sec: float) -> str:
     if sec < 0: sec = 0.0
-    ms = int(round(sec * 1000.0))
-    h = ms // 3600000; ms %= 3600000
-    m = ms // 60000;   ms %= 60000
-    s = ms // 1000;    ms %= 1000
+    ms = int(round(sec*1000))
+    h = ms // 3_600_000; ms -= h*3_600_000
+    m = ms // 60_000;     ms -= m*60_000
+    s = ms // 1_000;      ms -= s*1_000
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
-def load_as_line_base_ms() -> int | None:
-    cand = os.path.join(ARTDIR, "_as_line.json")
-    if not os.path.isfile(cand):
-        return None
-    try:
-        with open(cand, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        a = data.get("audioSpace", data) or {}
-        meta = a.get("metadata", {})
-        candidates = [
-            meta.get("started_at"),
-            meta.get("created_at"),
-            meta.get("start"),
-            data.get("started_at"),
-            data.get("created_at"),
-            data.get("start"),
-        ]
-        for v in candidates:
-            if isinstance(v, (int, float)) and 9_000_000_000_000 > v > 1_000_000_000:
-                return int(v)
-    except Exception:
-        pass
-    return None
+def parse_captions(jsonl_path: str, shift_secs: float=0.0, join_gap: float=1.2, pad: float=0.08):
+    events, reactions = [], []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for _, line in enumerate(f):
+            top, payload, body = _decode(line)
+            if not isinstance(body, dict): continue
+            ttype = body.get("type")
 
-def parse_jsonl_events(path: str):
-    """Yield normalized events from CC-like JSONL captured by twspace-crawler."""
-    if not path or not os.path.isfile(path):
-        raise FileNotFoundError(f"CC JSONL not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line=line.strip()
-            if not line:
-                continue
-            try:
-                j = json.loads(line)
-                p = j.get("payload")
-                if isinstance(p, str):
-                    p = json.loads(p)
-                body = p.get("body")
-                if isinstance(body, str):
-                    body = json.loads(body)
-            except Exception:
-                continue
-            yield {
-                "etype": body.get("type"),
-                "display": body.get("displayName") or body.get("name") or "",
-                "ts_ms": body.get("timestamp") if isinstance(body.get("timestamp"), int) else None,
-                "body": body.get("body"),
-            }
+            if ttype == 45:  # speech-to-text (final)
+                txt = _norm_text(str(body.get("body","")))
+                if not txt: continue
+                dt = _parse_iso(body.get("programDateTime"))
+                if dt is None:
+                    ts = top.get("timestamp")
+                    if isinstance(ts, (int, float)):
+                        try: dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
+                        except Exception: dt = None
+                if dt is None: continue
+                events.append({
+                    "dt": dt,
+                    "text": txt,
+                    "user": _speaker(body.get("username"), body.get("displayName"))
+                })
 
-def is_emoji(s: str) -> bool:
-    if not isinstance(s, str) or not s:
-        return False
-    if len(s) <= 3 and not re.search(r"[A-Za-z0-9]", s):
-        return True
-    return False
+            elif ttype == 2:  # reactions/emoji
+                emo = str(body.get("body","")).strip()
+                if not emo: continue
+                dt = _parse_iso(body.get("programDateTime"))
+                if dt is None:
+                    ts = top.get("timestamp")
+                    if isinstance(ts, (int, float)):
+                        try: dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
+                        except Exception: dt = None
+                if dt:
+                    reactions.append({
+                        "dt": dt,
+                        "text": f"{emo} {_speaker(body.get('username'), body.get('displayName'))}"
+                    })
 
-def build_emoji_vtt(events: list[dict], base_ms: int | None) -> tuple[str,int]:
-    MIN_EPOCH_MS = 978307200000  # 2001-01-01 UTC
-    emoji_events = [e for e in events if e["etype"] == 2 and isinstance(e["body"], str) and is_emoji(e["body"]) and isinstance(e["ts_ms"], int)]
-    if not emoji_events:
-        return "WEBVTT\n\nNOTE No emoji events found\n", 0
+    if not events:
+        return {"base_dt": None, "cues": [], "emoji": []}
 
-    plaus = [e for e in emoji_events if e["ts_ms"] >= (base_ms or MIN_EPOCH_MS) - 86_400_000]
-    if not plaus:
-        plaus = emoji_events
+    events.sort(key=lambda e: e["dt"])
+    base = events[0]["dt"]
 
-    if base_ms is None:
-        base_ms = min(e["ts_ms"] for e in plaus)
-        use_shift = True
-    else:
-        use_shift = False
-
-    rows = []
-    for e in plaus:
-        rel = (e["ts_ms"] - base_ms) / 1000.0
-        if use_shift and SHIFT_SECS:
-            rel = rel - float(SHIFT_SECS)
-        if rel < -5:
+    cues, cur = [], None
+    for e in events:
+        t = (e["dt"] - base).total_seconds() - float(shift_secs)
+        if t < 0: t = 0.0
+        if cur is None:
+            cur = {"start": t, "end": None, "user": e["user"], "text": e["text"]}
             continue
-        rel = max(0.0, rel)
-        rows.append((rel, e["body"], e.get("display","")))
-    if not rows:
-        return "WEBVTT\n\nNOTE No emoji events usable after filtering\n", 0
 
-    bucket = defaultdict(list)
-    bucket_size = 0.5
-    for t, emo, disp in rows:
-        key = math.floor(t / bucket_size) * bucket_size
-        bucket[key].append((t, emo, disp))
+        if e["user"] == cur["user"] and (cur["end"] is None or (t - cur["end"]) <= join_gap):
+            cur["end"] = t
+            if cur["text"] and not cur["text"].endswith(('-', '—')): cur["text"] += " "
+            cur["text"] += e["text"]
+        else:
+            if cur["end"] is None or cur["end"] < cur["start"] + 0.4:
+                wc = max(1, len(cur["text"].split()))
+                cur["end"] = cur["start"] + min(6.0, max(1.6, 0.35*wc))
+            cur["end"] = max(cur["end"], cur["start"] + 0.24)
+            cur["end"] = min(cur["end"], t - pad) if t > cur["start"] else cur["end"]
+            cues.append(cur)
+            cur = {"start": t, "end": None, "user": e["user"], "text": e["text"]}
 
+    if cur is not None:
+        if cur["end"] is None or cur["end"] < cur["start"] + 0.4:
+            wc = max(1, len(cur["text"].split()))
+            cur["end"] = cur["start"] + min(6.0, max(1.6, 0.35*wc))
+        cur["end"] = max(cur["end"], cur["start"] + 0.24)
+        cues.append(cur)
+
+    emoji_cues = []
+    if reactions:
+        reactions.sort(key=lambda r: r["dt"])
+        for r in reactions:
+            t = (r["dt"] - base).total_seconds() - float(shift_secs)
+            if t < 0: t = 0.0
+            emoji_cues.append({"start": t, "end": t + 0.8, "text": r["text"]})
+
+    return {"base_dt": base, "cues": cues, "emoji": emoji_cues}
+
+def write_vtt(cues, out_path):
     lines = ["WEBVTT", ""]
-    cue_count = 0
-    for start in sorted(bucket.keys()):
-        items = bucket[start]
-        counts = Counter([emo for _, emo, _ in items])
-        text = " ".join((emo * min(c, 6)) if len(emo) == 1 else (emo + f"×{c}" if c>1 else emo) for emo, c in counts.items())
-        if not text:
-            continue
-        cue_count += 1
-        cue_start = start
-        cue_end = start + 1.2
-        lines.append(f"{fmt_time(cue_start)} --> {fmt_time(cue_end)}")
-        lines.append(text)
+    for c in cues:
+        lines.append(f"{_fmt_ts(c['start'])} --> {_fmt_ts(c['end'])}")
+        speaker = c.get("user") or "Speaker"
+        text = re.sub(r'\s{2,}', ' ', c["text"]).strip()
+        lines.append(f"<v {speaker}>{html.escape(text)}")
         lines.append("")
-    return "\n".join(lines) + ("\n" if not lines[-1].endswith("\n") else ""), cue_count
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+def write_transcript_html(cues, out_path):
+    parts = []
+    parts.append('<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;line-height:1.45;padding:1rem} .t{cursor:pointer} .speaker{color:#333;font-weight:600} .time{color:#777;font-size:.85em;margin-left:.25rem} .seg{margin:.25rem 0}</style><section class="transcript">')
+    for c in cues:
+        spk = html.escape(c.get("user") or "Speaker")
+        start = c["start"]
+        parts.append(f'<p class="seg"><span class="speaker">{spk}</span><span class="time" data-start="{start:.3f}">[{_fmt_ts(start)}]</span> <span class="t" data-start="{start:.3f}">{html.escape(c["text"])}</span></p>')
+    parts.append("</section>")
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(parts))
 
 def main():
-    if not CC_JSONL or not os.path.isfile(CC_JSONL):
-        print(f"[gen_vtt] No CC_JSONL found at {CC_JSONL!r}; nothing to do.", file=sys.stderr)
-        for p in (out_vtt_path, out_emoji_vtt_path, out_html_path):
-            try:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write("")
-            except Exception:
-                pass
-        return 0
+    cc = os.environ.get("CC_JSONL") or ""
+    art = os.environ.get("ARTDIR") or "."
+    base = os.environ.get("BASE") or "space"
+    shift = float(os.environ.get("SHIFT_SECS") or 0.0)
+    join_gap = float(os.environ.get("JOIN_GAP_SECS") or 1.2)
+    pad = float(os.environ.get("PAD_SECS") or 0.08)
 
-    events = list(parse_jsonl_events(CC_JSONL))
-    base_ms = load_as_line_base_ms()
+    if not os.path.isfile(cc):
+        raise SystemExit(f"CC_JSONL not found: {cc}")
 
-    emoji_vtt, emoji_count = build_emoji_vtt(events, base_ms)
-    with open(out_emoji_vtt_path, "w", encoding="utf-8") as f:
-        f.write(emoji_vtt)
+    os.makedirs(art, exist_ok=True)
 
-    text_vtt = "WEBVTT\n\nNOTE No text captions were present in the provided CC JSONL.\n"
-    with open(out_vtt_path, "w", encoding="utf-8") as f:
-        f.write(text_vtt)
+    parsed = parse_captions(cc, shift_secs=shift, join_gap=join_gap, pad=pad)
+    cues, emoji = parsed["cues"], parsed["emoji"]
 
-    emoji_counts = Counter()
-    for e in events:
-        if e["etype"] == 2 and isinstance(e["body"], str) and is_emoji(e["body"]):
-            emoji_counts[e["body"]] += 1
+    write_vtt(cues, os.path.join(art, f"{base}.vtt"))
+    if emoji:
+        write_vtt(emoji, os.path.join(art, f"{base}_emoji.vtt"))
+    write_transcript_html(cues, os.path.join(art, f"{base}_transcript.html"))
 
-    try:
-        first_ts = min([e["ts_ms"] for e in events if e["ts_ms"]], default=None)
-        last_ts  = max([e["ts_ms"] for e in events if e["ts_ms"]], default=None)
-        def tsfmt(ms):
-            if not isinstance(ms, int): return "n/a"
-            return datetime.fromtimestamp(ms/1000, tz=timezone.utc).isoformat()
-        window = f"{tsfmt(first_ts)} → {tsfmt(last_ts)}"
-    except Exception:
-        window = "n/a"
-
-    html = ["<!DOCTYPE html><meta charset='utf-8'><title>Transcript</title>",
-            "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.4;margin:0;padding:1rem;}",
-            "h1{font-size:1.2rem;margin:.5rem 0;} .muted{opacity:.7;font-size:.9rem;} .chip{display:inline-block;margin:.15rem .3rem;padding:.2rem .5rem;border-radius:.75rem;background:#f1f1f1;}",
-            "code{background:#f7f7f7;padding:.1rem .25rem;border-radius:.25rem;}</style>",
-            f"<h1>{BASE} — Transcript</h1>",
-            "<p class='muted'>No text captions were present in the source JSONL; generated emoji VTT only.</p>",
-            f"<p class='muted'><b>Time window:</b> {window}</p>",
-            "<h2>Emoji summary</h2>",
-            "<p>Top reactions:</p><p>"]
-    for emo, c in emoji_counts.most_common(20):
-        display = (emo * min(c, 6)) if len(emo) == 1 else emo
-        html.append(f"<span class='chip'>{display} <small>×{c}</small></span>")
-    html.append("</p>")
-    with open(out_html_path, "w", encoding="utf-8") as f:
-        f.write("".join(html))
-
-    print(f"[gen_vtt] Wrote: {out_emoji_vtt_path} ({emoji_count} cues), {out_vtt_path}, {out_html_path}")
-    return 0
+    print(f"[gen_vtt] wrote {len(cues)} cues → {os.path.join(art, base+'.vtt')}")
+    if emoji:
+        print(f"[gen_vtt] wrote {len(emoji)} emoji cues → {os.path.join(art, base+'_emoji.vtt')}")
+    print(f"[gen_vtt] wrote transcript html → {os.path.join(art, base+'_transcript.html')}")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
