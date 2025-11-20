@@ -533,6 +533,19 @@ jobs:
           EVTT: ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy || steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}
         run: |
           set -euo pipefail
+
+          echo "== WP register debug =="
+          echo "WP_BASE_URL=${WP_BASE_URL}"
+          echo "PID=${PID}"
+          echo "AUD=${AUD}"
+          echo "VTTU=${VTTU:-<none>}"
+          echo "EVTT=${EVTT:-<none>}"
+          echo "START_ISO=${START_ISO:-<none>}"
+          echo "TRANSCRIPT_PATH=${TRANSCRIPT_PATH:-<none>}"
+          echo "ATTN_HTML=${ATTN_HTML:-<none>}"
+          echo "REPLIES_PATH=${REPLIES_PATH:-<none>}"
+          echo "LINKS_PATH=${LINKS_PATH:-<none>}"
+
           TTL="${TTL_FINAL:-${BASE}}"
 
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
@@ -547,7 +560,20 @@ jobs:
           LNK_FILE="${WORKDIR}/empty_links.html"; : > "$LNK_FILE"
           [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && LNK_FILE="${LINKS_PATH}"
 
+          echo "File sizes going into WP:"
+          for f in "$ATH_FILE" "$TR_FILE" "$REP_FILE" "$LNK_FILE"; do
+            if [ -f "$f" ]; then
+              echo "  $(basename "$f"): $(wc -c < "$f") bytes"
+            else
+              echo "  $(basename "$f"): (missing)"
+            fi
+          done
+
           REQ="${WORKDIR}/wp_register_body.json"
+          RESP="${WORKDIR}/wp_register_response.json"
+          HDRS="${WORKDIR}/wp_register_headers.txt"
+          CURL_TIMING="${WORKDIR}/wp_register_curl_timing.txt"
+
           jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
@@ -575,21 +601,47 @@ jobs:
              + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
             ' > "$REQ"
 
-          echo "WP request body:"
-          jq -r '.' "$REQ"
+          echo "WP request body (first 1.5KB):"
+          head -c 1536 "$REQ" | jq -r '.' || head -c 1536 "$REQ" || true
+          echo ""
+          echo "WP request body size: $(wc -c < "$REQ") bytes"
 
-          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "${WORKDIR}/wp_register_response.json" \
+          echo "Calling WP /ss3k/v1/register with curl (timeouts enabled)..."
+
+          HTTP_CODE=$(curl -sS \
             -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            --data-binary @"$REQ")
+            --data-binary @"$REQ" \
+            --connect-timeout 20 \
+            --max-time 180 \
+            -D "$HDRS" \
+            -o "$RESP" \
+            -w "%{http_code} %{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total}" \
+          | tee "$CURL_TIMING" )
 
-          echo "WP HTTP status: ${HTTP_CODE}"
-          echo "WP response:"
-          cat "${WORKDIR}/wp_register_response.json" || true
+          echo "Raw curl timing line: $(cat "$CURL_TIMING")"
+          CODE=$(cut -d' ' -f1 "$CURL_TIMING")
+          T_NL=$(cut -d' ' -f2 "$CURL_TIMING")
+          T_CONN=$(cut -d' ' -f3 "$CURL_TIMING")
+          T_ST=$(cut -d' ' -f4 "$CURL_TIMING")
+          T_TOT=$(cut -d' ' -f5 "$CURL_TIMING")
 
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            echo "WordPress register endpoint returned HTTP $HTTP_CODE"
+          echo "WP HTTP status: ${CODE}"
+          echo "  time_namelookup:   ${T_NL}s"
+          echo "  time_connect:      ${T_CONN}s"
+          echo "  time_starttransfer:${T_ST}s"
+          echo "  time_total:        ${T_TOT}s"
+
+          echo "WP response headers:"
+          sed -n '1,40p' "$HDRS" || true
+
+          echo "WP response body (first 2KB):"
+          head -c 2048 "$RESP" || true
+          echo ""
+
+          if [ "${CODE}" -ge 400 ]; then
+            echo "WordPress register endpoint returned HTTP ${CODE}"
             exit 1
           fi
 
