@@ -1,369 +1,542 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-gen_vtt.py — Parse X/Twitter Spaces CC.jsonl into WebVTT + HTML transcript.
+gen_vtt.py
+----------
+Builds a WEBVTT file + interactive transcript HTML from a crawler JSONL,
+while separating out emoji/tap reactions to a sidecar JSON for UI animation.
 
-Env:
-  CC_JSONL, ARTDIR, BASE, SHIFT_SECS (float, default 0)
-  JOIN_GAP_SECS (float, default 1.2), PAD_SECS (float, default 0.08)
+ENV:
+  ARTDIR      - output directory
+  BASE        - base filename (no extension)
+  CC_JSONL    - path to crawler JSONL (captions/reactions stream)
+  SHIFT_SECS  - seconds to shift left (lead-silence trim); float, optional
 
-Outputs:
-  {ARTDIR}/{BASE}.vtt
-  {ARTDIR}/{BASE}_emoji.vtt  (if any emoji found)
-  {ARTDIR}/{BASE}_transcript.html
+OUTPUTS:
+  {BASE}.vtt
+  {BASE}_transcript.html
+  {BASE}.start.txt          (ISO-8601 UTC when absolute start known)
+  {BASE}_speech.json        (processed speech segments: start,end,text, name, handle, avatar)
+  {BASE}_reactions.json     (reaction events normalized to same clock)
+  {BASE}_meta.json          (counts, timing diagnostics)
+
+Design fixes vs. previous versions:
+- Robust clock alignment: estimate Δ so rel+Δ ≈ (abs-abs0) using median over rows that
+  carry both clocks. Prevents "first lines" from jumping or starting at the wrong time.
+- Stable ordering: sort by time then ingestion index, never by speaker name.
+- Unicode-safe: NFC normalization and zero-width-strip to avoid stray glyphs in output.
+- Non-destructive: we do not "correct" words; we only normalize spacing and escape safely.
 """
-from __future__ import annotations
-import os, json, re, html
+
+import os, sys, re, json, html, unicodedata
 from datetime import datetime, timezone
-from typing import Any, Tuple
+from statistics import median
+from typing import Any, Dict, List, Optional
 
+# ---------------- Env ----------------
+ARTDIR = os.environ.get("ARTDIR", "").strip() or "."
+BASE   = os.environ.get("BASE", "space").strip() or "space"
+SRC    = os.environ.get("CC_JSONL", "").strip()
+SHIFT  = float(os.environ.get("SHIFT_SECS", "0").strip() or "0")
 
-def _parse_iso(s: str | None):
+os.makedirs(ARTDIR, exist_ok=True)
+
+VTT_PATH         = os.path.join(ARTDIR, f"{BASE}.vtt")
+TRANSCRIPT_PATH  = os.path.join(ARTDIR, f"{BASE}_transcript.html")
+START_PATH       = os.path.join(ARTDIR, f"{BASE}.start.txt")
+SPEECH_JSON_PATH = os.path.join(ARTDIR, f"{BASE}_speech.json")
+REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
+META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
+
+# ---------------- Utils ----------------
+def esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def nfc(s: str) -> str:
+    """Normalize to NFC and strip zero-width / bidi controls that cause odd glyphs."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+    return re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]", "", s)
+
+def fmt_ts(t: float) -> str:
+    if t < 0:
+        t = 0.0
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+def parse_time_iso(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
+    s = s.strip()
     try:
+        # '2025-10-14T10:20:33Z' or with offset
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
+        # '...+0000' → '...+00:00'
+        if re.search(r"[+-]\d{4}$", s):
+            s = s[:-5] + s[-5:-3] + ":" + s[-3:]
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
     except Exception:
         return None
 
-
-def _decode(line: str) -> Tuple[Any, Any, Any]:
-    """
-    Best-effort decode for twspace-crawler CC.jsonl lines.
-
-    Historically:
-      {"payload": "{\"body\":\"{...caption json...}\"}", "timestamp": ...}
-
-    Newer versions may put fields directly under `body` or at the top level.
-    We try, in order:
-      payload.body (decoded)
-      top.body (decoded)
-      top itself
-    and only return a dict for `body`.
-    """
+def to_secs(x: Any) -> Optional[float]:
+    """Float conversion with ms→s guard (epoch ms ~ 1e12)."""
+    if x is None:
+        return None
     try:
-        top = json.loads(line)
+        v = float(x)
     except Exception:
-        return None, None, None
-    if not isinstance(top, dict):
-        return None, None, None
+        return None
+    if v >= 1e12:  # very likely milliseconds epoch
+        v = v / 1000.0
+    return v
 
-    payload = top.get("payload")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            payload = None
+def first(*vals):
+    for v in vals:
+        if v not in (None, ""):
+            return v
+    return None
 
-    body = None
+# Emoji / punctuation classification
+EMOJI_RE = re.compile("[" +
+    "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
+    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
+    "\U0001FA00-\U0001FAFF" "\u2600-\u26FF" "\u2700-\u27BF" + "]+", re.UNICODE)
+ONLY_PUNCT_SPACE = re.compile(r"^[\s\.,;:!?\-–—'\"“”‘’•·]+$")
 
-    # 1) payload.body or payload itself
-    if isinstance(payload, dict):
-        candidate = payload.get("body", payload)
-        if isinstance(candidate, str):
-            try:
-                candidate = json.loads(candidate)
-            except Exception:
-                candidate = None
-        if isinstance(candidate, dict):
-            body = candidate
+def is_emoji_only(s: str) -> bool:
+    if not s or not s.strip():
+        return False
+    t = ONLY_PUNCT_SPACE.sub("", s)
+    t = EMOJI_RE.sub("", t)
+    return len(t.strip()) == 0
 
-    # 2) top.body
-    if body is None:
-        candidate = top.get("body")
-        if isinstance(candidate, str):
-            try:
-                candidate = json.loads(candidate)
-            except Exception:
-                candidate = None
-        if isinstance(candidate, dict):
-            body = candidate
+def has_letters_or_digits(s: str) -> bool:
+    return bool(re.search(r"[A-Za-z0-9]", s or ""))
 
-    # 3) fall back to top itself
-    if body is None and isinstance(top, dict):
-        body = top
+# ---------------- Early exit if no file ----------------
+if not (SRC and os.path.isfile(SRC)):
+    with open(VTT_PATH, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
+        "speech_segments": 0, "reactions": 0, "shift_secs_applied": SHIFT, "notes": "no input"
+    }, ensure_ascii=False))
+    open(START_PATH, "w", encoding="utf-8").write("")
+    sys.exit(0)
 
-    if not isinstance(body, dict):
-        body = None
+# ---------------- Parsing ----------------
+REL_KEYS  = ("offset", "startSec", "startMs", "start")
+ABS_KEYS  = ("programDateTime", "timestamp", "ts")
 
-    return top, payload, body
+raw_items: List[Dict[str, Any]] = []
+reactions: List[Dict[str, Any]] = []
+abs_candidates: List[float] = []
+ingest_idx = 0
 
+def pick_rel_abs(d: Dict[str, Any]) -> (Optional[float], Optional[float]):
+    """Classify fields into relative seconds and absolute epoch seconds.
 
-def _speaker(username: str | None, display: str | None) -> str:
-    if username:
-        username = username.lstrip("@")
-        return "@" + username
-    return display or "Speaker"
-
-
-def _norm_text(t: str) -> str:
-    t = t.replace("\r", " ").replace("\n", " ").strip()
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"\s*-\s*$", "", t)
-    return t
-
-
-def _fmt_ts(sec: float) -> str:
-    if sec < 0:
-        sec = 0.0
-    ms = int(round(sec * 1000))
-    h = ms // 3_600_000
-    ms -= h * 3_600_000
-    m = ms // 60_000
-    ms -= m * 60_000
-    s = ms // 1_000
-    ms -= s * 1_000
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-def _extract_text_and_user(body: dict) -> Tuple[str | None, str]:
+    Logic:
+      - REL from explicit rel keys.
+      - For numeric 'timestamp'/'ts': treat as ABS only if clearly epoch (>= 1e6).
+        Otherwise, if REL is still None, use as REL.
+      - 'programDateTime' is always ABS (ISO).
     """
-    Pull a plausible caption/reaction text and speaker handle from a body dict.
-    We don't rely on numeric type codes any more; we just look for texty fields.
-    """
-    text = ""
+    rel: Optional[float] = None
+    abs_ts: Optional[float] = None
 
-    # Common places text shows up
-    for key in ("body", "text", "caption", "captionText", "message", "content"):
-        v = body.get(key)
-        if isinstance(v, str):
-            if v.strip():
-                text = v
-                break
-        elif isinstance(v, dict):
-            tv = v.get("text")
-            if isinstance(tv, str) and tv.strip():
-                text = tv
+    # explicit relative
+    for k in REL_KEYS:
+        if k in d and d[k] not in (None, ""):
+            v = to_secs(d[k])
+            if v is not None:
+                rel = v
                 break
 
-    text = _norm_text(text) if text else ""
+    # absolute family
+    if "programDateTime" in d and d["programDateTime"] not in (None, ""):
+        abs_ts = parse_time_iso(d["programDateTime"])
 
-    username = (
-        body.get("username")
-        or body.get("user_name")
-        or body.get("screen_name")
-        or body.get("handle")
-    )
-    display = (
-        body.get("displayName")
-        or body.get("display_name")
-        or body.get("name")
-    )
-    speaker = _speaker(username, display)
-
-    return (text or None), speaker
-
-
-def parse_captions(
-    jsonl_path: str,
-    shift_secs: float = 0.0,
-    join_gap: float = 1.2,
-    pad: float = 0.08,
-):
-    """
-    Parse a CC.jsonl from twspace-crawler into:
-      - merged speech cues
-      - short-lived emoji/reaction cues
-
-    Strategy:
-      * Iterate every JSON line and dig out a dict-ish "body".
-      * Extract text + user, skipping lines without any text.
-      * If the text has alphabetic characters, treat as speech.
-        Otherwise treat as an emoji / reaction event.
-      * Timestamps primarily come from body.programDateTime, with fallback
-        to top-level `timestamp` (ms).
-    """
-    events, reactions = [], []
-
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for _, line in enumerate(f):
-            line = line.strip()
-            if not line:
+    # numeric abs/rel dual keys
+    for key in ("timestamp", "ts"):
+        if key in d and d[key] not in (None, ""):
+            v = to_secs(d[key])
+            if v is None:
                 continue
-
-            top, payload, body = _decode(line)
-            if not isinstance(body, dict):
-                continue
-
-            # Timestamp
-            dt = _parse_iso(body.get("programDateTime"))
-            if dt is None and isinstance(top, dict):
-                ts = top.get("timestamp")
-                if isinstance(ts, (int, float)):
-                    try:
-                        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
-                    except Exception:
-                        dt = None
-            if dt is None:
-                continue
-
-            text, user = _extract_text_and_user(body)
-            if not text:
-                continue
-
-            # Distinguish "speech" from emoji-ish reactions:
-            has_alpha = any(ch.isalpha() for ch in text)
-            if has_alpha:
-                events.append(
-                    {
-                        "dt": dt,
-                        "text": text,
-                        "user": user,
-                    }
-                )
+            if v >= 1e6:
+                # epoch seconds
+                abs_ts = v
             else:
-                reactions.append(
-                    {
-                        "dt": dt,
-                        "text": f"{text} {user}".strip(),
-                    }
-                )
+                # likely relative seconds; only take if we don't already have rel
+                if rel is None:
+                    rel = v
 
-    if not events:
-        return {"base_dt": None, "cues": [], "emoji": []}
+    return rel, abs_ts
 
-    events.sort(key=lambda e: e["dt"])
-    base = events[0]["dt"]
+def harvest_from_dict(d: Dict[str, Any]):
+    global ingest_idx
+    txt = first(d.get("body"), d.get("text"), d.get("caption"), d.get("payloadText"))
+    if not txt:
+        return
+    sender = d.get("sender") or {}
+    disp = first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
+                 (sender or {}).get("display_name"), d.get("name"), d.get("user"))
+    uname = first(d.get("username"), d.get("handle"), d.get("screen_name"),
+                  d.get("user_id"), (sender or {}).get("screen_name"))
+    avatar = first((sender or {}).get("profile_image_url_https"),
+                   (sender or {}).get("profile_image_url"),
+                   d.get("profile_image_url_https"), d.get("profile_image_url"))
 
-    cues = []
-    cur = None
+    rel, abs_ts = pick_rel_abs(d)
 
-    for e in events:
-        t = (e["dt"] - base).total_seconds() - float(shift_secs)
-        if t < 0:
-            t = 0.0
+    text = nfc(str(txt)).strip()
+    if not has_letters_or_digits(text) and not is_emoji_only(text):
+        return
 
-        if cur is None:
-            cur = {
-                "start": t,
-                "end": None,
-                "user": e["user"],
-                "text": e["text"],
-            }
-            continue
+    name = nfc(first(disp, uname, "Speaker") or "Speaker")
+    handle = (uname or "").lstrip("@")
+    avatar_url = avatar or ""
 
-        # Same speaker and close in time → merge into same cue
-        if e["user"] == cur["user"] and (
-            cur["end"] is None or (t - cur["end"]) <= join_gap
-        ):
-            cur["end"] = t
-            if cur["text"] and not cur["text"].endswith(("-", "—")):
-                cur["text"] += " "
-            cur["text"] += e["text"]
+    if is_emoji_only(text):
+        if abs_ts is not None or rel is not None:
+            reactions.append({
+                "idx": ingest_idx, "rel": rel, "abs": abs_ts,
+                "emoji": text, "name": name, "handle": handle, "avatar": avatar_url
+            })
+        ingest_idx += 1
+        return
+
+    raw_items.append({
+        "idx": ingest_idx, "rel": rel, "abs": abs_ts, "text": text,
+        "name": name, "username": handle, "avatar": avatar_url
+    })
+    ingest_idx += 1
+    if abs_ts is not None:
+        abs_candidates.append(abs_ts)
+
+def ingest_line(line: str):
+    line = (line or "").strip()
+    if not line:
+        return
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return
+
+    # consider multiple possible layers
+    layers: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        layers.append(obj)
+        pl = obj.get("payload")
+        # payload as stringified JSON
+        if isinstance(pl, str):
+            try:
+                plj = json.loads(pl)
+                if isinstance(plj, dict):
+                    layers.append(plj)
+                    body = plj.get("body")
+                    if isinstance(body, str):
+                        try:
+                            inner = json.loads(body)
+                            if isinstance(inner, dict):
+                                # merge sender if exists at payload
+                                if isinstance(plj.get("sender"), dict):
+                                    inner = dict(inner)
+                                    inner["sender"] = plj["sender"]
+                                layers.append(inner)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        # payload already dict
+        elif isinstance(pl, dict):
+            layers.append(pl)
+            body = pl.get("body")
+            if isinstance(body, str):
+                try:
+                    inner = json.loads(body)
+                    if isinstance(inner, dict):
+                        if isinstance(pl.get("sender"), dict):
+                            inner = dict(inner)
+                            inner["sender"] = pl["sender"]
+                        layers.append(inner)
+                except Exception:
+                    pass
+
+    # harvest
+    for d in layers:
+        if isinstance(d, dict):
+            harvest_from_dict(d)
+
+# -------- Read JSONL --------
+with open(SRC, "r", encoding="utf-8", errors="ignore") as f:
+    for ln in f:
+        ingest_line(ln)
+
+# If nothing collected, output empty artifacts
+if not raw_items and not reactions:
+    with open(VTT_PATH, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
+        "speech_segments": 0, "reactions": 0,
+        "inputs": {"raw_items": 0, "abs_candidates": 0},
+        "shift_secs_applied": SHIFT
+    }, ensure_ascii=False))
+    # Start time is optional; only write if we *know* it later.
+    open(START_PATH, "w", encoding="utf-8").write("")
+    sys.exit(0)
+
+# ------------- Time normalization with Δ alignment -------------
+abs0 = min(abs_candidates) if abs_candidates else None
+if abs0 is not None:
+    deltas = []
+    for it in raw_items:
+        if it["abs"] is not None and it["rel"] is not None:
+            deltas.append((it["abs"] - abs0) - it["rel"])
+    # also consider reaction rows for better statistics
+    for r in reactions:
+        if r["abs"] is not None and r["rel"] is not None:
+            deltas.append((r["abs"] - abs0) - r["rel"])
+
+    delta = median(deltas) if deltas else 0.0
+else:
+    delta = 0.0
+
+def rel_time_from_item(rel: Optional[float], abs_ts: Optional[float]) -> float:
+    """Map mixed rel/abs clocks onto a single relative timeline, then apply SHIFT."""
+    if rel is not None:
+        t = rel + delta
+    elif abs_ts is not None and abs0 is not None:
+        t = abs_ts - abs0
+    else:
+        t = 0.0
+    return max(0.0, t - SHIFT)
+
+# apply times
+norm: List[Dict[str, Any]] = []
+for it in raw_items:
+    t = rel_time_from_item(it["rel"], it["abs"])
+    norm.append({**it, "t": float(t)})
+
+# Sort by time then ingestion index (stable). Never sort by speaker name.
+norm.sort(key=lambda x: (x["t"], x["idx"]))
+EPS = 5e-4
+last = -1e9
+for u in norm:
+    if u["t"] <= last:
+        u["t"] = last + EPS
+    last = u["t"]
+
+# ------------- Build speech segments -------------
+MIN_DUR = 0.80
+MAX_DUR = 10.0
+GUARD   = 0.020
+MERGE_GAP = 3.0
+
+segments: List[Dict[str, Any]] = []
+# initial small duration per event
+for u in norm:
+    st = u["t"]
+    segments.append({
+        "start": st,
+        "end": st + MIN_DUR,
+        "text": u["text"],
+        "name": u["name"],
+        "username": u["username"],
+        "avatar": u["avatar"],
+    })
+
+# Merge adjacent segments by same speaker if gap <= MERGE_GAP
+merged: List[Dict[str, Any]] = []
+cur: Optional[Dict[str, Any]] = None
+
+def end_sentence_punct(s: str) -> bool:
+    return bool(re.search(r'[.!?]"?$', (s or "").strip()))
+
+for seg in segments:
+    if (cur is not None
+        and seg["name"] == cur["name"]
+        and seg["username"] == cur["username"]
+        and seg["start"] - cur["end"] <= MERGE_GAP):
+        sep = "" if end_sentence_punct(cur["text"]) else " "
+        cur["text"] = (cur["text"] + sep + seg["text"]).strip()
+        cur["end"] = max(cur["end"], seg["end"])
+    else:
+        cur = dict(seg)
+        merged.append(cur)
+
+# Smooth end times based on following start
+for i, g in enumerate(merged):
+    if i + 1 < len(merged):
+        nxt = merged[i + 1]["start"]
+        dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
+        g["end"] = g["start"] + dur
+    else:
+        # Estimate final duration by words
+        words = max(1, len((g["text"] or "").split()))
+        g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+
+# Ensure strictly increasing and clamp
+prev_end = 0.0
+for g in merged:
+    if g["start"] < prev_end + GUARD:
+        g["start"] = prev_end + GUARD
+    if g["end"] < g["start"] + MIN_DUR:
+        g["end"] = g["start"] + MIN_DUR
+    prev_end = g["end"]
+
+# ------------- Emit WEBVTT -------------
+with open(VTT_PATH, "w", encoding="utf-8") as vf:
+    vf.write("WEBVTT\n\n")
+    for i, g in enumerate(merged, 1):
+        vf.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n")
+        vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
+
+# ------------- Interactive transcript HTML -------------
+CSS = '''
+<style>
+.ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-height:70vh; overflow-y:auto; scroll-behavior:smooth; border:1px solid #e5e7eb; border-radius:12px; padding:6px}
+.ss3k-seg{display:flex;gap:10px;padding:8px 10px;border-radius:10px;margin:6px 0}
+.ss3k-seg.active{background:#eef6ff;outline:1px solid #bfdbfe}
+.ss3k-avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;margin-top:3px;background:#e5e7eb}
+.ss3k-meta{font-size:12px;color:#64748b;margin-bottom:2px}
+.ss3k-name a{color:#0f172a;text-decoration:none}
+.ss3k-text{white-space:pre-wrap;word-break:break-word;cursor:pointer}
+</style>
+'''.strip()
+
+JS = r'''
+<script>
+(function(){
+  function time(s){return parseFloat(s||'0')||0}
+  function within(t,seg){return t>=time(seg.dataset.start) && t<time(seg.dataset.end)}
+  function bind(){
+    var audio=document.getElementById('ss3k-audio')||document.querySelector('audio[data-ss3k-player]');
+    var cont=document.querySelector('.ss3k-transcript'); if(!audio||!cont) return;
+    var segs=[].slice.call(cont.querySelectorAll('.ss3k-seg'));
+    function tick(){
+      var t=audio.currentTime||0, found=null;
+      for(var i=0;i<segs.length;i++){ if(within(t,segs[i])){found=segs[i];break;} }
+      segs.forEach(function(s){ s.classList.toggle('active', s===found); });
+      if(found){
+        var top = found.offsetTop - cont.offsetTop;
+        if (Math.abs(cont.scrollTop - top) > 6) cont.scrollTop = top;
+      }
+    }
+    audio.addEventListener('timeupdate', tick);
+    audio.addEventListener('seeked', tick);
+    segs.forEach(function(s){
+      s.addEventListener('click', function(){
+        audio.currentTime = time(s.dataset.start)+0.05;
+        if (audio.play) audio.play().catch(function(){});
+      });
+    });
+    tick();
+  }
+  if(document.readyState!=="loading") bind(); else document.addEventListener('DOMContentLoaded', bind);
+})();
+</script>
+'''.strip()
+
+with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as tf:
+    tf.write(CSS + "\n")
+    tf.write('<div class="ss3k-transcript">\n')
+    for i, g in enumerate(merged, 1):
+        name = g["name"]
+        uname = (g.get("username") or "").strip().lstrip("@")
+        prof = f"https://x.com/{html.escape(uname, True)}" if uname else ""
+        avatar = g.get("avatar") or (f"https://unavatar.io/x/{html.escape(uname, True)}" if uname else "")
+        if avatar and prof:
+            avtag = f'<a href="{prof}" target="_blank" rel="noopener"><img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt=""></a>'
+        elif avatar:
+            avtag = f'<img class="ss3k-avatar" src="{html.escape(avatar, True)}" alt="">'
         else:
-            # Finalize previous cue
-            if cur["end"] is None or cur["end"] < cur["start"] + 0.4:
-                wc = max(1, len(cur["text"].split()))
-                cur["end"] = cur["start"] + min(6.0, max(1.6, 0.35 * wc))
-            cur["end"] = max(cur["end"], cur["start"] + 0.24)
-            if t > cur["start"]:
-                cur["end"] = min(cur["end"], t - pad)
-            cues.append(cur)
+            avtag = '<div class="ss3k-avatar" aria-hidden="true"></div>'
 
-            # Start new cue
-            cur = {
-                "start": t,
-                "end": None,
-                "user": e["user"],
-                "text": e["text"],
-            }
+        name_html = f'<span class="ss3k-name"><strong>{html.escape(name, True)}</strong></span>'
+        if prof:
+            name_html = f'<span class="ss3k-name"><a href="{prof}" target="_blank" rel="noopener"><strong>{html.escape(name, True)}</strong></a></span>'
 
-    if cur is not None:
-        if cur["end"] is None or cur["end"] < cur["start"] + 0.4:
-            wc = max(1, len(cur["text"].split()))
-            cur["end"] = cur["start"] + min(6.0, max(1.6, 0.35 * wc))
-        cur["end"] = max(cur["end"], cur["start"] + 0.24)
-        cues.append(cur)
-
-    emoji_cues = []
-    if reactions:
-        reactions.sort(key=lambda r: r["dt"])
-        for r in reactions:
-            t = (r["dt"] - base).total_seconds() - float(shift_secs)
-            if t < 0:
-                t = 0.0
-            emoji_cues.append(
-                {
-                    "start": t,
-                    "end": t + 0.8,
-                    "text": r["text"],
-                }
-            )
-
-    return {"base_dt": base, "cues": cues, "emoji": emoji_cues}
-
-
-def write_vtt(cues, out_path):
-    lines = ["WEBVTT", ""]
-    for c in cues:
-        lines.append(f"{_fmt_ts(c['start'])} --> {_fmt_ts(c['end'])}")
-        speaker = c.get("user") or "Speaker"
-        text = re.sub(r"\s{2,}", " ", c["text"]).strip()
-        lines.append(f"<v {speaker}>{html.escape(text)}")
-        lines.append("")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
-def write_transcript_html(cues, out_path):
-    parts = []
-    parts.append(
-        "<!doctype html><meta charset=\"utf-8\">"
-        "<style>"
-        "body{font-family:system-ui,Segoe UI,Arial,sans-serif;line-height:1.45;padding:1rem}"
-        ".t{cursor:pointer}"
-        ".speaker{color:#333;font-weight:600}"
-        ".time{color:#777;font-size:.85em;margin-left:.25rem}"
-        ".seg{margin:.25rem 0}"
-        "</style>"
-        "<section class=\"transcript\">"
-    )
-    for c in cues:
-        spk = html.escape(c.get("user") or "Speaker")
-        start = c["start"]
-        parts.append(
-            f'<p class="seg">'
-            f'<span class="speaker">{spk}</span>'
-            f'<span class="time" data-start="{start:.3f}">[{_fmt_ts(start)}]</span> '
-            f'<span class="t" data-start="{start:.3f}">{html.escape(c["text"])}</span>'
-            f"</p>"
+        tf.write(
+            f'<div class="ss3k-seg" id="seg-{i:04d}" data-start="{g["start"]:.3f}" data-end="{g["end"]:.3f}"'
         )
-    parts.append("</section>")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts))
+        if uname:
+            tf.write(f' data-handle="@{html.escape(uname, True)}"')
+        tf.write('>')
+        tf.write(avtag)
+        tf.write('<div class="ss3k-body">')
+        tf.write(f'<div class="ss3k-meta">{name_html} · <time>{fmt_ts(g["start"])}</time>–<time>{fmt_ts(g["end"])}</time></div>')
+        tf.write(f'<div class="ss3k-text">{esc(g["text"])}</div>')
+        tf.write('</div></div>\n')
+    tf.write('</div>\n' + JS + "\n")
 
+# ------------- Sidecar JSONs -------------
+# Speech sidecar
+speech_out = [{
+    "start": round(g["start"], 3),
+    "end": round(g["end"], 3),
+    "text": g["text"],
+    "name": g["name"],
+    "handle": g["username"],
+    "avatar": g["avatar"],
+} for g in merged]
+open(SPEECH_JSON_PATH, "w", encoding="utf-8").write(
+    json.dumps(speech_out, ensure_ascii=False)
+)
 
-def main():
-    cc = os.environ.get("CC_JSONL") or ""
-    art = os.environ.get("ARTDIR") or "."
-    base = os.environ.get("BASE") or "space"
-    shift = float(os.environ.get("SHIFT_SECS") or 0.0)
-    join_gap = float(os.environ.get("JOIN_GAP_SECS") or 1.2)
-    pad = float(os.environ.get("PAD_SECS") or 0.08)
+# Reactions sidecar (normalize onto same relative clock)
+rx_out = []
+for r in reactions:
+    if r["rel"] is not None:
+        t = r["rel"] + (delta or 0.0)
+    elif r["abs"] is not None and abs0 is not None:
+        t = r["abs"] - abs0
+    else:
+        continue
+    t = max(0.0, t - SHIFT)
+    rx_out.append({
+        "t": round(t, 3),
+        "emoji": r["emoji"],
+        "name": r["name"],
+        "handle": r["handle"],
+        "avatar": r["avatar"],
+    })
+open(REACT_JSON_PATH, "w", encoding="utf-8").write(
+    json.dumps(rx_out, ensure_ascii=False)
+)
 
-    if not os.path.isfile(cc):
-        raise SystemExit(f"CC_JSONL not found: {cc}")
+# ------------- Meta + start time -------------
+start_iso = ""
+if abs_candidates:
+    start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+open(START_PATH, "w", encoding="utf-8").write((start_iso or "") + "\n")
 
-    os.makedirs(art, exist_ok=True)
-
-    parsed = parse_captions(cc, shift_secs=shift, join_gap=join_gap, pad=pad)
-    cues, emoji = parsed["cues"], parsed["emoji"]
-
-    vtt_path = os.path.join(art, f"{base}.vtt")
-    write_vtt(cues, vtt_path)
-    if emoji:
-        emoji_vtt_path = os.path.join(art, f"{base}_emoji.vtt")
-        write_vtt(emoji, emoji_vtt_path)
-    html_path = os.path.join(art, f"{base}_transcript.html")
-    write_transcript_html(cues, html_path)
-
-    print(f"[gen_vtt] parsed {len(cues)} cues and {len(emoji)} emoji events")
-    print(f"[gen_vtt] wrote VTT → {vtt_path}")
-    if emoji:
-        print(f"[gen_vtt] wrote emoji VTT → {emoji_vtt_path}")
-    print(f"[gen_vtt] wrote transcript html → {html_path}")
-
-
-if __name__ == "__main__":
-    main()
+meta = {
+    "speech_segments": len(merged),
+    "reactions": len(rx_out),
+    "inputs": {
+        "raw_items": len(raw_items),
+        "abs_candidates": len(abs_candidates),
+        "raw_reaction_rows": len(reactions),
+    },
+    "timing": {
+        "shift_secs_applied": SHIFT,
+        "abs0_present": abs0 is not None,
+        "delta_used": round(delta, 6) if abs0 is not None else 0.0,
+        "first_caption_start": round(merged[0]["start"], 3) if merged else None,
+    }
+}
+open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
