@@ -510,8 +510,6 @@ jobs:
           echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
 
       - name: Register assets in WP
-        # IMPORTANT: allow both full and transcript_only modes,
-        # and allow registering if we have transcript even if MP3 upload failed.
         if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') 
                 && env.WP_BASE_URL != '' 
                 && env.WP_USER != '' 
@@ -569,11 +567,22 @@ jobs:
             fi
           done
 
+          # Flags so jq doesn't need to regex-strip whitespace
+          HAS_ATH=0
+          HAS_TR=0
+          HAS_REP=0
+          HAS_LNK=0
+          [ "$ATH_FILE" != "${WORKDIR}/empty_attendees.html" ] && HAS_ATH=1
+          [ "$TR_FILE"  != "${WORKDIR}/empty_transcript.html" ] && HAS_TR=1
+          [ "$REP_FILE" != "${WORKDIR}/empty_replies.html" ] && HAS_REP=1
+          [ "$LNK_FILE" != "${WORKDIR}/empty_links.html" ] && HAS_LNK=1
+
           REQ="${WORKDIR}/wp_register_body.json"
           RESP="${WORKDIR}/wp_register_response.json"
           HDRS="${WORKDIR}/wp_register_headers.txt"
           CURL_TIMING="${WORKDIR}/wp_register_curl_timing.txt"
 
+          echo "Building WP request body with jq..."
           jq -n \
             --arg gcs   "${AUD}" \
             --arg mime  "audio/mpeg" \
@@ -586,6 +595,10 @@ jobs:
             --rawfile tr  "${TR_FILE}" \
             --rawfile rep "${REP_FILE}" \
             --rawfile lnk "${LNK_FILE}" \
+            --argjson has_ath "${HAS_ATH}" \
+            --argjson has_tr  "${HAS_TR}" \
+            --argjson has_rep "${HAS_REP}" \
+            --argjson has_lnk "${HAS_LNK}" \
             '{
                gcs_url: $gcs,
                mime:    $mime,
@@ -595,10 +608,10 @@ jobs:
              + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if ($evtt|length)>0 then {emoji_vtt_url:$evtt} else {} end)
-             + (if ($ath|gsub("\\s";"")|length)>0 then {attendees_html:$ath} else {} end)
-             + (if ($tr|gsub("\\s";"")|length)>0 then {transcript:$tr, has_transcript:true} else {} end)
-             + (if ($rep|gsub("\\s";"")|length)>0 then {ss3k_replies_html:$rep} else {} end)
-             + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
+             + (if $has_ath == 1 then {attendees_html:$ath} else {} end)
+             + (if $has_tr  == 1 then {transcript:$tr, has_transcript:true} else {} end)
+             + (if $has_rep == 1 then {ss3k_replies_html:$rep} else {} end)
+             + (if $has_lnk == 1 then {shared_links_html:$lnk} else {} end)
             ' > "$REQ"
 
           echo "WP request body (first 1.5KB):"
@@ -608,7 +621,7 @@ jobs:
 
           echo "Calling WP /ss3k/v1/register with curl (timeouts enabled)..."
 
-          HTTP_CODE=$(curl -sS \
+          HTTP_LINE=$(curl -sS \
             -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
@@ -617,15 +630,14 @@ jobs:
             --max-time 180 \
             -D "$HDRS" \
             -o "$RESP" \
-            -w "%{http_code} %{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total}" \
-          | tee "$CURL_TIMING" )
+            -w "%{http_code} %{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total}")
 
-          echo "Raw curl timing line: $(cat "$CURL_TIMING")"
-          CODE=$(cut -d' ' -f1 "$CURL_TIMING")
-          T_NL=$(cut -d' ' -f2 "$CURL_TIMING")
-          T_CONN=$(cut -d' ' -f3 "$CURL_TIMING")
-          T_ST=$(cut -d' ' -f4 "$CURL_TIMING")
-          T_TOT=$(cut -d' ' -f5 "$CURL_TIMING")
+          echo "Raw curl timing line: ${HTTP_LINE}"
+          CODE=$(echo "$HTTP_LINE" | awk '{print $1}')
+          T_NL=$(echo "$HTTP_LINE" | awk '{print $2}')
+          T_CONN=$(echo "$HTTP_LINE" | awk '{print $3}')
+          T_ST=$(echo "$HTTP_LINE" | awk '{print $4}')
+          T_TOT=$(echo "$HTTP_LINE" | awk '{print $5}')
 
           echo "WP HTTP status: ${CODE}"
           echo "  time_namelookup:   ${T_NL}s"
