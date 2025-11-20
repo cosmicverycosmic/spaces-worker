@@ -510,7 +510,21 @@ jobs:
           echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
 
       - name: Register assets in WP
-        if: ${{ github.event.inputs.mode == '' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' && (steps.upload_mp3.outputs.audio_proxy != '' || steps.upload_mp3.outputs.audio_raw != '') }}
+        # IMPORTANT: allow both full and transcript_only modes,
+        # and allow registering if we have transcript even if MP3 upload failed.
+        if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') 
+                && env.WP_BASE_URL != '' 
+                && env.WP_USER != '' 
+                && env.WP_APP_PASSWORD != '' 
+                && github.event.inputs.post_id != '' 
+                && (
+                     steps.upload_mp3.outputs.audio_proxy != '' 
+                     || steps.upload_mp3.outputs.audio_raw != '' 
+                     || env.TRANSCRIPT_PATH != '' 
+                     || env.ATTN_HTML != '' 
+                     || env.REPLIES_PATH != '' 
+                     || env.LINKS_PATH != ''
+                   ) }}
         shell: bash
         env:
           PID:  ${{ github.event.inputs.post_id }}
@@ -520,12 +534,16 @@ jobs:
         run: |
           set -euo pipefail
           TTL="${TTL_FINAL:-${BASE}}"
+
           ATH_FILE="${WORKDIR}/empty_attendees.html"; : > "$ATH_FILE"
           [ -n "${ATTN_HTML:-}" ] && [ -s "${ATTN_HTML:-}" ] && ATH_FILE="${ATTN_HTML}"
+
           TR_FILE="${WORKDIR}/empty_transcript.html"; : > "$TR_FILE"
           [ -n "${TRANSCRIPT_PATH:-}" ] && [ -s "${TRANSCRIPT_PATH}" ] && TR_FILE="${TRANSCRIPT_PATH}"
+
           REP_FILE="${WORKDIR}/empty_replies.html"; : > "$REP_FILE"
           [ -n "${REPLIES_PATH:-}" ] && [ -s "${REPLIES_PATH:-}" ] && REP_FILE="${REPLIES_PATH}"
+
           LNK_FILE="${WORKDIR}/empty_links.html"; : > "$LNK_FILE"
           [ -n "${LINKS_PATH:-}" ] && [ -s "${LINKS_PATH:-}" ] && LNK_FILE="${LINKS_PATH}"
 
@@ -557,10 +575,23 @@ jobs:
              + (if ($lnk|gsub("\\s";"")|length)>0 then {shared_links_html:$lnk} else {} end)
             ' > "$REQ"
 
-          curl -sS -u "${WP_USER}:${WP_APP_PASSWORD}" \
+          echo "WP request body:"
+          jq -r '.' "$REQ"
+
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o "${WORKDIR}/wp_register_response.json" \
+            -u "${WP_USER}:${WP_APP_PASSWORD}" \
             -H "Content-Type: application/json" \
             -X POST "${WP_BASE_URL%/}/wp-json/ss3k/v1/register" \
-            --data-binary @"$REQ" | jq -r .
+            --data-binary @"$REQ")
+
+          echo "WP HTTP status: ${HTTP_CODE}"
+          echo "WP response:"
+          cat "${WORKDIR}/wp_register_response.json" || true
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "WordPress register endpoint returned HTTP $HTTP_CODE"
+            exit 1
+          fi
 
       - name: Patch WP attendees only
         if: ${{ github.event.inputs.mode == 'attendees_only' && env.WP_BASE_URL != '' && env.WP_USER != '' && env.WP_APP_PASSWORD != '' && github.event.inputs.post_id != '' }}
