@@ -33,6 +33,25 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Dict, List, Optional
 
+# ---------------- Absolute timestamp sanity ----------------
+def sanitize_abs_epoch(v: Optional[float]) -> Optional[float]:
+    """Return a plausible epoch seconds value or None.
+
+    We only accept timestamps that:
+      - are convertible by datetime.fromtimestamp, and
+      - fall in a reasonable year window (e.g. 2000–2100).
+    Anything else is treated as 'no absolute clock' to avoid overflow.
+    """
+    if v is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(v), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if 2000 <= dt.year <= 2100:
+        return float(v)
+    return None
+
 # ---------------- Env ----------------
 ARTDIR = os.environ.get("ARTDIR", "").strip() or "."
 BASE   = os.environ.get("BASE", "space").strip() or "space"
@@ -197,6 +216,7 @@ def harvest_from_dict(d: Dict[str, Any]):
                    d.get("profile_image_url_https"), d.get("profile_image_url"))
 
     rel, abs_ts = pick_rel_abs(d)
+    abs_ts = sanitize_abs_epoch(abs_ts)
 
     text = nfc(str(txt)).strip()
     if not has_letters_or_digits(text) and not is_emoji_only(text):
@@ -521,7 +541,10 @@ open(REACT_JSON_PATH, "w", encoding="utf-8").write(
 # ------------- Meta + start time -------------
 start_iso = ""
 if abs_candidates:
-    start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    try:
+        start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        start_iso = ""
 open(START_PATH, "w", encoding="utf-8").write((start_iso or "") + "\n")
 
 meta = {
