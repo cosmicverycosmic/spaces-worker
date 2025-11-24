@@ -373,22 +373,6 @@ jobs:
             echo "Deepgram returned empty response, ignoring"
           fi
 
-      - name: Upload MP3 to GCS
-        id: upload_mp3
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
-          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
-          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
-          gsutil -m cp "${MP3_PATH}" "$DEST"
-          if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
-            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
-          fi
-          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
-          echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
-
       - name: Build VTT + rich transcript
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
@@ -416,6 +400,119 @@ jobs:
           if [ -s "${ARTDIR}/${BASE}_transcript_polished.html" ]; then
             echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript_polished.html" >> "$GITHUB_ENV"
           fi
+
+      - name: Derive Space title and publish date
+        id: meta
+        shell: bash
+        env:
+          AS_LINE: ${{ steps.crawl.outputs.as_line }}
+        run: |
+          set -euo pipefail
+          TTL=""
+          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
+            TTL="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.name // .title // "")' "${AS_LINE}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          fi
+          if [ -z "$TTL" ]; then TTL="${BASE}"; fi
+          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
+
+          START_ISO=""
+          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
+            MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
+            if [[ "$MS" =~ ^[0-9]+$ ]]; then
+              if [ ${#MS} -gt 10 ]; then SECS=$((MS/1000)); else SECS=$MS; fi
+              START_ISO="$(date -u -d "@$SECS" +%Y-%m-%dT%H:%M:%SZ || true)"
+            fi
+          fi
+          if [ -z "$START_ISO" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
+            START_ISO="$(head -n1 "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')"
+          fi
+          if [ -z "$START_ISO" ]; then
+            START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
+
+      - name: Normalize filenames to space start date
+        shell: bash
+        env:
+          SID: ${{ steps.ids.outputs.space_id }}
+        run: |
+          set -euxo pipefail
+          DATE_TAG=""
+          if [ -n "${START_ISO:-}" ]; then
+            DATE_TAG="$(date -u -d "${START_ISO}" +%m-%d-%Y || true)"
+          fi
+          if [ -z "$DATE_TAG" ]; then
+            DATE_TAG="$(date -u +%m-%d-%Y)"
+          fi
+          FINAL_BASE="space-${DATE_TAG}-${SID:-unknown}"
+          echo "Computed FINAL_BASE=${FINAL_BASE} (prev BASE=${BASE:-})"
+
+          if [ "${FINAL_BASE}" != "${BASE:-}" ] && [ -n "${BASE:-}" ]; then
+            for f in \
+              "${ARTDIR}/${BASE}.mp3" \
+              "${ARTDIR}/${BASE}.vtt" \
+              "${ARTDIR}/${BASE}_emoji.vtt" \
+              "${ARTDIR}/${BASE}_dg.json" \
+              "${ARTDIR}/${BASE}.start.txt" \
+              "${ARTDIR}/${BASE}_transcript.html" \
+              "${ARTDIR}/${BASE}_transcript_polished.html" \
+              "${ARTDIR}/${BASE}_speech.json" \
+              "${ARTDIR}/${BASE}_reactions.json" \
+              "${ARTDIR}/${BASE}_meta.json" \
+              "${ARTDIR}/${BASE}_replies.html" \
+              "${ARTDIR}/${BASE}_links.html"
+            do
+              if [ -f "$f" ]; then
+                nf="${f/${BASE}/${FINAL_BASE}}"
+                mv "$f" "$nf"
+              fi
+            done
+
+            if [ "${MP3_PATH:-}" = "${ARTDIR}/${BASE}.mp3" ] && [ -f "${ARTDIR}/${FINAL_BASE}.mp3" ]; then
+              MP3_PATH="${ARTDIR}/${FINAL_BASE}.mp3"
+              echo "MP3_PATH=${MP3_PATH}" >> "$GITHUB_ENV"
+            fi
+
+            if [ "${VTT_PATH:-}" = "${ARTDIR}/${BASE}.vtt" ] && [ -f "${ARTDIR}/${FINAL_BASE}.vtt" ]; then
+              VTT_PATH="${ARTDIR}/${FINAL_BASE}.vtt"
+              echo "VTT_PATH=${VTT_PATH}" >> "$GITHUB_ENV"
+            fi
+
+            if [ "${TRANSCRIPT_PATH:-}" = "${ARTDIR}/${BASE}_transcript.html" ] && [ -f "${ARTDIR}/${FINAL_BASE}_transcript.html" ]; then
+              TRANSCRIPT_PATH="${ARTDIR}/${FINAL_BASE}_transcript.html"
+              echo "TRANSCRIPT_PATH=${TRANSCRIPT_PATH}" >> "$GITHUB_ENV"
+            elif [ "${TRANSCRIPT_PATH:-}" = "${ARTDIR}/${BASE}_transcript_polished.html" ] && [ -f "${ARTDIR}/${FINAL_BASE}_transcript_polished.html" ]; then
+              TRANSCRIPT_PATH="${ARTDIR}/${FINAL_BASE}_transcript_polished.html"
+              echo "TRANSCRIPT_PATH=${TRANSCRIPT_PATH}" >> "$GITHUB_ENV"
+            fi
+
+            if [ -f "${ARTDIR}/${FINAL_BASE}_dg.json" ]; then
+              echo "DG_JSON=${ARTDIR}/${FINAL_BASE}_dg.json" >> "$GITHUB_ENV"
+            fi
+
+            echo "BASE=${FINAL_BASE}" >> "$GITHUB_ENV"
+          else
+            echo "BASE already matches date tag; no rename needed"
+            if [ -f "${ARTDIR}/${BASE}_dg.json" ]; then
+              echo "DG_JSON=${ARTDIR}/${BASE}_dg.json" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Upload MP3 to GCS
+        id: upload_mp3
+        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
+          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}.mp3"
+          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}.mp3"
+          gsutil -m cp "${MP3_PATH}" "$DEST"
+          if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
+            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
+          fi
+          echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
+          echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
       - name: Upload VTT to GCS
         id: upload_vtt
@@ -491,36 +588,6 @@ jobs:
           if [ -s "${ARTDIR}/${BASE}_links.html" ]; then
             echo "LINKS_PATH=${ARTDIR}/${BASE}_links.html" >> "$GITHUB_ENV"
           fi
-
-      - name: Derive Space title and publish date
-        id: meta
-        shell: bash
-        env:
-          AS_LINE: ${{ steps.crawl.outputs.as_line }}
-        run: |
-          set -euo pipefail
-          TTL=""
-          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
-            TTL="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.title // $a.metadata.name // .title // "")' "${AS_LINE}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-          fi
-          if [ -z "$TTL" ]; then TTL="${BASE}"; fi
-          echo "TTL_FINAL=$TTL" >> "$GITHUB_ENV"
-
-          START_ISO=""
-          if [ -n "${AS_LINE:-}" ] && [ -s "${AS_LINE}" ]; then
-            MS="$(jq -r '(.audioSpace // .) as $a | ($a.metadata.started_at // $a.metadata.created_at // $a.metadata.start // empty)' "${AS_LINE}")" || true
-            if [[ "$MS" =~ ^[0-9]+$ ]]; then
-              if [ ${#MS} -gt 10 ]; then SECS=$((MS/1000)); else SECS=$MS; fi
-              START_ISO="$(date -u -d "@$SECS" +%Y-%m-%dT%H:%M:%SZ || true)"
-            fi
-          fi
-          if [ -z "$START_ISO" ] && [ -s "${ARTDIR}/${BASE}.start.txt" ]; then
-            START_ISO="$(head -n1 "${ARTDIR}/${BASE}.start.txt" | tr -d '\r\n')"
-          fi
-          if [ -z "$START_ISO" ]; then
-            START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          fi
-          echo "START_ISO=$START_ISO" >> "$GITHUB_ENV"
 
       - name: Register assets in WP
         if: ${{ (github.event.inputs.mode == '' || github.event.inputs.mode == 'transcript_only') 
@@ -613,7 +680,7 @@ jobs:
                post_id: ($pid|tonumber),
                title:   $ttl
              }
-             + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
+             + (if ($when|length)>0 then {post_date_gmt:$when, post_date:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
              + (if $has_ath == 1 then {attendees_html:$ath} else {} end)
              + (if $has_tr  == 1 then {transcript:$tr, has_transcript:true} else {} end)
