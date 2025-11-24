@@ -4,12 +4,13 @@
 gen_vtt.py
 ----------
 Builds a WEBVTT file + interactive transcript HTML from a crawler JSONL,
-while separating out emoji/tap reactions to a sidecar JSON for UI animation.
+optionally enriching it with a Deepgram diarized transcript when available.
 
 ENV:
   ARTDIR      - output directory
   BASE        - base filename (no extension)
   CC_JSONL    - path to crawler JSONL (captions/reactions stream)
+  DG_JSON     - optional path to Deepgram diarized JSON
   SHIFT_SECS  - seconds to shift left (lead-silence trim); float, optional
 
 OUTPUTS:
@@ -26,6 +27,8 @@ Design fixes vs. previous versions:
 - Stable ordering: sort by time then ingestion index, never by speaker name.
 - Unicode-safe: NFC normalization and zero-width-strip to avoid stray glyphs in output.
 - Non-destructive: we do not "correct" words; we only normalize spacing and escape safely.
+- Deepgram-aware: when DG_JSON is provided, use its diarized utterances for text + timing,
+  and map speaker IDs onto real X handles/names from crawler captions where possible.
 """
 
 import os, sys, re, json, html, unicodedata
@@ -56,6 +59,7 @@ def sanitize_abs_epoch(v: Optional[float]) -> Optional[float]:
 ARTDIR = os.environ.get("ARTDIR", "").strip() or "."
 BASE   = os.environ.get("BASE", "space").strip() or "space"
 SRC    = os.environ.get("CC_JSONL", "").strip()
+DG_JSON_PATH = os.environ.get("DG_JSON", "").strip()
 SHIFT  = float(os.environ.get("SHIFT_SECS", "0").strip() or "0")
 
 os.makedirs(ARTDIR, exist_ok=True)
@@ -122,7 +126,7 @@ def first(*vals):
             return v
     return None
 
-# Emoji / punctuation classification
+# Emoji / punctuation classification (used to peel off reactions only)
 EMOJI_RE = re.compile("[" +
     "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
     "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
@@ -139,7 +143,7 @@ def is_emoji_only(s: str) -> bool:
 def has_letters_or_digits(s: str) -> bool:
     return bool(re.search(r"[A-Za-z0-9]", s or ""))
 
-# ---------------- Early exit if no file ----------------
+# ---------------- Early exit if no CC file ----------------
 if not (SRC and os.path.isfile(SRC)):
     with open(VTT_PATH, "w", encoding="utf-8") as f:
         f.write("WEBVTT\n\n")
@@ -147,7 +151,10 @@ if not (SRC and os.path.isfile(SRC)):
     open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
     open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
     open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-        "speech_segments": 0, "reactions": 0, "shift_secs_applied": SHIFT, "notes": "no input"
+        "speech_segments": 0,
+        "reactions": 0,
+        "shift_secs_applied": SHIFT,
+        "notes": "no CC_JSONL input"
     }, ensure_ascii=False))
     open(START_PATH, "w", encoding="utf-8").write("")
     sys.exit(0)
@@ -310,7 +317,8 @@ if not raw_items and not reactions:
     open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
     open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
     open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-        "speech_segments": 0, "reactions": 0,
+        "speech_segments": 0,
+        "reactions": 0,
         "inputs": {"raw_items": 0, "abs_candidates": 0},
         "shift_secs_applied": SHIFT
     }, ensure_ascii=False))
@@ -359,63 +367,174 @@ for u in norm:
         u["t"] = last + EPS
     last = u["t"]
 
-# ------------- Build speech segments -------------
+# ------------- Deepgram diarization (optional) -------------
+dg_used = False
+dg_utter_count = 0
+
+def load_deepgram_utterances(path: str) -> List[Dict[str, Any]]:
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    res = data.get("results") or {}
+    utts = res.get("utterances") or []
+    if not isinstance(utts, list):
+        return []
+    return utts
+
+def pick_cc_speaker_for_window(items: List[Dict[str, Any]], start: float, end: float) -> Optional[Dict[str, Any]]:
+    """
+    Given a time window [start,end] on the trimmed audio clock, pick the most
+    common crawler speaker mentioning anything in that window, using name+handle+avatar
+    as the key. We allow a small padding around the window to catch near-alignments.
+    """
+    if not items:
+        return None
+    pad_before = 1.5
+    pad_after = 0.5
+    w_start = start - pad_before
+    w_end = end + pad_after
+    counts: Dict[tuple, int] = {}
+    best_key = None
+    best_example = None
+    best_count = 0
+    for row in items:
+        t = row.get("t", 0.0)
+        if t < w_start:
+            continue
+        if t > w_end:
+            break
+        name = (row.get("name") or "").strip()
+        uname = (row.get("username") or "").strip()
+        avatar = row.get("avatar") or ""
+        if not name and not uname:
+            continue
+        key = (name, uname, avatar)
+        c = counts.get(key, 0) + 1
+        counts[key] = c
+        if c > best_count:
+            best_count = c
+            best_key = key
+            best_example = row
+    return best_example if best_key is not None else None
+
+segments: List[Dict[str, Any]] = []
+
+dg_utts = load_deepgram_utterances(DG_JSON_PATH)
+if dg_utts:
+    # Use Deepgram for text + timing, CC only for identity (name/handle/avatar).
+    dg_used = True
+    dg_utter_count = len(dg_utts)
+    for utt in dg_utts:
+        try:
+            st = float(utt.get("start", 0.0) or 0.0)
+            en = float(utt.get("end", st + 0.8) or (st + 0.8))
+        except Exception:
+            continue
+        txt = nfc(str(utt.get("transcript", "") or "")).strip()
+        if not txt:
+            continue
+        speaker_id = utt.get("speaker", None)
+        cc_match = pick_cc_speaker_for_window(norm, st, en)
+        if cc_match:
+            name = cc_match.get("name") or "Speaker"
+            uname = cc_match.get("username") or ""
+            avatar = cc_match.get("avatar") or ""
+        else:
+            if speaker_id is not None:
+                name = f"Speaker {speaker_id}"
+            else:
+                name = "Speaker"
+            uname = ""
+            avatar = ""
+        segments.append({
+            "start": st,
+            "end": en,
+            "text": txt,
+            "name": nfc(name),
+            "username": uname.lstrip("@"),
+            "avatar": avatar,
+        })
+
+# ------------- Build speech segments (CC-only fallback) -------------
 MIN_DUR = 0.80
 MAX_DUR = 10.0
 GUARD   = 0.020
 MERGE_GAP = 3.0
 
-segments: List[Dict[str, Any]] = []
-# initial small duration per event
-for u in norm:
-    st = u["t"]
-    segments.append({
-        "start": st,
-        "end": st + MIN_DUR,
-        "text": u["text"],
-        "name": u["name"],
-        "username": u["username"],
-        "avatar": u["avatar"],
-    })
-
-# Merge adjacent segments by same speaker if gap <= MERGE_GAP
-merged: List[Dict[str, Any]] = []
-cur: Optional[Dict[str, Any]] = None
-
 def end_sentence_punct(s: str) -> bool:
     return bool(re.search(r'[.!?]"?$', (s or "").strip()))
 
-for seg in segments:
-    if (cur is not None
-        and seg["name"] == cur["name"]
-        and seg["username"] == cur["username"]
-        and seg["start"] - cur["end"] <= MERGE_GAP):
-        sep = "" if end_sentence_punct(cur["text"]) else " "
-        cur["text"] = (cur["text"] + sep + seg["text"]).strip()
-        cur["end"] = max(cur["end"], seg["end"])
-    else:
-        cur = dict(seg)
-        merged.append(cur)
+if not dg_used:
+    # Original CC-driven segmentation pipeline
+    cc_segments: List[Dict[str, Any]] = []
+    for u in norm:
+        st = u["t"]
+        cc_segments.append({
+            "start": st,
+            "end": st + MIN_DUR,
+            "text": u["text"],
+            "name": u["name"],
+            "username": u["username"],
+            "avatar": u["avatar"],
+        })
 
-# Smooth end times based on following start
-for i, g in enumerate(merged):
-    if i + 1 < len(merged):
-        nxt = merged[i + 1]["start"]
-        dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
-        g["end"] = g["start"] + dur
-    else:
-        # Estimate final duration by words
-        words = max(1, len((g["text"] or "").split()))
-        g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+    merged_cc: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
 
-# Ensure strictly increasing and clamp
-prev_end = 0.0
-for g in merged:
-    if g["start"] < prev_end + GUARD:
-        g["start"] = prev_end + GUARD
-    if g["end"] < g["start"] + MIN_DUR:
-        g["end"] = g["start"] + MIN_DUR
-    prev_end = g["end"]
+    for seg in cc_segments:
+        if (cur is not None
+            and seg["name"] == cur["name"]
+            and seg["username"] == cur["username"]
+            and seg["start"] - cur["end"] <= MERGE_GAP):
+            sep = "" if end_sentence_punct(cur["text"]) else " "
+            cur["text"] = (cur["text"] + sep + seg["text"]).strip()
+            cur["end"] = max(cur["end"], seg["end"])
+        else:
+            cur = dict(seg)
+            merged_cc.append(cur)
+
+    # Smooth end times based on following start
+    for i, g in enumerate(merged_cc):
+        if i + 1 < len(merged_cc):
+            nxt = merged_cc[i + 1]["start"]
+            dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
+            g["end"] = g["start"] + dur
+        else:
+            # Estimate final duration by words
+            words = max(1, len((g["text"] or "").split()))
+            g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+
+    # Ensure strictly increasing and clamp
+    prev_end = 0.0
+    for g in merged_cc:
+        if g["start"] < prev_end + GUARD:
+            g["start"] = prev_end + GUARD
+        if g["end"] < g["start"] + MIN_DUR:
+            g["end"] = g["start"] + MIN_DUR
+        prev_end = g["end"]
+
+    merged = merged_cc
+else:
+    # Deepgram-based segments: keep DG timing as much as possible, just enforce monotonicity
+    segments.sort(key=lambda s: (s["start"], s["end"]))
+    prev_end = 0.0
+    for seg in segments:
+        st = float(seg["start"])
+        en = float(seg["end"])
+        if st < prev_end:
+            st = prev_end + EPS
+        if en <= st:
+            en = st + MIN_DUR
+        seg["start"] = st
+        seg["end"] = en
+        prev_end = en
+    merged = segments
 
 # ------------- Emit WEBVTT -------------
 with open(VTT_PATH, "w", encoding="utf-8") as vf:
@@ -560,6 +679,11 @@ meta = {
         "abs0_present": abs0 is not None,
         "delta_used": round(delta, 6) if abs0 is not None else 0.0,
         "first_caption_start": round(merged[0]["start"], 3) if merged else None,
+    },
+    "deepgram": {
+        "used": dg_used,
+        "utterances": dg_utter_count,
+        "source": DG_JSON_PATH if dg_used else ""
     }
 }
 open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
