@@ -433,22 +433,6 @@ jobs:
           echo "vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Emoji VTT to GCS
-        id: upload_emoji_vtt
-        if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.EMOJI_VTT_PATH != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          DEST="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}_emoji.vtt"
-          RAW="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/${BASE}_emoji.vtt"
-          PROXY="https://media.chbmp.org/${PREFIX}/${BASE}_emoji.vtt"
-          gsutil -m cp "${EMOJI_VTT_PATH}" "$DEST"
-          if [ "${{ github.event.inputs.make_public }}" = "true" ]; then
-            (gsutil acl ch -u AllUsers:R "$DEST" || gsutil iam ch allUsers:objectViewer "gs://${GCS_BUCKET}") || true
-          fi
-          echo "emoji_vtt_raw=${RAW}"     >> "$GITHUB_OUTPUT"
-          echo "emoji_vtt_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
-
       - name: Build attendees HTML
         id: attendees
         if: ${{ github.event.inputs.mode != 'replies_only' && steps.crawl.outcome == 'success' && steps.crawl.outputs.as_line != '' }}
@@ -557,7 +541,6 @@ jobs:
           PID:  ${{ github.event.inputs.post_id }}
           AUD:  ${{ steps.upload_mp3.outputs.audio_proxy || steps.upload_mp3.outputs.audio_raw }}
           VTTU: ${{ steps.upload_vtt.outputs.vtt_proxy   || steps.upload_vtt.outputs.vtt_raw }}
-          EVTT: ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy || steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}
         run: |
           set -euo pipefail
 
@@ -566,7 +549,6 @@ jobs:
           echo "PID=${PID}"
           echo "AUD=${AUD}"
           echo "VTTU=${VTTU:-<none>}"
-          echo "EVTT=${EVTT:-<none>}"
           echo "START_ISO=${START_ISO:-<none>}"
           echo "TRANSCRIPT_PATH=${TRANSCRIPT_PATH:-<none>}"
           echo "ATTN_HTML=${ATTN_HTML:-<none>}"
@@ -616,7 +598,6 @@ jobs:
             --arg pid   "${PID}" \
             --arg ttl   "${TTL}" \
             --arg vtt   "${VTTU}" \
-            --arg evtt  "${EVTT}" \
             --arg when  "${START_ISO:-}" \
             --rawfile ath "${ATH_FILE}" \
             --rawfile tr  "${TR_FILE}" \
@@ -634,7 +615,6 @@ jobs:
              }
              + (if ($when|length)>0 then {post_date_gmt:$when, space_started_at:$when, publish_date:$when} else {} end)
              + (if ($vtt|length)>0 then {vtt_url:$vtt} else {} end)
-             + (if ($evtt|length)>0 then {emoji_vtt_url:$evtt} else {} end)
              + (if $has_ath == 1 then {attendees_html:$ath} else {} end)
              + (if $has_tr  == 1 then {transcript:$tr, has_transcript:true} else {} end)
              + (if $has_rep == 1 then {ss3k_replies_html:$rep} else {} end)
@@ -735,11 +715,6 @@ jobs:
             elif [ -n "${{ steps.upload_vtt.outputs.vtt_raw }}" ]; then
               echo "- VTT ${{ steps.upload_vtt.outputs.vtt_raw }}"
             fi
-            if [ -n "${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy }}" ]; then
-              echo "- Emoji VTT ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_proxy }}"
-            elif [ -n "${{ steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}" ]; then
-              echo "- Emoji VTT ${{ steps.upload_emoji_vtt.outputs.emoji_vtt_raw }}"
-            fi
             if [ -n "${REPLIES_PATH:-}" ]; then
               echo "- Replies saved: ${REPLIES_PATH}"
             fi
@@ -759,9 +734,12 @@ jobs:
           mkdir -p "$ARTDIR/captions"
           find "$ARTDIR" -type f \( -iname '*cc.jsonl' -o -iname '*caption*.jsonl' -o -iname '*captions*.jsonl' \) -exec cp -a {} "$ARTDIR/captions/" \;
           find "$ARTDIR" -type f \( -iname '*cc.txt'   -o -iname '*caption*.txt'   -o -iname '*captions*.txt'   \) -exec cp -a {} "$ARTDIR/captions/" \;
+          if [ -s "${ARTDIR}/${BASE}_dg.json" ]; then
+            cp -a "${ARTDIR}/${BASE}_dg.json" "$ARTDIR/captions/"
+          fi
           ls -lah "$ARTDIR/captions" || true
 
-      - name: Upload captions (jsonl + txt only)
+      - name: Upload captions (jsonl + txt + DG JSON)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
