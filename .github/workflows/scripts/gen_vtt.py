@@ -3,63 +3,62 @@
 """
 gen_vtt.py
 ----------
-Builds a WEBVTT file + interactive transcript HTML from:
-  - Deepgram diarized, smart_formatted utterances (primary), and
-  - Crawler JSONL captions (secondary; used for speaker/handle mapping and fallback).
+Builds a WEBVTT file + interactive transcript HTML from either:
+
+  (A) Deepgram diarized transcript JSON (preferred, high-accuracy), optionally
+      aligned with Twitter Space crawler CC.txt to replace "Speaker N"
+      with real X/Twitter handles and display names.
+  (B) Fallback: crawler JSONL captions/reactions stream (legacy mode).
 
 ENV:
-  ARTDIR         - output directory
-  BASE           - base filename (no extension)
-  CC_JSONL       - path to crawler JSONL (captions/reactions stream), optional
-  DEEPGRAM_JSON  - path to Deepgram JSON (utterances+diarization), optional
-                   (alias: DG_JSON)
-  SHIFT_SECS     - seconds to shift CC stream left (lead-silence trim); float, optional
+  ARTDIR        - output directory
+  BASE          - base filename (no extension)
+  CC_JSONL      - path to crawler JSONL (optional; used for metadata + fallback)
+  CC_TXT        - path to crawler CC.txt (optional; used for speaker mapping)
+  DG_JSON       - path to Deepgram JSON (optional; if missing, fall back to CC)
+  SHIFT_SECS    - seconds to shift left (lead-silence trim); float, optional
+                  NOTE: applied only in CC-fallback path; Deepgram times are
+                  assumed to already match the trimmed audio.
 
 OUTPUTS:
   {BASE}.vtt
   {BASE}_transcript.html
-  {BASE}.start.txt          (ISO-8601 UTC when absolute start known from CC)
-  {BASE}_speech.json        (speech segments: start,end,text, name, handle, avatar)
-  {BASE}_reactions.json     (reaction events normalized to same clock, if any)
+  {BASE}.start.txt          (ISO-8601 UTC when absolute start known)
+  {BASE}_speech.json        (processed speech segments: start,end,text,name,handle,avatar)
+  {BASE}_reactions.json     (reaction events normalized to same clock; may be empty)
   {BASE}_meta.json          (counts, timing diagnostics)
 
 Design goals:
-- Prefer Deepgram utterances (smart_format + diarize) for segmenting and text.
-- Use crawler CC only to:
-    * map Deepgram speaker IDs → X handles / display names / avatars, and
-    * provide a fallback transcript if Deepgram output is missing.
-- Robust clock alignment for CC stream so mapping is stable.
-- Unicode-safe normalization.
+- Prefer Deepgram utterances (diarize + smart_format) for actual text/timing.
+- Use crawler CC.txt to map Deepgram speaker IDs → real handles/names via
+  content-based alignment and time offsets.
+- Use crawler CC.jsonl only for:
+    * Display-name lookup for handles.
+    * Absolute start time (programDateTime / timestamp).
+    * Fallback caption generation when DG is unavailable.
+- Add redundancy and conservative checks to avoid misattributing speakers.
+- Retain sidecar JSONs for UI, but drop emoji VTT generation entirely.
 """
 
-import os, sys, re, json, html, unicodedata
-from datetime import datetime, timezone
+import os
+import sys
+import re
+import json
+import html
+import unicodedata
+from datetime import datetime, timezone, timedelta
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
-
-# ---------------- Absolute timestamp sanity ----------------
-def sanitize_abs_epoch(v: Optional[float]) -> Optional[float]:
-    """Return a plausible epoch seconds value or None."""
-    if v is None:
-        return None
-    try:
-        dt = datetime.fromtimestamp(float(v), timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-    if 2000 <= dt.year <= 2100:
-        return float(v)
-    return None
+from collections import Counter, defaultdict
+import bisect
 
 # ---------------- Env ----------------
 ARTDIR = os.environ.get("ARTDIR", "").strip() or "."
 BASE   = os.environ.get("BASE", "space").strip() or "space"
-SRC    = os.environ.get("CC_JSONL", "").strip()
-SHIFT  = float(os.environ.get("SHIFT_SECS", "0").strip() or "0")
-
-DG_JSON = (
-    os.environ.get("DEEPGRAM_JSON", "").strip()
-    or os.environ.get("DG_JSON", "").strip()
-)
+CC_JSONL = os.environ.get("CC_JSONL", "").strip()
+CC_TXT   = os.environ.get("CC_TXT", "").strip()
+DG_JSON  = os.environ.get("DG_JSON", "").strip()
+SHIFT    = float(os.environ.get("SHIFT_SECS", "0").strip() or "0")
 
 os.makedirs(ARTDIR, exist_ok=True)
 
@@ -69,6 +68,26 @@ START_PATH       = os.path.join(ARTDIR, f"{BASE}.start.txt")
 SPEECH_JSON_PATH = os.path.join(ARTDIR, f"{BASE}_speech.json")
 REACT_JSON_PATH  = os.path.join(ARTDIR, f"{BASE}_reactions.json")
 META_JSON_PATH   = os.path.join(ARTDIR, f"{BASE}_meta.json")
+
+# Try to infer CC_TXT if not explicitly provided
+if not CC_TXT and CC_JSONL:
+    root, ext = os.path.splitext(CC_JSONL)
+    CC_TXT = root + ".txt"
+
+# Try to infer DG_JSON if not explicitly provided
+def find_first_existing(paths: List[str]) -> str:
+    for p in paths:
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+if not DG_JSON:
+    candidates = [
+        os.path.join(ARTDIR, f"{BASE}.dg.json"),
+        os.path.join(ARTDIR, f"{BASE}_dg.json"),
+        os.path.join(ARTDIR, f"{BASE}.deepgram.json")
+    ]
+    DG_JSON = find_first_existing(candidates)
 
 # ---------------- Utils ----------------
 def esc(s: str) -> str:
@@ -113,8 +132,8 @@ def to_secs(x: Any) -> Optional[float]:
         v = float(x)
     except Exception:
         return None
-    if v >= 1e12:  # very likely milliseconds epoch
-        v = v / 1000.0
+    if v >= 1e12:  # likely milliseconds epoch
+        v /= 1000.0
     return v
 
 def first(*vals):
@@ -123,7 +142,30 @@ def first(*vals):
             return v
     return None
 
-# Emoji / punctuation classification
+def sanitize_abs_epoch(v: Optional[float]) -> Optional[float]:
+    """Return a plausible epoch seconds value or None."""
+    if v is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(v), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if 2000 <= dt.year <= 2100:
+        return float(v)
+    return None
+
+def normalize_phrase(s: str) -> str:
+    s = nfc(s or "")
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def text_tokens(s: str) -> List[str]:
+    s = normalize_phrase(s)
+    return s.split()
+
+# Emoji / punctuation classification (for reactions; no more emoji VTT)
 EMOJI_RE = re.compile("[" +
     "\U0001F1E6-\U0001F1FF" "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF" +
     "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF" "\U0001F900-\U0001F9FF" +
@@ -140,44 +182,16 @@ def is_emoji_only(s: str) -> bool:
 def has_letters_or_digits(s: str) -> bool:
     return bool(re.search(r"[A-Za-z0-9]", s or ""))
 
-# ---------------- Early exit if no sources ----------------
-if not (
-    (SRC and os.path.isfile(SRC)) or
-    (DG_JSON and os.path.isfile(DG_JSON))
-):
-    with open(VTT_PATH, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
-    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-        "speech_segments": 0,
-        "reactions": 0,
-        "inputs": {"raw_items": 0, "abs_candidates": 0, "deepgram_utterances": 0},
-        "timing": {"shift_secs_applied": SHIFT, "abs0_present": False, "delta_used": 0.0}
-    }, ensure_ascii=False))
-    open(START_PATH, "w", encoding="utf-8").write("")
-    sys.exit(0)
-
-# ---------------- Parsing CC JSONL ----------------
+# ---------------- Crawler CC parsing (metadata + fallback captions) ----------------
 REL_KEYS  = ("offset", "startSec", "startMs", "start")
-ABS_KEYS  = ("programDateTime", "timestamp", "ts")
 
-raw_items: List[Dict[str, Any]] = []
-reactions: List[Dict[str, Any]] = []
-abs_candidates: List[float] = []
+raw_items: List[Dict[str, Any]] = []   # for CC-fallback captions
+reactions: List[Dict[str, Any]] = []   # emoji/tap events
+abs_candidates: List[float] = []       # for absolute start time estimation
 ingest_idx = 0
 
 def pick_rel_abs(d: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """Classify fields into relative seconds and absolute epoch seconds.
-
-    Logic:
-      - REL from explicit rel keys.
-      - 'programDateTime' always ABS (ISO).
-      - 'timestamp'/'ts':
-           * if clearly epoch (>= 1e6), treat as ABS;
-           * else treat as REL if REL not already set.
-    """
+    """Classify fields into relative seconds and absolute epoch seconds."""
     rel: Optional[float] = None
     abs_ts: Optional[float] = None
 
@@ -204,27 +218,19 @@ def pick_rel_abs(d: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
 
     return rel, abs_ts
 
-def harvest_from_dict(d: Dict[str, Any]):
+def harvest_from_dict_for_cc(d: Dict[str, Any]):
     global ingest_idx
     txt = first(d.get("body"), d.get("text"), d.get("caption"), d.get("payloadText"))
     if not txt:
         return
-
     sender = d.get("sender") or {}
-    disp = first(
-        d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
-        sender.get("display_name"), d.get("name"), d.get("user")
-    )
-    uname = first(
-        d.get("username"), d.get("handle"), d.get("screen_name"),
-        d.get("user_id"), sender.get("screen_name")
-    )
-    avatar = first(
-        sender.get("profile_image_url_https"),
-        sender.get("profile_image_url"),
-        d.get("profile_image_url_https"),
-        d.get("profile_image_url")
-    )
+    disp = first(d.get("displayName"), d.get("speaker_name"), d.get("speakerName"),
+                 (sender or {}).get("display_name"), d.get("name"), d.get("user"))
+    uname = first(d.get("username"), d.get("handle"), d.get("screen_name"),
+                  d.get("user_id"), (sender or {}).get("screen_name"))
+    avatar = first((sender or {}).get("profile_image_url_https"),
+                   (sender or {}).get("profile_image_url"),
+                   d.get("profile_image_url_https"), d.get("profile_image_url"))
 
     rel, abs_ts = pick_rel_abs(d)
     abs_ts = sanitize_abs_epoch(abs_ts)
@@ -254,7 +260,7 @@ def harvest_from_dict(d: Dict[str, Any]):
     if abs_ts is not None:
         abs_candidates.append(abs_ts)
 
-def ingest_line(line: str):
+def ingest_cc_jsonl_line(line: str):
     line = (line or "").strip()
     if not line:
         return
@@ -267,8 +273,6 @@ def ingest_line(line: str):
     if isinstance(obj, dict):
         layers.append(obj)
         pl = obj.get("payload")
-
-        # payload as stringified JSON
         if isinstance(pl, str):
             try:
                 plj = json.loads(pl)
@@ -287,7 +291,6 @@ def ingest_line(line: str):
                             pass
             except Exception:
                 pass
-        # payload already dict
         elif isinstance(pl, dict):
             layers.append(pl)
             body = pl.get("body")
@@ -304,184 +307,423 @@ def ingest_line(line: str):
 
     for d in layers:
         if isinstance(d, dict):
-            harvest_from_dict(d)
+            harvest_from_dict_for_cc(d)
 
-# Read CC JSONL if present
-if SRC and os.path.isfile(SRC):
-    with open(SRC, "r", encoding="utf-8", errors="ignore") as f:
+def load_cc_jsonl():
+    if not (CC_JSONL and os.path.isfile(CC_JSONL)):
+        return
+    with open(CC_JSONL, "r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
-            ingest_line(ln)
+            ingest_cc_jsonl_line(ln)
 
-# ---------------- Deepgram utterances ----------------
-dg_utterances_raw: List[Dict[str, Any]] = []
+# ---------------- CC.txt anchors + handle/display name mapping ----------------
+CC_TXT_RE = re.compile(
+    r"^(?P<hms>\d{2}:\d{2}:\d{2})\s*\|\s*(?P<handle>[^:]+):\s*(?P<text>.*)$"
+)
 
-if DG_JSON and os.path.isfile(DG_JSON):
-    try:
-        with open(DG_JSON, "r", encoding="utf-8") as df:
-            dg_data = json.load(df)
-        res = (dg_data or {}).get("results") or {}
+def hms_to_seconds(hms: str) -> float:
+    h, m, s = map(int, hms.split(":"))
+    return float(h * 3600 + m * 60 + s)
 
-        utts = res.get("utterances")
-        if not isinstance(utts, list):
-            # Try channels[0].alternatives[0].utterances
-            channels = res.get("channels") or []
-            for ch in channels:
-                for alt in ch.get("alternatives", []):
-                    if isinstance(alt.get("utterances"), list):
-                        utts = alt["utterances"]
-                        break
-                if isinstance(utts, list):
-                    break
-
-        if isinstance(utts, list):
-            for i, u in enumerate(utts):
-                try:
-                    st = float(u.get("start", 0.0))
-                    en = float(u.get("end", st + 0.5))
-                except Exception:
-                    continue
-                txt = nfc(str(u.get("transcript", "")).strip())
-                if not has_letters_or_digits(txt):
-                    continue
-                spk = u.get("speaker")
-                dg_utterances_raw.append({
-                    "idx": i,
-                    "start": max(0.0, st),
-                    "end": max(0.0, en),
-                    "speaker": spk,
-                    "text": txt,
-                })
-    except Exception:
-        dg_utterances_raw = []
-
-dg_utterances_raw.sort(key=lambda u: (u["start"], u["idx"]))
-
-# ---------------- If absolutely nothing, emit empties ----------------
-if not raw_items and not dg_utterances_raw and not reactions:
-    with open(VTT_PATH, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
-    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
-    open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps({
-        "speech_segments": 0,
-        "reactions": 0,
-        "inputs": {"raw_items": 0, "abs_candidates": 0, "deepgram_utterances": 0},
-        "timing": {"shift_secs_applied": SHIFT, "abs0_present": False, "delta_used": 0.0}
-    }, ensure_ascii=False))
-    open(START_PATH, "w", encoding="utf-8").write("")
-    sys.exit(0)
-
-# ------------- Time normalization for CC (Δ alignment) -------------
-abs0 = min(abs_candidates) if abs_candidates else None
-if abs0 is not None:
-    deltas = []
-    for it in raw_items:
-        if it["abs"] is not None and it["rel"] is not None:
-            deltas.append((it["abs"] - abs0) - it["rel"])
-    for r in reactions:
-        if r["abs"] is not None and r["rel"] is not None:
-            deltas.append((r["abs"] - abs0) - r["rel"])
-    delta = median(deltas) if deltas else 0.0
-else:
-    delta = 0.0
-
-def rel_time_from_item(rel: Optional[float], abs_ts: Optional[float]) -> float:
-    """Map mixed rel/abs clocks onto a single relative timeline, then apply SHIFT for CC."""
-    if rel is not None:
-        t = rel + delta
-    elif abs_ts is not None and abs0 is not None:
-        t = abs_ts - abs0
-    else:
-        t = 0.0
-    return max(0.0, t - SHIFT)
-
-# CC timeline
-norm: List[Dict[str, Any]] = []
-for it in raw_items:
-    t = rel_time_from_item(it["rel"], it["abs"])
-    norm.append({**it, "t": float(t)})
-
-norm.sort(key=lambda x: (x["t"], x["idx"]))
-EPS = 5e-4
-last = -1e9
-for u in norm:
-    if u["t"] <= last:
-        u["t"] = last + EPS
-    last = u["t"]
-
-# Build avatar map by username for mapped speakers
-avatar_by_username: Dict[str, str] = {}
-for it in raw_items:
-    uname = (it.get("username") or "").strip()
-    av = it.get("avatar") or ""
-    if uname and av and uname not in avatar_by_username:
-        avatar_by_username[uname] = av
-
-# ------------- Map Deepgram speakers → CC names/handles -------------
-speaker_map: Dict[Any, Dict[str, str]] = {}
-if dg_utterances_raw and norm:
-    votes: Dict[Any, Dict[Tuple[str, str], int]] = {}
-    tol = 1.0  # seconds window
-
-    for cc in norm:
-        t = cc["t"]
-        best = None
-        best_gap = None
-        for u in dg_utterances_raw:
-            if t < u["start"] - tol or t > u["end"] + tol:
+def load_cc_txt_anchors(path: str):
+    anchors = []  # [{abs_t, handle, text}]
+    if not (path and os.path.isfile(path)):
+        return anchors
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
                 continue
-            mid = 0.5 * (u["start"] + u["end"])
-            gap = abs(t - mid)
-            if best is None or gap < best_gap:
-                best = u
-                best_gap = gap
-        if best is None:
+            m = CC_TXT_RE.match(ln)
+            if not m:
+                continue
+            hms   = m.group("hms")
+            handle = m.group("handle").strip()
+            text   = m.group("text").strip()
+            anchors.append({
+                "abs_t": hms_to_seconds(hms),
+                "handle": handle,
+                "text": text,
+            })
+    anchors.sort(key=lambda a: a["abs_t"])
+    return anchors
+
+def build_handle_display_map_from_cc_jsonl(path: str):
+    out: Dict[str, str] = {}
+    if not (path and os.path.isfile(path)):
+        return out
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            sender = (obj.get("payload") or {}).get("sender") or obj.get("sender") or {}
+            handle = sender.get("screen_name") or sender.get("username")
+            disp   = sender.get("display_name") or sender.get("name")
+            if handle and disp and handle not in out:
+                out[handle] = nfc(str(disp))
+    return out
+
+# ---------------- Deepgram utterance loading ----------------
+def load_deepgram_utterances(path: str) -> List[Dict[str, Any]]:
+    if not (path and os.path.isfile(path)):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    # Preferred: results.utterances
+    utterances = []
+    res = (data.get("results") if isinstance(data, dict) else None) or {}
+    if isinstance(res.get("utterances"), list) and res["utterances"]:
+        for u in res["utterances"]:
+            try:
+                start = float(u["start"])
+                end   = float(u["end"])
+            except Exception:
+                continue
+            if end <= start:
+                continue
+            transcript = u.get("transcript", "").strip()
+            if not transcript:
+                continue
+            speaker = u.get("speaker")
+            utterances.append({
+                "start": start,
+                "end": end,
+                "speaker": speaker,
+                "transcript": nfc(transcript),
+            })
+
+    if utterances:
+        utterances.sort(key=lambda u: u["start"])
+        return utterances
+
+    # Fallback: build "utterances" from words if diarization present
+    channels = res.get("channels") or []
+    if not channels:
+        return []
+    alt = channels[0].get("alternatives") or []
+    if not alt:
+        return []
+    alt0 = alt[0]
+    words = alt0.get("words") or []
+    if not words:
+        return []
+
+    # Group consecutive words by speaker ID and small gaps
+    MAX_GAP = 1.0
+    seg = None
+    for w in words:
+        try:
+            ws = float(w["start"])
+            we = float(w["end"])
+        except Exception:
             continue
-        spk = best.get("speaker")
+        if we <= ws:
+            continue
+        word = w.get("word", "").strip()
+        if not word:
+            continue
+        spk = w.get("speaker")
+        if seg is None:
+            seg = {
+                "start": ws,
+                "end": we,
+                "speaker": spk,
+                "words": [word],
+            }
+            continue
+        if spk == seg["speaker"] and ws - seg["end"] <= MAX_GAP:
+            seg["words"].append(word)
+            seg["end"] = we
+        else:
+            text = " ".join(seg["words"]).strip()
+            if text:
+                utterances.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "speaker": seg["speaker"],
+                    "transcript": nfc(text),
+                })
+            seg = {
+                "start": ws,
+                "end": we,
+                "speaker": spk,
+                "words": [word],
+            }
+    if seg is not None:
+        text = " ".join(seg["words"]).strip()
+        if text:
+            utterances.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "speaker": seg["speaker"],
+                "transcript": nfc(text),
+            })
+
+    utterances.sort(key=lambda u: u["start"])
+    return utterances
+
+# ---------------- DG ↔ CC alignment (text + time) ----------------
+def estimate_offset_between_cc_and_dg(anchors, dg_utts, min_words=6, score_thresh=0.6, max_pairs=400):
+    """
+    Estimate absolute-time offset such that:
+      CC_abs_time ≈ DG_start + offset_abs
+
+    Uses content similarity between CC lines and DG utterances to pair them
+    and then takes the median of (abs_t - start).
+    """
+    if not anchors or not dg_utts:
+        return None
+
+    offsets = []
+    # Pre-tokenize CC anchors
+    cc_tokens = []
+    for a in anchors:
+        toks = text_tokens(a.get("text", ""))
+        if toks:
+            cc_tokens.append((a["abs_t"], toks))
+
+    if not cc_tokens:
+        return None
+
+    for utt in dg_utts[:max_pairs]:
+        toks_u = text_tokens(utt.get("transcript", ""))
+        if len(toks_u) < min_words:
+            continue
+        set_u = set(toks_u)
+        best_score = 0.0
+        best_abs_t = None
+        for abs_t, toks_a in cc_tokens:
+            set_a = set(toks_a)
+            inter = len(set_u & set_a)
+            if inter == 0:
+                continue
+            denom = min(len(set_u), len(set_a))
+            if denom == 0:
+                continue
+            score = inter / denom
+            if score > best_score:
+                best_score = score
+                best_abs_t = abs_t
+        if best_abs_t is not None and best_score >= score_thresh:
+            offsets.append(best_abs_t - utt["start"])
+
+    if len(offsets) < 2:
+        # Not enough matches to be confident
+        return None
+    return median(offsets)
+
+def map_speakers_to_handles(anchors, dg_utts, offset_abs, window=4.0):
+    """
+    anchors: [{abs_t, handle, text}]
+    dg_utts: [{start, end, speaker, transcript}]
+    offset_abs: seconds; CC_abs_time ≈ dg_start + offset_abs
+    window: allowed distance in seconds between utterance and nearest CC line
+    """
+    if not anchors or offset_abs is None:
+        return {}
+
+    times = [a["abs_t"] for a in anchors]
+
+    def nearest_anchor(t_abs: float):
+        if not times:
+            return None
+        idx = bisect.bisect_left(times, t_abs)
+        best = None
+        best_d = 1e9
+        for j in (idx - 1, idx, idx + 1):
+            if 0 <= j < len(anchors):
+                a = anchors[j]
+                d = abs(a["abs_t"] - t_abs)
+                if d < best_d:
+                    best_d = d
+                    best = a
+        if best is None or best_d > window:
+            return None
+        return best
+
+    votes: Dict[int, Counter] = defaultdict(Counter)
+
+    for utt in dg_utts:
+        spk = utt.get("speaker")
         if spk is None:
             continue
-        uname = (cc.get("username") or "").strip()
-        nm = (cc.get("name") or "").strip()
-        if not (uname or nm):
+        t_abs = utt["start"] + offset_abs
+        anc = nearest_anchor(t_abs)
+        if not anc:
             continue
-        key = (uname, nm)
-        votes.setdefault(spk, {})
-        votes[spk][key] = votes[spk].get(key, 0) + 1
+        handle = anc["handle"]
+        if not handle:
+            continue
+        # weight by utterance length (words) to favor richer matches
+        w = max(1, len(text_tokens(utt.get("transcript", ""))) // 3)
+        votes[int(spk)][handle] += w
 
-    for spk, options in votes.items():
-        (uname, nm), _ = max(options.items(), key=lambda kv: kv[1])
-        disp = nm or uname or f"Speaker {spk}"
-        speaker_map[spk] = {
-            "username": uname,
-            "name": disp,
-        }
+    if not votes:
+        return {}
 
-# ------------- Build segments (Deepgram primary, CC fallback) -------------
-final_segments: List[Dict[str, Any]] = []
+    # First pass: per handle, keep the speaker with strongest vote to avoid
+    # two different DG speakers being assigned the same handle.
+    handle_best: Dict[str, Tuple[int, int]] = {}  # handle -> (spk, count)
+    for spk, ctr in votes.items():
+        for handle, cnt in ctr.items():
+            prev = handle_best.get(handle)
+            if prev is None or cnt > prev[1]:
+                handle_best[handle] = (spk, cnt)
 
-if dg_utterances_raw:
-    # Use Deepgram utterances as authoritative segments
-    for u in dg_utterances_raw:
-        spk = u.get("speaker")
-        meta = speaker_map.get(spk, {}) if spk is not None else {}
-        uname = (meta.get("username") or "").strip()
-        name = meta.get("name") or (f"Speaker {spk}" if spk is not None else "Speaker")
-        avatar = avatar_by_username.get(uname, "")
+    speaker_to_handle: Dict[int, str] = {}
+    for handle, (spk, _cnt) in handle_best.items():
+        speaker_to_handle[spk] = handle
 
-        st = max(0.0, float(u["start"]))
-        en = max(st + 0.10, float(u["end"]))  # ensure non-zero
-        final_segments.append({
-            "start": st,
-            "end": en,
-            "text": u["text"],
-            "name": name,
-            "username": uname,
-            "avatar": avatar,
-            "speaker": spk,
+    return speaker_to_handle
+
+# ---------------- Build segments from Deepgram ----------------
+def segments_from_deepgram(
+    dg_utts: List[Dict[str, Any]],
+    anchors,
+    handle_display_map: Dict[str, str]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Build merged segments from Deepgram utterances, with best-effort mapping
+    of speaker IDs to real handles and display names using CC anchors.
+    Returns (segments, speaker_mapping_meta)
+    """
+    speaker_mapping_meta: Dict[str, Any] = {
+        "offset_abs": None,
+        "speaker_to_handle": {},
+        "handle_to_display": handle_display_map,
+    }
+
+    segments: List[Dict[str, Any]] = []
+    if not dg_utts:
+        return segments, speaker_mapping_meta
+
+    offset_abs = estimate_offset_between_cc_and_dg(anchors, dg_utts)
+    speaker_mapping_meta["offset_abs"] = offset_abs
+
+    speaker_to_handle: Dict[int, str] = {}
+    if anchors and offset_abs is not None:
+        speaker_to_handle = map_speakers_to_handles(anchors, dg_utts, offset_abs)
+        speaker_mapping_meta["speaker_to_handle"] = speaker_to_handle
+
+    # Build per-speaker display map
+    def label_for_utterance(utt):
+        spk = utt.get("speaker")
+        if spk is not None and int(spk) in speaker_to_handle:
+            handle = speaker_to_handle[int(spk)]
+            disp = handle_display_map.get(handle, handle)
+            return disp or f"@{handle}", handle
+        # fallback: stable pseudo-name
+        if spk is None:
+            return "Speaker", ""
+        return f"Speaker {int(spk) + 1}", ""
+
+    for utt in dg_utts:
+        name, handle = label_for_utterance(utt)
+        segments.append({
+            "start": float(utt["start"]),
+            "end": float(utt["end"]),
+            "text": utt["transcript"],
+            "name": nfc(name),
+            "username": handle.lstrip("@"),
+            "avatar": "",  # could be filled from handle later if desired
         })
-else:
-    # Fallback to CC-only segmentation (original logic)
+
+    # Merge/smooth similar to legacy CC path
+    segments.sort(key=lambda g: g["start"])
+    MIN_DUR = 0.80
+    MAX_DUR = 10.0
+    GUARD   = 0.020
+    MERGE_GAP = 3.0
+
+    merged: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    def end_sentence_punct(s: str) -> bool:
+        return bool(re.search(r'[.!?]"?$', (s or "").strip()))
+
+    for seg in segments:
+        if (cur is not None
+            and seg["name"] == cur["name"]
+            and seg["username"] == cur["username"]
+            and seg["start"] - cur["end"] <= MERGE_GAP):
+            sep = "" if end_sentence_punct(cur["text"]) else " "
+            cur["text"] = (cur["text"] + sep + seg["text"]).strip()
+            cur["end"] = max(cur["end"], seg["end"])
+        else:
+            cur = dict(seg)
+            merged.append(cur)
+
+    # Refine end times relative to next start or length
+    for i, g in enumerate(merged):
+        if i + 1 < len(merged):
+            nxt = merged[i + 1]["start"]
+            dur = max(MIN_DUR, min(MAX_DUR, (nxt - g["start"]) - GUARD))
+            g["end"] = g["start"] + dur
+        else:
+            words = max(1, len((g["text"] or "").split()))
+            g["end"] = g["start"] + max(MIN_DUR, min(MAX_DUR, 0.33 * words + 0.7))
+
+    prev_end = 0.0
+    for g in merged:
+        if g["start"] < prev_end + GUARD:
+            g["start"] = prev_end + GUARD
+        if g["end"] < g["start"] + MIN_DUR:
+            g["end"] = g["start"] + MIN_DUR
+        prev_end = g["end"]
+
+    return merged, speaker_mapping_meta
+
+# ---------------- Fallback: segments from CC captions ----------------
+def segments_from_cc(raw_items_local: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Legacy path: build segments from crawler CC captions when Deepgram is
+    unavailable. Uses REL+ABS Δ alignment and SHIFT_SECS to match trimmed audio.
+    """
+    if not raw_items_local:
+        return []
+
+    # Δ alignment
+    abs0 = min(abs_candidates) if abs_candidates else None
+    if abs0 is not None:
+        deltas = []
+        for it in raw_items_local:
+            if it["abs"] is not None and it["rel"] is not None:
+                deltas.append((it["abs"] - abs0) - it["rel"])
+        delta = median(deltas) if deltas else 0.0
+    else:
+        delta = 0.0
+
+    def rel_time_from_item(rel: Optional[float], abs_ts: Optional[float]) -> float:
+        if rel is not None:
+            t = rel + delta
+        elif abs_ts is not None and abs0 is not None:
+            t = abs_ts - abs0
+        else:
+            t = 0.0
+        return max(0.0, t - SHIFT)
+
+    norm: List[Dict[str, Any]] = []
+    for it in raw_items_local:
+        t = rel_time_from_item(it["rel"], it["abs"])
+        norm.append({**it, "t": float(t)})
+
+    norm.sort(key=lambda x: (x["t"], x["idx"]))
+    EPS = 5e-4
+    last = -1e9
+    for u in norm:
+        if u["t"] <= last:
+            u["t"] = last + EPS
+        last = u["t"]
+
     MIN_DUR = 0.80
     MAX_DUR = 10.0
     GUARD   = 0.020
@@ -534,16 +776,75 @@ else:
             g["end"] = g["start"] + MIN_DUR
         prev_end = g["end"]
 
-    final_segments = merged
+    return merged
 
-# ------------- Emit WEBVTT -------------
+# ---------------- Main pipeline ----------------
+def write_empty_outputs(note: str):
+    with open(VTT_PATH, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+    open(TRANSCRIPT_PATH, "w", encoding="utf-8").write("")
+    open(SPEECH_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(REACT_JSON_PATH, "w", encoding="utf-8").write("[]")
+    open(START_PATH, "w", encoding="utf-8").write("")
+    meta = {
+        "speech_segments": 0,
+        "reactions": 0,
+        "inputs": {
+            "raw_items": 0,
+            "abs_candidates": 0,
+            "dg_utterances": 0,
+        },
+        "timing": {
+            "shift_secs_applied": 0.0,
+            "abs0_present": False,
+            "delta_used": 0.0,
+            "first_caption_start": None,
+        },
+        "notes": note,
+    }
+    open(META_JSON_PATH, "w", encoding="utf-8").write(
+        json.dumps(meta, ensure_ascii=False, indent=2)
+    )
+    sys.exit(0)
+
+# Load CC JSONL (for metadata + fallback)
+if CC_JSONL and os.path.isfile(CC_JSONL):
+    load_cc_jsonl()
+
+# Load Deepgram utterances
+dg_utts = load_deepgram_utterances(DG_JSON)
+
+# Load CC.txt anchors + handle display map
+anchors = load_cc_txt_anchors(CC_TXT)
+handle_display_map = build_handle_display_map_from_cc_jsonl(CC_JSONL)
+
+# Decide on primary source
+use_deepgram = bool(dg_utts)
+use_cc_fallback = (not use_deepgram) and bool(raw_items)
+
+if not use_deepgram and not use_cc_fallback and not reactions:
+    write_empty_outputs("no Deepgram or CC caption input available")
+
+# Build segments
+speaker_mapping_meta = {}
+if use_deepgram:
+    merged, speaker_mapping_meta = segments_from_deepgram(dg_utts, anchors, handle_display_map)
+    shift_applied = 0.0  # Deepgram times are already aligned to trimmed audio
+else:
+    merged = segments_from_cc(raw_items)
+    shift_applied = SHIFT
+
+if not merged:
+    write_empty_outputs("no segments built from available inputs")
+
+# ---------------- Emit WEBVTT ----------------
 with open(VTT_PATH, "w", encoding="utf-8") as vf:
     vf.write("WEBVTT\n\n")
-    for i, g in enumerate(final_segments, 1):
+    for i, g in enumerate(merged, 1):
         vf.write(f"{i}\n{fmt_ts(g['start'])} --> {fmt_ts(g['end'])}\n")
         vf.write(f"<v {esc(g['name'])}> {esc(g['text'])}\n\n")
 
-# ------------- Interactive transcript HTML -------------
+# ---------------- Interactive transcript HTML ----------------
 CSS = '''
 <style>
 .ss3k-transcript{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
@@ -593,7 +894,7 @@ JS = r'''
 with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as tf:
     tf.write(CSS + "\n")
     tf.write('<div class="ss3k-transcript">\n')
-    for i, g in enumerate(final_segments, 1):
+    for i, g in enumerate(merged, 1):
         name = g["name"]
         uname = (g.get("username") or "").strip().lstrip("@")
         prof = f"https://x.com/{html.escape(uname, True)}" if uname else ""
@@ -622,65 +923,82 @@ with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as tf:
         tf.write('</div></div>\n')
     tf.write('</div>\n' + JS + "\n")
 
-# ------------- Sidecar JSONs -------------
+# ---------------- Sidecar JSONs ----------------
 speech_out = [{
     "start": round(g["start"], 3),
     "end": round(g["end"], 3),
     "text": g["text"],
     "name": g["name"],
-    "handle": g.get("username", ""),
-    "avatar": g.get("avatar", ""),
-} for g in final_segments]
+    "handle": g["username"],
+    "avatar": g["avatar"],
+} for g in merged]
+
 open(SPEECH_JSON_PATH, "w", encoding="utf-8").write(
     json.dumps(speech_out, ensure_ascii=False)
 )
 
-# Reactions sidecar (normalize CC emoji onto same relative clock as CC timeline)
+# Reactions sidecar (normalize onto same relative clock for CC path).
+# For Deepgram-first mode, this is informational only.
 rx_out = []
-for r in reactions:
-    if r["rel"] is not None:
-        t = r["rel"] + (delta or 0.0)
-    elif r["abs"] is not None and abs0 is not None:
-        t = r["abs"] - abs0
+abs0_for_rx = min(abs_candidates) if abs_candidates else None
+if reactions:
+    # We reuse CC style Δ alignment for reactions
+    if abs0_for_rx is not None:
+        deltas = []
+        for r in reactions:
+            if r["abs"] is not None and r["rel"] is not None:
+                deltas.append((r["abs"] - abs0_for_rx) - r["rel"])
+        delta_rx = median(deltas) if deltas else 0.0
     else:
-        continue
-    t = max(0.0, t - SHIFT)
-    rx_out.append({
-        "t": round(t, 3),
-        "emoji": r["emoji"],
-        "name": r["name"],
-        "handle": r["handle"],
-        "avatar": r["avatar"],
-    })
+        delta_rx = 0.0
+
+    for r in reactions:
+        if r["rel"] is not None:
+            t = r["rel"] + (delta_rx or 0.0)
+        elif r["abs"] is not None and abs0_for_rx is not None:
+            t = r["abs"] - abs0_for_rx
+        else:
+            continue
+        t = max(0.0, t - SHIFT)
+        rx_out.append({
+            "t": round(t, 3),
+            "emoji": r["emoji"],
+            "name": r["name"],
+            "handle": r["handle"],
+            "avatar": r["avatar"],
+        })
+
 open(REACT_JSON_PATH, "w", encoding="utf-8").write(
     json.dumps(rx_out, ensure_ascii=False)
 )
 
-# ------------- Meta + start time -------------
+# ---------------- Meta + start time ----------------
 start_iso = ""
 if abs_candidates:
     try:
-        start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
+        start_iso = datetime.fromtimestamp(min(abs_candidates), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
         start_iso = ""
 open(START_PATH, "w", encoding="utf-8").write((start_iso or "") + "\n")
 
 meta = {
-    "speech_segments": len(final_segments),
+    "speech_segments": len(merged),
     "reactions": len(rx_out),
     "inputs": {
         "raw_items": len(raw_items),
         "abs_candidates": len(abs_candidates),
-        "deepgram_utterances": len(dg_utterances_raw),
-        "raw_reaction_rows": len(reactions),
+        "dg_utterances": len(dg_utts),
+        "cc_anchors": len(anchors),
+        "has_cc_jsonl": bool(CC_JSONL and os.path.isfile(CC_JSONL)),
+        "has_cc_txt": bool(CC_TXT and os.path.isfile(CC_TXT)),
+        "has_dg_json": bool(DG_JSON and os.path.isfile(DG_JSON)),
     },
     "timing": {
-        "shift_secs_applied": SHIFT,
-        "abs0_present": abs0 is not None,
-        "delta_used": round(delta, 6) if abs0 is not None else 0.0,
-        "first_caption_start": round(final_segments[0]["start"], 3) if final_segments else None,
-    }
+        "shift_secs_applied": shift_applied,
+        "abs0_present": bool(abs_candidates),
+        "delta_used": None,  # detailed Δ used internally; omit here for brevity
+        "first_caption_start": round(merged[0]["start"], 3) if merged else None,
+    },
+    "speaker_mapping": speaker_mapping_meta,
 }
 open(META_JSON_PATH, "w", encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
