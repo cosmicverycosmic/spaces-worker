@@ -79,6 +79,8 @@ env:
   TW_API_ACCESS_TOKEN:        ${{ secrets.TW_API_ACCESS_TOKEN        || vars.TW_API_ACCESS_TOKEN }}
   TW_API_ACCESS_TOKEN_SECRET: ${{ secrets.TW_API_ACCESS_TOKEN_SECRET || vars.TW_API_ACCESS_TOKEN_SECRET }}
 
+  DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY || vars.DEEPGRAM_API_KEY }}
+
   WORKDIR: ${{ github.workspace }}/work
   ARTDIR:  ${{ github.workspace }}/out
 
@@ -344,6 +346,33 @@ jobs:
           fi
           echo "MP3_PATH=${OUT}" >> "$GITHUB_ENV"
 
+      - name: Deepgram diarized transcript
+        if: ${{ github.event.inputs.mode != 'attendees_only'
+                && github.event.inputs.mode != 'replies_only'
+                && env.MP3_PATH != ''
+                && env.DEEPGRAM_API_KEY != ''
+                && github.event.inputs.do_transcript == 'true' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT_JSON="${ARTDIR}/${BASE}_dg.json"
+          echo "Requesting Deepgram diarized transcript..."
+          curl -sS -X POST \
+            -H "Authorization: Token ${DEEPGRAM_API_KEY}" \
+            -H "Content-Type: audio/mpeg" \
+            --data-binary @"${MP3_PATH}" \
+            "https://api.deepgram.com/v1/listen?model=nova-3&language=en&utterances=true&diarize=true&smart_format=true" \
+            -o "$OUT_JSON" || {
+              echo "Deepgram request failed, proceeding without DG JSON"
+              exit 0
+            }
+          if [ -s "$OUT_JSON" ]; then
+            echo "DG_JSON=${OUT_JSON}" >> "$GITHUB_ENV"
+            echo "Deepgram output saved to $OUT_JSON"
+          else
+            echo "Deepgram returned empty response, ignoring"
+          fi
+
       - name: Upload MP3 to GCS
         id: upload_mp3
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' && env.MP3_PATH != '' }}
@@ -360,19 +389,19 @@ jobs:
           echo "audio_raw=${RAW}"     >> "$GITHUB_OUTPUT"
           echo "audio_proxy=${PROXY}" >> "$GITHUB_OUTPUT"
 
-      - name: Build VTT (full & emoji) + rich transcript
+      - name: Build VTT + rich transcript
         if: ${{ github.event.inputs.mode != 'attendees_only' && github.event.inputs.mode != 'replies_only' }}
         shell: bash
         env:
-          CC_JSONL: ${{ env.CRAWLER_CC }}
+          CC_JSONL:   ${{ env.CRAWLER_CC }}
           SHIFT_SECS: ${{ steps.detect.outputs.lead || '0' }}
+          DG_JSON:    ${{ env.DG_JSON }}
         run: |
           set -euxo pipefail
           if [ -n "${CC_JSONL:-}" ] && [ -s "${CC_JSONL}" ]; then
-            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" \
+            CC_JSONL="${CC_JSONL}" ARTDIR="${ARTDIR}" BASE="${BASE}" SHIFT_SECS="${SHIFT_SECS}" DG_JSON="${DG_JSON:-}" \
               python3 ".github/workflows/scripts/gen_vtt.py"
             [ -s "${ARTDIR}/${BASE}.vtt" ] && echo "VTT_PATH=${ARTDIR}/${BASE}.vtt" >> "$GITHUB_ENV" || true
-            [ -s "${ARTDIR}/${BASE}_emoji.vtt" ] && echo "EMOJI_VTT_PATH=${ARTDIR}/${BASE}_emoji.vtt" >> "$GITHUB_ENV" || true
             [ -s "${ARTDIR}/${BASE}_transcript.html" ] && echo "TRANSCRIPT_PATH=${ARTDIR}/${BASE}_transcript.html" >> "$GITHUB_ENV" || true
           else
             echo "No CC JSONL found; skipping gen_vtt"
@@ -567,7 +596,6 @@ jobs:
             fi
           done
 
-          # Flags so jq doesn't need to regex-strip whitespace
           HAS_ATH=0
           HAS_TR=0
           HAS_REP=0
@@ -580,7 +608,6 @@ jobs:
           REQ="${WORKDIR}/wp_register_body.json"
           RESP="${WORKDIR}/wp_register_response.json"
           HDRS="${WORKDIR}/wp_register_headers.txt"
-          CURL_TIMING="${WORKDIR}/wp_register_curl_timing.txt"
 
           echo "Building WP request body with jq..."
           jq -n \
@@ -719,9 +746,11 @@ jobs:
             if [ -n "${LINKS_PATH:-}" ]; then
               echo "- Links saved: ${LINKS_PATH}"
             fi
+            if [ -n "${DG_JSON:-}" ]; then
+              echo "- Deepgram JSON: ${DG_JSON}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # --- Artifact minimization: upload captions only (no audio) ---
       - name: Collect caption files
         if: ${{ always() }}
         shell: bash
